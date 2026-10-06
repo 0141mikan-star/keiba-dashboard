@@ -169,29 +169,33 @@ if "current_distance" not in st.session_state:
 # レース距離の手動数値入力（キーボードで直接入力可能）
 race_distance = st.sidebar.number_input(
     "📏 レース距離 (m) [手動入力]",
-    min_value=800,
+    min_value=100,
     max_value=4000,
     value=int(st.session_state["current_distance"]),
     step=100,
-    help="キーボードで直接好きな数値を手動入力できます（例: 1150, 1700, 2500など）"
+    help="キーボードで直接好きな数値を手動入力できます（例: 200, 1200, 1600, 2000, 2500など）"
 )
 st.session_state["current_distance"] = race_distance
 
 # 定番距離のクイック選択ボタン
-cols_d = st.sidebar.columns(4)
+cols_d = st.sidebar.columns(5)
 with cols_d[0]:
+    if st.button("200m", use_container_width=True, help="ばんえい帯広"):
+        st.session_state["current_distance"] = 200
+        st.rerun()
+with cols_d[1]:
     if st.button("1200m", use_container_width=True):
         st.session_state["current_distance"] = 1200
         st.rerun()
-with cols_d[1]:
+with cols_d[2]:
     if st.button("1600m", use_container_width=True):
         st.session_state["current_distance"] = 1600
         st.rerun()
-with cols_d[2]:
+with cols_d[3]:
     if st.button("2000m", use_container_width=True):
         st.session_state["current_distance"] = 2000
         st.rerun()
-with cols_d[3]:
+with cols_d[4]:
     if st.button("2400m", use_container_width=True):
         st.session_state["current_distance"] = 2400
         st.rerun()
@@ -206,28 +210,41 @@ track_name = st.sidebar.selectbox(
         "中京 (左回り / 直線412m・急坂タフ)",
         "新潟 (左回り / 直線659m・日本最長直線)",
         "小倉・福島・函館・札幌 (小回り平坦・先行有利)",
-        "標準・指定なし (平均的なコース)"
+        "盛岡 (左回り / 起伏4.4mタフ・地方唯一芝併設)",
+        "大井 (右回り / 直線386m・南関王道・外差し届く)",
+        "金沢 (右回り / 直線236m・超小回り前残り鉄則)",
+        "帯広（ば） (直線200m / 世界唯一ばんえい・障害登坂)",
+        "標準・地方他 (平均的・先行やや有利)"
     ],
     index=0,
-    help="競馬場ごとの直線の長さや坂・コーナーの急さが自動判定されます"
+    help="競馬場ごとの直線の長さや坂・障害・コーナーの急さが自動判定されます"
 )
+
+# 帯広（ばんえい）選択時の便利アシスト
+if ("帯広" in track_name or "ば" in track_name) and race_distance != 200:
+    st.sidebar.info("💡 帯広（ば）は直線200mのばんえい競走です。")
+    if st.sidebar.button("⚡ 距離を200mにワンタップ変更", key="btn_fix_banei_dist", use_container_width=True):
+        st.session_state["current_distance"] = 200
+        st.rerun()
 
 track_condition = st.sidebar.selectbox(
     "🌦️ 馬場状態 (天候・水分)",
     [
         "良馬場 (晴・乾燥 / 高速スピード＆キレ味)",
         "稍重 (標準〜やや湿り / 総合力)",
-        "重・不良 (雨・泥濘 / パワー＆スタミナ前残り波乱)"
+        "重・不良 (雨・泥濘 / パワー＆スタミナ前残り波乱・ばんえいはソリ滑走軽馬場)"
     ],
     index=0,
-    help="雨で馬場が渋ると、キレ味自慢の人気馬が失速し、パワー型の前残りが大激走しやすくなります"
+    help="雨で馬場が渋ると、キレ味自慢の人気馬が失速し、パワー型の前残りが大激走しやすくなります（ばんえいではソリが滑り超高速前残り決着）"
 )
 
-course_type = st.sidebar.selectbox("コース種別", ["芝", "ダート"], index=0)
+course_type = st.sidebar.selectbox("コース種別", ["芝", "ダート", "ばんえい"], index=0)
 pace_prediction = st.sidebar.selectbox("想定ペース", ["スローペース", "ミドルペース", "ハイペース"], index=1)
 
 # 距離カテゴリの自動判定表示
-if race_distance <= 1400:
+if race_distance <= 400:
+    dist_label = "🧱 超短距離・ばんえい : 2連障害登坂＆前残り主導権"
+elif race_distance <= 1400:
     dist_label = "⚡ 短距離 : スピード・前残り絶対有利"
 elif race_distance <= 2000:
     dist_label = "🎯 マイル〜中距離 : スピード＆スタミナ総合力"
@@ -677,7 +694,16 @@ def get_distance_modifiers(dist: int):
 
 def get_style_distance_eval(style: str, dist: int) -> tuple[float, str]:
     """各馬の脚質とレース距離との展開相性を評価"""
-    if dist <= 1400:
+    if dist <= 400:
+        if style == "逃げ":
+            return 28.0, "⚡ ばんえい障害先頭 (+28)"
+        elif style == "先行":
+            return 24.0, "👑 障害抜け出し主導権 (+24)"
+        elif style == "差し":
+            return -10.0, "▲ 障害待ち届かず不利 (-10)"
+        else:
+            return -24.0, "✕ 追込障害絶望的 (-24)"
+    elif dist <= 1400:
         if style == "逃げ":
             return 25.0, "⚡ 前残り絶対有利 (+25)"
         elif style == "先行":
@@ -720,6 +746,21 @@ def get_track_modifiers(track_str: str, condition_str: str):
     elif "京都" in track_str:
         track_style_bonus = {"逃げ": 6.0, "先行": 8.0, "差し": 6.0, "追込": 0.0}
         track_desc = "京都 (直線404m・平坦高速持続)"
+    elif "中京" in track_str:
+        track_style_bonus = {"逃げ": -2.0, "先行": 6.0, "差し": 8.0, "追込": 4.0}
+        track_desc = "中京 (直線412m・急坂タフ)"
+    elif "盛岡" in track_str:
+        track_style_bonus = {"逃げ": 6.0, "先行": 8.0, "差し": 4.0, "追込": -4.0}
+        track_desc = "盛岡 (左回り / 起伏4.4mタフ・地方唯一芝併設)"
+    elif "大井" in track_str:
+        track_style_bonus = {"逃げ": 2.0, "先行": 6.0, "差し": 10.0, "追込": 6.0}
+        track_desc = "大井 (右回り / 直線386m・南関王道・外差し届く)"
+    elif "金沢" in track_str:
+        track_style_bonus = {"逃げ": 18.0, "先行": 14.0, "差し": -12.0, "追込": -20.0}
+        track_desc = "金沢 (右回り / 直線236m・超小回り前残り鉄則)"
+    elif "帯広" in track_str or "ば" in track_str:
+        track_style_bonus = {"逃げ": 18.0, "先行": 20.0, "差し": -10.0, "追込": -24.0}
+        track_desc = "帯広（ば） (直線200m / 世界唯一ばんえい・障害登坂)"
     elif any(k in track_str for k in ["小倉", "福島", "函館", "札幌"]):
         track_style_bonus = {"逃げ": 16.0, "先行": 12.0, "差し": -10.0, "追込": -18.0}
         track_desc = "小回り平坦 (前残り絶対有利)"
@@ -729,13 +770,19 @@ def get_track_modifiers(track_str: str, condition_str: str):
 
     if "重・不良" in condition_str:
         cond_style_bonus = {"逃げ": 14.0, "先行": 9.0, "差し": -8.0, "追込": -15.0}
-        cond_desc = "☔ 重・不良 (泥濘スタミナ戦・前残り波乱)"
+        if "帯広" in track_str or "ば" in track_str:
+            cond_desc = "☔ 重・不良 (水分高・ソリ軽馬場超スピード前残り)"
+        else:
+            cond_desc = "☔ 重・不良 (泥濘スタミナ戦・前残り波乱)"
     elif "稍重" in condition_str:
         cond_style_bonus = {"逃げ": 5.0, "先行": 4.0, "差し": 0.0, "追込": -5.0}
         cond_desc = "☁️ 稍重 (タフな馬場)"
     else:
         cond_style_bonus = {"逃げ": 0.0, "先行": 2.0, "差し": 2.0, "追込": 0.0}
-        cond_desc = "☀️ 良馬場 (スピード勝負)"
+        if "帯広" in track_str or "ば" in track_str:
+            cond_desc = "☀️ 良馬場 (乾燥砂重・超パワー消耗戦)"
+        else:
+            cond_desc = "☀️ 良馬場 (スピード勝負)"
 
     return track_style_bonus, cond_style_bonus, track_desc, cond_desc
 
