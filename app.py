@@ -301,25 +301,14 @@ st.markdown(
     """
 )
 
-# セッション状態の出走馬データ初期化 (各馬の得意距離ゾーンも設定)
-DISTANCE_CHOICES = ["短距離(1200m)", "マイル(1600m)", "中距離(2000m)", "中長距離(2400m)", "長距離(3000m以上)", "万能"]
-
-DIST_CENTERS = {
-    "短距離(1200m)": 1200,
-    "マイル(1600m)": 1600,
-    "中距離(2000m)": 2000,
-    "中長距離(2400m)": 2400,
-    "長距離(3000m以上)": 3000,
-    "万能": None,
-}
-
-if "horses_data" not in st.session_state or "適性距離" not in st.session_state["horses_data"].columns:
+# セッション状態の出走馬データ初期化 (新聞を見て選べる5項目のみ)
+if "horses_data" not in st.session_state or "適性距離" in st.session_state["horses_data"].columns:
     st.session_state["horses_data"] = pd.DataFrame([
-        {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "脚質": "先行", "騎手名": "ルメール", "適性距離": "短距離(1200m)"},
-        {"馬番": 2, "馬名": "コントレイル", "単勝人気": 2, "脚質": "差し", "騎手名": "川田将雅", "適性距離": "中長距離(2400m)"},
-        {"馬番": 3, "馬名": "キセキ", "単勝人気": 4, "脚質": "逃げ", "騎手名": "武豊", "適性距離": "長距離(3000m以上)"},
-        {"馬番": 4, "馬名": "クロノジェネシス", "単勝人気": 3, "脚質": "先行", "騎手名": "坂井瑠星", "適性距離": "中距離(2000m)"},
-        {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "脚質": "追込", "騎手名": "池添謙一", "適性距離": "短距離(1200m)"},
+        {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+        {"馬番": 2, "馬名": "コントレイル", "単勝人気": 2, "騎手名": "川田将雅", "脚質": "差し"},
+        {"馬番": 3, "馬名": "キセキ", "単勝人気": 4, "騎手名": "武豊", "脚質": "逃げ"},
+        {"馬番": 4, "馬名": "クロノジェネシス", "単勝人気": 3, "騎手名": "坂井瑠星", "脚質": "先行"},
+        {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "騎手名": "池添謙一", "脚質": "追込"},
     ])
 
 def parse_horses_from_text(raw_text: str) -> list[dict]:
@@ -351,33 +340,18 @@ def parse_horses_from_text(raw_text: str) -> list[dict]:
         except Exception:
             extracted_data = []
 
-    valid_dists = ["短距離(1200m)", "マイル(1600m)", "中距離(2000m)", "中長距離(2400m)", "長距離(3000m以上)", "万能"]
     parsed_list = []
 
     if isinstance(extracted_data, list) and len(extracted_data) > 0:
         for item in extracted_data:
             if not isinstance(item, dict):
                 continue
-            dist_cand = str(item.get("適性距離", "中距離(2000m)"))
-            if dist_cand not in valid_dists:
-                if "短" in dist_cand or "1200" in dist_cand:
-                    dist_cand = "短距離(1200m)"
-                elif "マイル" in dist_cand or "1600" in dist_cand:
-                    dist_cand = "マイル(1600m)"
-                elif "中長" in dist_cand or "2400" in dist_cand:
-                    dist_cand = "中長距離(2400m)"
-                elif "長" in dist_cand or "3000" in dist_cand:
-                    dist_cand = "長距離(3000m以上)"
-                else:
-                    dist_cand = "中距離(2000m)"
-
             parsed_list.append({
                 "馬番": int(item.get("馬番", len(parsed_list) + 1)),
                 "馬名": str(item.get("馬名", f"馬{len(parsed_list) + 1}")),
                 "単勝人気": int(item.get("単勝人気", len(parsed_list) + 1)),
-                "脚質": item.get("脚質", "先行") if item.get("脚質") in ["逃げ", "先行", "差し", "追込"] else "先行",
                 "騎手名": str(item.get("騎手名", "騎手")),
-                "適性距離": dist_cand
+                "脚質": item.get("脚質", "先行") if item.get("脚質") in ["逃げ", "先行", "差し", "追込"] else "先行",
             })
 
     # JSONパースに失敗した場合の行ベースフォールバック（netkeibaテキスト等）
@@ -396,9 +370,8 @@ def parse_horses_from_text(raw_text: str) -> list[dict]:
                         "馬番": h_no,
                         "馬名": h_name,
                         "単勝人気": h_pop,
-                        "脚質": "先行",
                         "騎手名": tokens[3] if len(tokens) >= 4 else "騎手",
-                        "適性距離": "中距離(2000m)"
+                        "脚質": "先行",
                     })
                 except Exception:
                     continue
@@ -438,12 +411,12 @@ with st.expander("📷 **【画像・AIから出走馬を一括入力】スク�
 
         if btn_demo:
             st.session_state["horses_data"] = pd.DataFrame([
-                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "脚質": "差し", "騎手名": "武豊", "適性距離": "中長距離(2400m)"},
-                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "脚質": "先行", "騎手名": "ルメール", "適性距離": "中長距離(2400m)"},
-                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "脚質": "差し", "騎手名": "川田将雅", "適性距離": "中距離(2000m)"},
-                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "脚質": "追込", "騎手名": "坂井瑠星", "適性距離": "長距離(3000m以上)"},
-                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "脚質": "逃げ", "騎手名": "横山和生", "適性距離": "長距離(3000m以上)"},
-                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "脚質": "先行", "騎手名": "モレイラ", "適性距離": "中長距離(2400m)"},
+                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "騎手名": "武豊", "脚質": "差し"},
+                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "騎手名": "川田将雅", "脚質": "差し"},
+                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "騎手名": "坂井瑠星", "脚質": "追込"},
+                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "騎手名": "横山和生", "脚質": "逃げ"},
+                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "騎手名": "モレイラ", "脚質": "先行"},
             ])
             st.session_state["predicted_results"] = None
             st.session_state["has_run_prediction"] = False
@@ -473,8 +446,7 @@ with st.expander("📷 **【画像・AIから出走馬を一括入力】スク�
                             "馬名": "馬名",
                             "単勝人気": 1 (単勝人気。不明ならオッズや実績から1〜18の整数),
                             "騎手名": "騎手名 (例: ルメール、川田、武豊)",
-                            "脚質": "逃げ" または "先行" または "差し" または "追込" (過去成績や枠・馬の特性から推定),
-                            "適性距離": "短距離(1200m)" または "マイル(1600m)" または "中距離(2000m)" または "中長距離(2400m)" または "長距離(3000m以上)" または "万能"
+                            "脚質": "逃げ" または "先行" または "差し" または "追込" (推定)
                           }
                         ]
                         注意: 最大18頭まで抽出してください。マークダウンタグはつけず、純粋なJSON文字列のみ出力してください。
@@ -567,8 +539,7 @@ with st.expander("📷 **【画像・AIから出走馬を一括入力】スク�
     "馬名": "馬名",
     "単勝人気": 1,
     "騎手名": "騎手名",
-    "脚質": "逃げ/先行/差し/追込のいずれか",
-    "適性距離": "短距離(1200m)/マイル(1600m)/中距離(2000m)/中長距離(2400m)/長距離(3000m以上)/万能のいずれか"
+    "脚質": "逃げ/先行/差し/追込のいずれか"
   }
 ]
 解説文やマークダウンタグはつけず、純粋なJSON配列のみを出力してください。"""
@@ -578,7 +549,7 @@ with st.expander("📷 **【画像・AIから出走馬を一括入力】スク�
         pasted_content = st.text_area(
             "貼り付けエリア",
             height=160,
-            placeholder='ここに [ {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, ... } ] を貼り付けます',
+            placeholder='ここに [ {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"} ] を貼り付けます',
             key="text_area_pasted_horses"
         )
 
@@ -590,12 +561,12 @@ with st.expander("📷 **【画像・AIから出走馬を一括入力】スク�
 
         if btn_demo_paste:
             st.session_state["horses_data"] = pd.DataFrame([
-                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "脚質": "差し", "騎手名": "武豊", "適性距離": "中長距離(2400m)"},
-                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "脚質": "先行", "騎手名": "ルメール", "適性距離": "中長距離(2400m)"},
-                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "脚質": "差し", "騎手名": "川田将雅", "適性距離": "中距離(2000m)"},
-                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "脚質": "追込", "騎手名": "坂井瑠星", "適性距離": "長距離(3000m以上)"},
-                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "脚質": "逃げ", "騎手名": "横山和生", "適性距離": "長距離(3000m以上)"},
-                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "脚質": "先行", "騎手名": "モレイラ", "適性距離": "中長距離(2400m)"},
+                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "騎手名": "武豊", "脚質": "差し"},
+                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "騎手名": "川田将雅", "脚質": "差し"},
+                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "騎手名": "坂井瑠星", "脚質": "追込"},
+                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "騎手名": "横山和生", "脚質": "逃げ"},
+                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "騎手名": "モレイラ", "脚質": "先行"},
             ])
             st.session_state["predicted_results"] = None
             st.session_state["has_run_prediction"] = False
@@ -620,24 +591,20 @@ with st.expander("📷 **【画像・AIから出走馬を一括入力】スク�
 # 4. 出走馬データ入力テーブル
 # ==========================================
 st.subheader("📋 出走馬データ")
-st.caption("出馬表を見ながら入力・編集できます。行の追加・削除も可能です。")
+st.caption("💡 **脚質（逃げ・先行・差し・追込）は、新聞やnetkeibaの通過順（1-1-1なら逃げ、10-10-8なら差し/追込等）を見て自分で選ぶと的中率が大幅に向上します！**")
 
 current_data = st.session_state["horses_data"].copy()
 current_data = current_data.loc[:, ~current_data.columns.duplicated()]
-required_cols = ["馬番", "馬名", "単勝人気", "脚質", "騎手名", "適性距離"]
+required_cols = ["馬番", "馬名", "単勝人気", "騎手名", "脚質"]
 existing_cols = [c for c in required_cols if c in current_data.columns]
 current_data = current_data[existing_cols]
-
-if "適性距離" not in current_data.columns:
-    current_data["適性距離"] = "中距離(2000m)"
 
 column_config = {
     "馬番": st.column_config.NumberColumn("馬番", min_value=1, max_value=18, step=1, format="%d", required=True),
     "馬名": st.column_config.TextColumn("馬名", required=True),
     "単勝人気": st.column_config.NumberColumn("単勝人気 (1〜18)", min_value=1, max_value=18, step=1, format="%d位", required=True),
-    "脚質": st.column_config.SelectboxColumn("脚質", options=["逃げ", "先行", "差し", "追込"], required=True),
     "騎手名": st.column_config.TextColumn("騎手名", required=True),
-    "適性距離": st.column_config.SelectboxColumn("適性距離", options=DISTANCE_CHOICES, required=True, help="各馬の得意距離ゾーン（レース距離との差で着順が劇的に変化します）"),
+    "脚質": st.column_config.SelectboxColumn("脚質 (自分で選択)", options=["逃げ", "先行", "差し", "追込"], required=True, help="競馬新聞の脚質や通過順を見て選んでください"),
 }
 
 edited_df = st.data_editor(
@@ -658,40 +625,56 @@ PACE_MATRIX = {
 }
 
 def get_distance_modifiers(dist: int):
-    """レース距離に応じた補正係数と脚質補正を返す"""
+    """
+    レース距離に応じた展開補正・騎手重要度（本格競馬モデル）:
+    - 短距離 (〜1400m): 前残り絶対有利（逃げ・先行が特大ボーナス、差し・追込は届かず減点）
+    - マイル〜中距離 (1500m〜2000m): スピード＆スタミナの総合力勝負
+    - 長距離 (2100m〜): スタミナ温存・末脚重視（逃げスタミナ切れ失速減点、差し・追込特大ボーナス、名手騎手重要度急上昇）
+    """
     if dist <= 1400:
-        # 短距離: スピード重視、逃げ・先行の前残り有利
         ability_factor = 1.15
         jockey_factor = 0.85
-        pace_bonus = {"逃げ": 1.15, "先行": 1.10, "差し": 0.90, "追込": 0.80}
+        pace_dist_bonus = {"逃げ": 25.0, "先行": 16.0, "差し": -12.0, "追込": -24.0}
+        pace_dist_mult = {"逃げ": 1.20, "先行": 1.15, "差し": 0.85, "追込": 0.70}
     elif dist <= 2000:
-        # マイル〜中距離: バランス型
         ability_factor = 1.00
         jockey_factor = 1.00
-        pace_bonus = {"逃げ": 1.00, "先行": 1.00, "差し": 1.00, "追込": 1.00}
+        pace_dist_bonus = {"逃げ": 4.0, "先行": 6.0, "差し": 5.0, "追込": 0.0}
+        pace_dist_mult = {"逃げ": 1.00, "先行": 1.00, "差し": 1.00, "追込": 1.00}
     else:
-        # 長距離 (2200m〜): 『長距離は騎手で買え』騎手能力の重要度アップ
         ability_factor = 0.90
-        jockey_factor = 1.30
-        pace_bonus = {"逃げ": 0.85, "先行": 0.95, "差し": 1.15, "追込": 1.10}
-    return ability_factor, jockey_factor, pace_bonus
+        jockey_factor = 1.45
+        pace_dist_bonus = {"逃げ": -24.0, "先行": 4.0, "差し": 20.0, "追込": 16.0}
+        pace_dist_mult = {"逃げ": 0.75, "先行": 0.95, "差し": 1.20, "追込": 1.15}
+    return ability_factor, jockey_factor, pace_dist_bonus, pace_dist_mult
 
-def calculate_distance_fit_bonus(horse_dist_type: str, race_dist: int) -> tuple[float, str]:
-    """各馬の得意距離ゾーンと実際のレース距離との乖離から、加点・大減点を判定"""
-    center = DIST_CENTERS.get(horse_dist_type)
-    if center is None:
-        return 0.0, "万能 (±0)"
-    diff = abs(race_dist - center)
-    if diff <= 200:
-        return 24.0, "◎ 距離ベスト (+24)"
-    elif diff <= 450:
-        return 6.0, "○ 守備範囲 (+6)"
-    elif diff <= 700:
-        return -16.0, "▲ やや不適 (-16)"
-    elif diff <= 1000:
-        return -35.0, "✕ スタミナ/速度難 (-35)"
+def get_style_distance_eval(style: str, dist: int) -> tuple[float, str]:
+    """各馬の脚質とレース距離との展開相性を評価"""
+    if dist <= 1400:
+        if style == "逃げ":
+            return 25.0, "⚡ 前残り絶対有利 (+25)"
+        elif style == "先行":
+            return 16.0, "◎ 好位抜け出し (+16)"
+        elif style == "差し":
+            return -12.0, "▲ 届かず不利 (-12)"
+        else:
+            return -24.0, "✕ 直線短く大不利 (-24)"
+    elif dist <= 2000:
+        if style in ["先行", "差し"]:
+            return 6.0, "○ 総合力適合 (+6)"
+        elif style == "逃げ":
+            return 4.0, "○ ペース次第 (+4)"
+        else:
+            return 0.0, "▲ 展開待ち (±0)"
     else:
-        return -55.0, "✕✕ 距離適性外 (-55)"
+        if style == "逃げ":
+            return -24.0, "✕ スタミナ切れ失速 (-24)"
+        elif style == "先行":
+            return 4.0, "○ 折り合い要 (+4)"
+        elif style == "差し":
+            return 20.0, "👑 直線末脚特大有利 (+20)"
+        else:
+            return 16.0, "◎ 後方脚溜め急襲 (+16)"
 
 def calculate_predictions(
     df: pd.DataFrame,
@@ -704,7 +687,7 @@ def calculate_predictions(
     """
     最先端の非線形・ゲーム理論競馬AIロジック:
     1. 他馬の脚質構成による【展開力学（単騎逃げの利 vs 競り合い共倒れ）】
-    2. 各馬の得意距離ゾーンとレース距離による【距離適合度（ベスト vs 距離適性外）】
+    2. レース距離 × 脚質による【距離展開適合（短距離前残り vs 長距離スタミナ末脚）】
     3. 距離 × 騎手 / 距離 × 脚質の【クロスシナジー】
     4. 能力突出馬の【非線形シグモイド格差拡大】
     5. 期待値【激走穴馬（バリューホース）】自動検知
@@ -712,7 +695,7 @@ def calculate_predictions(
     if df.empty:
         return df, {}
 
-    dist_ab_factor, dist_jk_factor, pace_dist_bonus = get_distance_modifiers(race_distance)
+    dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
 
     # 1. レース内の脚質分布（他馬とのゲーム理論的相互作用）を集計
     escape_count = int((df["脚質"] == "逃げ").sum())
@@ -732,8 +715,8 @@ def calculate_predictions(
     jockey_scores = []
     dynamic_bonuses = []
     synergy_bonuses = []
-    distance_fit_scores = []
-    distance_fit_labels = []
+    dist_bonus_scores = []
+    dist_bonus_labels = []
     estimated_indices = []
     jockey_rates = []
 
@@ -750,7 +733,7 @@ def calculate_predictions(
 
         # ② 展開・脚質ベース
         style = str(row.get("脚質", "先行"))
-        pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_bonus.get(style, 1.0)
+        pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_mult.get(style, 1.0)
         base_pace = 50.0 * w_pace * pace_mult
 
         # ③ 【展開力学】他馬との相互作用（単騎逃げの利 vs 競り合い共倒れ）
@@ -777,36 +760,35 @@ def calculate_predictions(
 
         # ⑤ 【クロスシナジー】掛け算相互作用
         synergy_score = 0.0
-        # 長距離 × トップ騎手 (20%以上)
-        if race_distance >= 2200 and j_rate >= 20.0:
-            synergy_score += (j_rate - 15.0) * 1.8 * w_synergy
+        # 長距離 × トップ騎手 (14%以上: ルメール、川田、武豊、モレイラ等)
+        if race_distance >= 2100 and j_rate >= 14.0:
+            synergy_score += (j_rate - 11.0) * 2.2 * w_synergy
         # 短距離 × 先行逃げ
         if race_distance <= 1400 and style in ["逃げ", "先行"]:
             synergy_score += 14.0 * w_synergy
         # 長距離 × 競り合い逃げ（スタミナ切れ必至）
-        if race_distance >= 2400 and style == "逃げ" and escape_count >= 2:
+        if race_distance >= 2200 and style == "逃げ" and escape_count >= 2:
             synergy_score -= 25.0 * w_synergy
 
-        # ⑥ 【距離適性適合度】馬のベスト距離ゾーンとレース距離の乖離（着順激変の決定打！）
-        horse_dist_type = str(row.get("適性距離", "中距離(2000m)"))
-        dist_fit_val, dist_fit_lbl = calculate_distance_fit_bonus(horse_dist_type, race_distance)
+        # ⑥ 【レース距離 × 脚質】の展開適合ボーナス
+        dist_bonus_val, dist_bonus_lbl = get_style_distance_eval(style, race_distance)
 
-        total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_fit_val
+        total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val
 
         ability_scores.append(round(ability, 2))
         pace_scores.append(round(base_pace + dynamic_score, 2))
         jockey_scores.append(round(base_jockey + synergy_score, 2))
         dynamic_bonuses.append(round(dynamic_score, 2))
         synergy_bonuses.append(round(synergy_score, 2))
-        distance_fit_scores.append(round(dist_fit_val, 2))
-        distance_fit_labels.append(dist_fit_lbl)
+        dist_bonus_scores.append(round(dist_bonus_val, 2))
+        dist_bonus_labels.append(dist_bonus_lbl)
         scores.append(total)
 
     result_df = df.copy()
     result_df["推定能力指数"] = estimated_indices
     result_df["騎手勝率(%)"] = jockey_rates
-    result_df["距離適性評価"] = distance_fit_labels
-    result_df["距離補正点"] = distance_fit_scores
+    result_df["距離展開評価"] = dist_bonus_labels
+    result_df["距離展開点"] = dist_bonus_scores
     result_df["総合スコア"] = np.round(scores, 2)
     result_df["能力スコア"] = ability_scores
     result_df["展開スコア"] = pace_scores
@@ -921,8 +903,8 @@ if st.session_state["predicted_results"] is not None:
 
     st.subheader("📊 全頭の予測着順一覧")
     display_columns = [
-        "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "適性距離", "距離適性評価",
-        "勝率(%)", "総合スコア", "脚質", "推定能力指数", "騎手勝率(%)",
+        "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "脚質", "距離展開評価",
+        "勝率(%)", "総合スコア", "推定能力指数", "騎手勝率(%)",
         "能力スコア", "展開スコア", "騎手スコア", "展開力学", "シナジー"
     ]
     filtered_display = results[[c for c in display_columns if c in results.columns]]
@@ -932,8 +914,8 @@ if st.session_state["predicted_results"] is not None:
         column_config={
             "勝率(%)": st.column_config.ProgressColumn("勝率(%)", format="%.1f%%", min_value=0.0, max_value=100.0),
             "単勝人気": st.column_config.NumberColumn("人気", format="%d位"),
-            "適性距離": st.column_config.TextColumn("得意距離"),
-            "距離適性評価": st.column_config.TextColumn("距離適性判定"),
+            "脚質": st.column_config.TextColumn("選択脚質"),
+            "距離展開評価": st.column_config.TextColumn("距離×脚質適合度"),
             "総合スコア": st.column_config.NumberColumn("総合スコア", format="%.2f"),
             "推定能力指数": st.column_config.NumberColumn("推定能力値", format="%d"),
             "騎手勝率(%)": st.column_config.NumberColumn("騎手勝率", format="%.1f%%"),
@@ -1214,13 +1196,13 @@ if st.session_state["predicted_results"] is not None:
             # 学習対象データ
             features_for_opt = results.copy()
             merged_opt = pd.merge(
-                features_for_opt[["馬番", "馬名", "推定能力指数", "脚質", "騎手勝率(%)", "適性距離"]],
+                features_for_opt[["馬番", "馬名", "推定能力指数", "脚質", "騎手勝率(%)"]],
                 comp_df[["馬番", "実際の着順"]],
                 on="馬番"
             )
 
             # ランキング損失関数 (実着順のペアに対して、非線形パラメータも含めて予測スコアの逆転を最小化)
-            dist_ab_factor, dist_jk_factor, pace_dist_bonus = get_distance_modifiers(race_distance)
+            dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
             escape_count = int((merged_opt["脚質"] == "逃げ").sum())
 
             def ranking_loss(weights):
@@ -1232,7 +1214,7 @@ if st.session_state["predicted_results"] is not None:
                     ability = (idx_val * w_a * dist_ab_factor) + extra_ab
 
                     style = str(r["脚質"])
-                    pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_bonus.get(style, 1.0)
+                    pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_mult.get(style, 1.0)
                     base_pace = 50.0 * w_p * pace_mult
 
                     # 展開力学
@@ -1255,18 +1237,17 @@ if st.session_state["predicted_results"] is not None:
 
                     # クロスシナジー
                     synergy_score = 0.0
-                    if race_distance >= 2200 and j_rate >= 20.0:
-                        synergy_score += (j_rate - 15.0) * 1.8 * w_syn
+                    if race_distance >= 2100 and j_rate >= 14.0:
+                        synergy_score += (j_rate - 11.0) * 2.2 * w_syn
                     if race_distance <= 1400 and style in ["逃げ", "先行"]:
                         synergy_score += 14.0 * w_syn
-                    if race_distance >= 2400 and style == "逃げ" and escape_count >= 2:
+                    if race_distance >= 2200 and style == "逃げ" and escape_count >= 2:
                         synergy_score -= 25.0 * w_syn
 
-                    # 距離適性補正
-                    horse_dist_type = str(r.get("適性距離", "中距離(2000m)"))
-                    dist_fit_val, _ = calculate_distance_fit_bonus(horse_dist_type, race_distance)
+                    # 距離×脚質展開ボーナス
+                    dist_bonus_val, _ = get_style_distance_eval(style, race_distance)
 
-                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_fit_val)
+                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val)
 
                 scores_arr = np.array(calc_scores)
                 actual_ranks = merged_opt["実際の着順"].values
