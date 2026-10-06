@@ -87,6 +87,9 @@ def load_ai_model():
                 data = json.load(f)
                 weights = DEFAULT_WEIGHTS.copy()
                 weights.update(data.get("learned_weights", {}))
+                # 麻痺・極端値防止ガード: 主要パラメータが全て0.3以下の場合は健全な標準値に自動リカバリ
+                if weights.get("ability", 1.5) <= 0.3 and weights.get("pace", 1.2) <= 0.3:
+                    weights = DEFAULT_WEIGHTS.copy()
                 history = data.get("training_history", [])
                 return weights, history
         except Exception:
@@ -113,11 +116,26 @@ if "learned_weights" not in st.session_state:
 if "predicted_results" not in st.session_state:
     st.session_state["predicted_results"] = None
 
-# 主要騎手の参考勝率データベース (%)
+# 主要騎手の参考勝率データベース (%) (JRA・地方競馬・ばんえい対応)
 JOCKEY_WIN_RATES = {
     # トップ層 (20%〜)
     "ルメール": 26.5, "C.ルメール": 26.5, "川田": 25.0, "川田将雅": 25.0,
     "モレイラ": 28.0, "J.モレイラ": 28.0, "レーン": 27.0, "D.レーン": 27.0, "ムーア": 25.0, "R.ムーア": 25.0,
+    # 地方競馬トップ層 (南関・岩手・金沢・高知・園田・ばんえい等)
+    "吉原": 24.5, "吉原寛人": 24.5, # 金沢レジェンド・全国交流重賞キラー
+    "森泰斗": 20.5, # 南関レジェンド
+    "赤岡": 25.0, "赤岡修次": 25.0, # 高知トップ
+    "吉村智": 24.0, "吉村智洋": 24.0, # 園田トップ
+    "山本聡": 20.0, "山本聡哉": 20.0, # 岩手・盛岡トップ
+    "鈴木恵": 20.0, "鈴木恵介": 20.0, # ばんえい帯広
+    "阿部武": 18.0, "阿部武臣": 18.0, # ばんえい帯広
+    "笹川": 18.5, "笹川翼": 18.5, # 南関リーディング
+    "山本政": 17.5, "山本政聡": 17.5, # 岩手・盛岡
+    "矢野": 17.0, "矢野貴之": 17.0, # 南関トップ
+    "島津新": 17.0, # ばんえい帯広
+    "村上忍": 17.0, # 岩手・盛岡
+    "御神本": 16.5, "御神本訓史": 16.5, # 南関名手
+    "中島龍": 16.5, "中島龍也": 16.5, # 金沢
     # 上位層 (13%〜19%)
     "戸崎": 16.5, "戸崎圭太": 16.5, "坂井": 15.5, "坂井瑠星": 15.5, "武豊": 15.0,
     "横山武": 14.5, "横山武史": 14.5, "松山": 13.5, "松山弘平": 13.5,
@@ -946,7 +964,20 @@ def calculate_predictions(
             tc_lbl = "○ コース不問"
         track_cond_labels.append(tc_lbl)
 
-        total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val
+        # ⑧ 【枠番・馬番バイアス】（ダート短距離の外枠有利・砂被り回避）
+        draw_score = 0.0
+        try:
+            h_num = int(row.get("馬番", 0))
+            total_n = len(df)
+            if course_type == "ダート" and race_distance <= 1400:
+                if total_n >= 8 and h_num >= total_n - 2:
+                    draw_score += 6.0  # 外枠（砂被らずスムーズ加速有利）
+                elif h_num <= 2:
+                    draw_score -= 4.0  # 最内枠（砂被り・包まれリスク）
+        except Exception:
+            pass
+
+        total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val + draw_score
 
         ability_scores.append(round(ability, 2))
         pace_scores.append(round(base_pace + dynamic_score, 2))
@@ -1430,7 +1461,20 @@ if st.session_state["predicted_results"] is not None:
                     # 競馬場×馬場補正
                     t_val = track_style_bonus.get(style, 0.0) + cond_style_bonus.get(style, 0.0)
 
-                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val)
+                    # ⑧ 枠番バイアス
+                    draw_score = 0.0
+                    try:
+                        h_num = int(r.get("馬番", 0))
+                        total_n = len(merged_opt)
+                        if course_type == "ダート" and race_distance <= 1400:
+                            if total_n >= 8 and h_num >= total_n - 2:
+                                draw_score += 6.0
+                            elif h_num <= 2:
+                                draw_score -= 4.0
+                    except Exception:
+                        pass
+
+                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val + draw_score)
 
                 scores_arr = np.array(calc_scores)
                 actual_ranks = merged_opt["実際の着順"].values
@@ -1462,11 +1506,26 @@ if st.session_state["predicted_results"] is not None:
 
             opt_res = minimize(ranking_loss, initial_guess, method="L-BFGS-B", bounds=bounds)
 
-            new_w_ability = round(float(opt_res.x[0]), 2)
-            new_w_pace = round(float(opt_res.x[1]), 2)
-            new_w_jockey = round(float(opt_res.x[2]), 2)
-            new_w_escape = round(float(opt_res.x[3]), 2)
-            new_w_synergy = round(float(opt_res.x[4]), 2)
+            target_a = float(opt_res.x[0])
+            target_p = float(opt_res.x[1])
+            target_j = float(opt_res.x[2])
+            target_e = float(opt_res.x[3])
+            target_s = float(opt_res.x[4])
+
+            # ★ 一戦の波乱でモデルが崩壊（ゼロ麻痺）しないためのモメンタム学習（学習率 35%）
+            alpha = 0.35
+            new_w_ability = round(float(weight_ability * (1 - alpha) + target_a * alpha), 2)
+            new_w_pace = round(float(weight_pace * (1 - alpha) + target_p * alpha), 2)
+            new_w_jockey = round(float(weight_jockey * (1 - alpha) + target_j * alpha), 2)
+            new_w_escape = round(float(weight_escape_dynamic * (1 - alpha) + target_e * alpha), 2)
+            new_w_synergy = round(float(weight_synergy * (1 - alpha) + target_s * alpha), 2)
+
+            # 最低安全リミッター（能力や展開の重みが0近くに潰れるのを防止）
+            new_w_ability = max(0.6, min(3.0, new_w_ability))
+            new_w_pace = max(0.5, min(3.0, new_w_pace))
+            new_w_jockey = max(0.4, min(3.0, new_w_jockey))
+            new_w_escape = max(0.5, min(3.0, new_w_escape))
+            new_w_synergy = max(0.4, min(3.0, new_w_synergy))
 
             delta_a = round(new_w_ability - weight_ability, 2)
             delta_p = round(new_w_pace - weight_pace, 2)
