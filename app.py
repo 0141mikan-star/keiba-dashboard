@@ -257,25 +257,46 @@ st.sidebar.header("⚖️ 予想要素の重視度 (重み)")
 st.sidebar.caption("※ AIが学習した最適値が自動セットされます（手動微調整も可能）")
 
 # スライダーと学習重みの同期処理（AI学習完了時や標準値リセット時に強制更新）
+def clamp_w(v, min_v=0.0, max_v=3.0):
+    try:
+        return float(round(max(min_v, min(max_v, float(v))), 2))
+    except Exception:
+        return 1.0
+
+# スライダーと学習重みの同期処理（AI学習完了時や標準値リセット時に強制更新）
 if st.session_state.get("weights_just_updated", False):
-    st.session_state["slider_ability"] = float(st.session_state["learned_weights"]["ability"])
-    st.session_state["slider_pace"] = float(st.session_state["learned_weights"]["pace"])
-    st.session_state["slider_jockey"] = float(st.session_state["learned_weights"]["jockey"])
-    st.session_state["slider_escape_dynamic"] = float(st.session_state["learned_weights"].get("escape_dynamic", 1.2))
-    st.session_state["slider_synergy"] = float(st.session_state["learned_weights"].get("synergy", 1.1))
+    st.session_state["slider_ability"] = clamp_w(st.session_state["learned_weights"]["ability"])
+    st.session_state["slider_pace"] = clamp_w(st.session_state["learned_weights"]["pace"])
+    st.session_state["slider_jockey"] = clamp_w(st.session_state["learned_weights"]["jockey"])
+    st.session_state["slider_escape_dynamic"] = clamp_w(st.session_state["learned_weights"].get("escape_dynamic", 1.2))
+    st.session_state["slider_synergy"] = clamp_w(st.session_state["learned_weights"].get("synergy", 1.1))
     st.session_state["weights_just_updated"] = False
 
 current_w = st.session_state["learned_weights"]
 if "slider_ability" not in st.session_state:
-    st.session_state["slider_ability"] = float(current_w.get("ability", 1.5))
+    st.session_state["slider_ability"] = clamp_w(current_w.get("ability", 1.5))
+else:
+    st.session_state["slider_ability"] = clamp_w(st.session_state["slider_ability"])
+
 if "slider_pace" not in st.session_state:
-    st.session_state["slider_pace"] = float(current_w.get("pace", 1.2))
+    st.session_state["slider_pace"] = clamp_w(current_w.get("pace", 1.2))
+else:
+    st.session_state["slider_pace"] = clamp_w(st.session_state["slider_pace"])
+
 if "slider_jockey" not in st.session_state:
-    st.session_state["slider_jockey"] = float(current_w.get("jockey", 0.9))
+    st.session_state["slider_jockey"] = clamp_w(current_w.get("jockey", 0.9))
+else:
+    st.session_state["slider_jockey"] = clamp_w(st.session_state["slider_jockey"])
+
 if "slider_escape_dynamic" not in st.session_state:
-    st.session_state["slider_escape_dynamic"] = float(current_w.get("escape_dynamic", 1.2))
+    st.session_state["slider_escape_dynamic"] = clamp_w(current_w.get("escape_dynamic", 1.2))
+else:
+    st.session_state["slider_escape_dynamic"] = clamp_w(st.session_state["slider_escape_dynamic"])
+
 if "slider_synergy" not in st.session_state:
-    st.session_state["slider_synergy"] = float(current_w.get("synergy", 1.1))
+    st.session_state["slider_synergy"] = clamp_w(current_w.get("synergy", 1.1))
+else:
+    st.session_state["slider_synergy"] = clamp_w(st.session_state["slider_synergy"])
 
 col_rst1, col_rst2 = st.sidebar.columns(2)
 with col_rst1:
@@ -301,12 +322,12 @@ weight_jockey = st.sidebar.slider(
 with st.sidebar.expander("⚡ **AI非線形・ゲーム理論パラメータ**"):
     st.caption("他馬との駆け引きや距離の掛け算を制御（AI学習で自動最適化）")
     weight_escape_dynamic = st.slider(
-        "🔥 単騎逃げ・ハナ争い力学", min_value=0.5, max_value=2.5,
+        "🔥 単騎逃げ・ハナ争い力学", min_value=0.0, max_value=3.0,
         step=0.1, key="slider_escape_dynamic",
         help="単騎逃げの特大ボーナス、および逃げ馬競り合い時の共倒れペナルティの強度"
     )
     weight_synergy = st.slider(
-        "✨ 距離×騎手クロスシナジー", min_value=0.5, max_value=2.5,
+        "✨ 距離×騎手クロスシナジー", min_value=0.0, max_value=3.0,
         step=0.1, key="slider_synergy",
         help="長距離×名手、短距離×先行など条件相乗効果の強度"
     )
@@ -1437,7 +1458,7 @@ if st.session_state["predicted_results"] is not None:
 
             # 最適化の実行 (5次元パラメータ探索)
             initial_guess = [weight_ability, weight_pace, weight_jockey, weight_escape_dynamic, weight_synergy]
-            bounds = [(0.0, 3.0), (0.0, 3.0), (0.0, 3.0), (0.5, 2.5), (0.5, 2.5)]
+            bounds = [(0.0, 3.0), (0.0, 3.0), (0.0, 3.0), (0.0, 3.0), (0.0, 3.0)]
 
             opt_res = minimize(ranking_loss, initial_guess, method="L-BFGS-B", bounds=bounds)
 
