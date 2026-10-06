@@ -256,24 +256,45 @@ st.sidebar.markdown("---")
 st.sidebar.header("⚖️ 予想要素の重視度 (重み)")
 st.sidebar.caption("※ AIが学習した最適値が自動セットされます（手動微調整も可能）")
 
+# スライダーと学習重みの同期処理（AI学習完了時や標準値リセット時に強制更新）
+if st.session_state.get("weights_just_updated", False):
+    st.session_state["slider_ability"] = float(st.session_state["learned_weights"]["ability"])
+    st.session_state["slider_pace"] = float(st.session_state["learned_weights"]["pace"])
+    st.session_state["slider_jockey"] = float(st.session_state["learned_weights"]["jockey"])
+    st.session_state["slider_escape_dynamic"] = float(st.session_state["learned_weights"].get("escape_dynamic", 1.2))
+    st.session_state["slider_synergy"] = float(st.session_state["learned_weights"].get("synergy", 1.1))
+    st.session_state["weights_just_updated"] = False
+
+current_w = st.session_state["learned_weights"]
+if "slider_ability" not in st.session_state:
+    st.session_state["slider_ability"] = float(current_w.get("ability", 1.5))
+if "slider_pace" not in st.session_state:
+    st.session_state["slider_pace"] = float(current_w.get("pace", 1.2))
+if "slider_jockey" not in st.session_state:
+    st.session_state["slider_jockey"] = float(current_w.get("jockey", 0.9))
+if "slider_escape_dynamic" not in st.session_state:
+    st.session_state["slider_escape_dynamic"] = float(current_w.get("escape_dynamic", 1.2))
+if "slider_synergy" not in st.session_state:
+    st.session_state["slider_synergy"] = float(current_w.get("synergy", 1.1))
+
 col_rst1, col_rst2 = st.sidebar.columns(2)
 with col_rst1:
     if st.button("🔄 標準値に戻す", use_container_width=True):
         st.session_state["learned_weights"] = DEFAULT_WEIGHTS.copy()
+        st.session_state["weights_just_updated"] = True
         st.rerun()
 
-current_w = st.session_state["learned_weights"]
 weight_ability = st.sidebar.slider(
     "1️⃣ 基礎能力（人気・指数）", min_value=0.0, max_value=3.0,
-    value=float(current_w.get("ability", 1.5)), step=0.1, key="slider_ability"
+    step=0.1, key="slider_ability"
 )
 weight_pace = st.sidebar.slider(
     "2️⃣ 展開・脚質適合度", min_value=0.0, max_value=3.0,
-    value=float(current_w.get("pace", 1.2)), step=0.1, key="slider_pace"
+    step=0.1, key="slider_pace"
 )
 weight_jockey = st.sidebar.slider(
     "3️⃣ 騎手能力", min_value=0.0, max_value=3.0,
-    value=float(current_w.get("jockey", 0.9)), step=0.1, key="slider_jockey"
+    step=0.1, key="slider_jockey"
 )
 
 # AI非線形・ゲーム理論パラメータ（自動最適化される深層パラメータ）
@@ -281,14 +302,21 @@ with st.sidebar.expander("⚡ **AI非線形・ゲーム理論パラメータ**")
     st.caption("他馬との駆け引きや距離の掛け算を制御（AI学習で自動最適化）")
     weight_escape_dynamic = st.slider(
         "🔥 単騎逃げ・ハナ争い力学", min_value=0.5, max_value=2.5,
-        value=float(current_w.get("escape_dynamic", 1.2)), step=0.1, key="slider_escape_dynamic",
+        step=0.1, key="slider_escape_dynamic",
         help="単騎逃げの特大ボーナス、および逃げ馬競り合い時の共倒れペナルティの強度"
     )
     weight_synergy = st.slider(
         "✨ 距離×騎手クロスシナジー", min_value=0.5, max_value=2.5,
-        value=float(current_w.get("synergy", 1.1)), step=0.1, key="slider_synergy",
+        step=0.1, key="slider_synergy",
         help="長距離×名手、短距離×先行など条件相乗効果の強度"
     )
+
+# 手動スライダー変更をlearned_weightsにリアルタイム同期
+st.session_state["learned_weights"]["ability"] = weight_ability
+st.session_state["learned_weights"]["pace"] = weight_pace
+st.session_state["learned_weights"]["jockey"] = weight_jockey
+st.session_state["learned_weights"]["escape_dynamic"] = weight_escape_dynamic
+st.session_state["learned_weights"]["synergy"] = weight_synergy
 
 # サイドバーに学習履歴の要約と永続化ステータスを表示
 if len(st.session_state["training_history"]) > 0:
@@ -305,6 +333,7 @@ if len(st.session_state["training_history"]) > 0:
             os.remove(MODEL_FILE)
         st.session_state["learned_weights"] = DEFAULT_WEIGHTS.copy()
         st.session_state["training_history"] = []
+        st.session_state["weights_just_updated"] = True
         st.success("学習データを初期化しました！")
         st.rerun()
 
@@ -841,7 +870,7 @@ def calculate_predictions(
         # ① 基礎能力 (上位突出馬の非線形格差補正)
         extra_ability = 0.0
         if idx_val >= 92:
-            extra_ability = ((idx_val - 90) ** 1.3) * 1.5
+            extra_ability = ((idx_val - 90) ** 1.3) * 1.5 * (w_ability / 1.5)
         ability = (float(idx_val) * w_ability * dist_ab_factor) + extra_ability
 
         # ② 展開・脚質ベース
@@ -959,6 +988,7 @@ if "has_run_prediction" not in st.session_state:
 
 if btn_predict:
     st.session_state["has_run_prediction"] = True
+    st.session_state["show_optimization_success"] = None
 
 # 一度予測を実行した後は、サイドバーの距離変更・スライダー変更・データ変更時に自動でリアルタイム再計算
 if st.session_state["has_run_prediction"]:
@@ -1339,7 +1369,7 @@ if st.session_state["predicted_results"] is not None:
                 calc_scores = []
                 for _, r in merged_opt.iterrows():
                     idx_val = float(r["推定能力指数"])
-                    extra_ab = ((idx_val - 90) ** 1.3) * 1.5 if idx_val >= 92 else 0.0
+                    extra_ab = ((idx_val - 90) ** 1.3) * 1.5 * (w_a / 1.5) if idx_val >= 92 else 0.0
                     ability = (idx_val * w_a * dist_ab_factor) + extra_ab
 
                     style = str(r["脚質"])
@@ -1399,7 +1429,7 @@ if st.session_state["predicted_results"] is not None:
                                 loss += margin ** 2
 
                 # 正則化項 (極端な偏りを防ぐ安定化項)
-                reg = 0.04 * (
+                reg = 0.02 * (
                     (w_a - 1.5)**2 + (w_p - 1.2)**2 + (w_j - 0.9)**2 +
                     (w_esc - 1.2)**2 + (w_syn - 1.1)**2
                 )
@@ -1407,7 +1437,7 @@ if st.session_state["predicted_results"] is not None:
 
             # 最適化の実行 (5次元パラメータ探索)
             initial_guess = [weight_ability, weight_pace, weight_jockey, weight_escape_dynamic, weight_synergy]
-            bounds = [(0.1, 3.0), (0.1, 3.0), (0.1, 3.0), (0.3, 2.5), (0.3, 2.5)]
+            bounds = [(0.0, 3.0), (0.0, 3.0), (0.0, 3.0), (0.5, 2.5), (0.5, 2.5)]
 
             opt_res = minimize(ranking_loss, initial_guess, method="L-BFGS-B", bounds=bounds)
 
@@ -1417,6 +1447,12 @@ if st.session_state["predicted_results"] is not None:
             new_w_escape = round(float(opt_res.x[3]), 2)
             new_w_synergy = round(float(opt_res.x[4]), 2)
 
+            delta_a = round(new_w_ability - weight_ability, 2)
+            delta_p = round(new_w_pace - weight_pace, 2)
+            delta_j = round(new_w_jockey - weight_jockey, 2)
+            delta_e = round(new_w_escape - weight_escape_dynamic, 2)
+            delta_s = round(new_w_synergy - weight_synergy, 2)
+
             # 学習結果の保存 (セッション & ローカルファイルに永続化)
             st.session_state["learned_weights"] = {
                 "ability": new_w_ability,
@@ -1425,6 +1461,9 @@ if st.session_state["predicted_results"] is not None:
                 "escape_dynamic": new_w_escape,
                 "synergy": new_w_synergy
             }
+            # スライダー同期フラグをONにして次フレームでスライダーを更新
+            st.session_state["weights_just_updated"] = True
+
             hist_entry = {
                 "レース番号": f"第{len(st.session_state['training_history']) + 1}戦",
                 "学習日時": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
@@ -1439,43 +1478,59 @@ if st.session_state["predicted_results"] is not None:
             # ローカルファイルに永久保存
             save_ai_model(st.session_state["learned_weights"], st.session_state["training_history"])
 
-            st.success("🎉 **最先端AIの多次元最適化学習が完了しました！最適化結果は永久保存されました。**")
-
-            # ビフォーアフターの比較表示
-            col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
-            with col_b1:
-                delta_a = round(new_w_ability - weight_ability, 2)
-                st.metric("1️⃣ 基礎能力", f"{new_w_ability:.2f}", delta=f"{delta_a:+.2f}")
-            with col_b2:
-                delta_p = round(new_w_pace - weight_pace, 2)
-                st.metric("2️⃣ 展開・脚質", f"{new_w_pace:.2f}", delta=f"{delta_p:+.2f}")
-            with col_b3:
-                delta_j = round(new_w_jockey - weight_jockey, 2)
-                st.metric("3️⃣ 騎手能力", f"{new_w_jockey:.2f}", delta=f"{delta_j:+.2f}")
-            with col_b4:
-                delta_e = round(new_w_escape - weight_escape_dynamic, 2)
-                st.metric("🔥 展開力学", f"{new_w_escape:.2f}", delta=f"{delta_e:+.2f}")
-            with col_b5:
-                delta_s = round(new_w_synergy - weight_synergy, 2)
-                st.metric("✨ シナジー", f"{new_w_synergy:.2f}", delta=f"{delta_s:+.2f}")
-
             # AIの分析解説インサイト
             insights = []
             if delta_e > 0.05:
                 insights.append("🔥 **【展開力学の学習】** 逃げ馬の頭数による影響（単騎逃げの利、または逃げ争いによる共倒れ・差し台頭）をより敏感に評価するよう進化しました。")
+            elif delta_e < -0.05:
+                insights.append("🕊️ **【展開力学の抑制】** 逃げ馬の展開による影響を控えめに補正しました。")
             if delta_s > 0.05:
                 insights.append("✨ **【クロスシナジーの学習】** 「長距離×トップ騎手」や「短距離×先行」などの条件掛け算シナジーをより強力に評価するように学習しました。")
             if delta_p > 0.1:
                 insights.append("🏇 **展開（脚質）が勝敗を大きく左右したレース**でした。展開・位置取りの基本重要度を引き上げました。")
+            elif delta_p < -0.1:
+                insights.append("📉 **展開の影響が少なかったレース**でした。展開重視度を抑制しました。")
             if delta_a > 0.1:
                 insights.append("💪 **馬の絶対的な基礎能力・人気通りの強さが目立ったレース**でした。基礎能力の重視度を引き上げました。")
+            elif delta_a < -0.1:
+                insights.append("⚡ **人気馬が総崩れした波乱レース**でした。人気・指数の過信を抑え、穴馬重視へシフトしました。")
             if delta_j > 0.1:
                 insights.append("🏇 **トップ騎手の腕前・勝負勘が大きく貢献したレース**でした。騎手能力の重視度を引き上げました。")
 
-            if insights:
-                st.info("💡 **AIの学習分析コメント**:\n" + "\n".join(insights))
+            st.session_state["show_optimization_success"] = {
+                "deltas": (delta_a, delta_p, delta_j, delta_e, delta_s),
+                "weights": (new_w_ability, new_w_pace, new_w_jockey, new_w_escape, new_w_synergy),
+                "insights": insights
+            }
 
-            st.balloons()
+            # 画面を即座に再描画して、スライダーと予測結果に最新学習重みを反映
+            st.rerun()
+
+    # 最適化学習完了時のビフォーアフター & インサイト表示
+    if st.session_state.get("show_optimization_success"):
+        opt_info = st.session_state["show_optimization_success"]
+        delta_a, delta_p, delta_j, delta_e, delta_s = opt_info["deltas"]
+        w_a, w_p, w_j, w_e, w_s = opt_info["weights"]
+        insights = opt_info["insights"]
+
+        st.success("🎉 **最先端AIの多次元最適化学習が完了しました！サイドバーの重みと予想着順を最新学習モデルで自動更新しました。**")
+
+        col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
+        with col_b1:
+            st.metric("1️⃣ 基礎能力", f"{w_a:.2f}", delta=f"{delta_a:+.2f}")
+        with col_b2:
+            st.metric("2️⃣ 展開・脚質", f"{w_p:.2f}", delta=f"{delta_p:+.2f}")
+        with col_b3:
+            st.metric("3️⃣ 騎手能力", f"{w_j:.2f}", delta=f"{delta_j:+.2f}")
+        with col_b4:
+            st.metric("🔥 展開力学", f"{w_e:.2f}", delta=f"{delta_e:+.2f}")
+        with col_b5:
+            st.metric("✨ シナジー", f"{w_s:.2f}", delta=f"{delta_s:+.2f}")
+
+        if insights:
+            st.info("💡 **AIの学習分析コメント**:\n" + "\n".join(insights))
+
+        st.balloons()
 
 # ==========================================
 # 8. 永続化された学習レース履歴の一覧表示
