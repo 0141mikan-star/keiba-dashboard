@@ -196,16 +196,43 @@ with cols_d[3]:
         st.session_state["current_distance"] = 2400
         st.rerun()
 
+track_name = st.sidebar.selectbox(
+    "🏟️ 競馬場 (コース特徴)",
+    [
+        "東京 (左回り / 直線525m・日本屈指の末脚勝負)",
+        "中山 (右回り / 直線310m・急坂小回り前残り)",
+        "阪神 (右回り / 直線474m・急坂パワー勝負)",
+        "京都 (右回り / 直線404m・平坦高速持続)",
+        "中京 (左回り / 直線412m・急坂タフ)",
+        "新潟 (左回り / 直線659m・日本最長直線)",
+        "小倉・福島・函館・札幌 (小回り平坦・先行有利)",
+        "標準・指定なし (平均的なコース)"
+    ],
+    index=0,
+    help="競馬場ごとの直線の長さや坂・コーナーの急さが自動判定されます"
+)
+
+track_condition = st.sidebar.selectbox(
+    "🌦️ 馬場状態 (天候・水分)",
+    [
+        "良馬場 (晴・乾燥 / 高速スピード＆キレ味)",
+        "稍重 (標準〜やや湿り / 総合力)",
+        "重・不良 (雨・泥濘 / パワー＆スタミナ前残り波乱)"
+    ],
+    index=0,
+    help="雨で馬場が渋ると、キレ味自慢の人気馬が失速し、パワー型の前残りが大激走しやすくなります"
+)
+
 course_type = st.sidebar.selectbox("コース種別", ["芝", "ダート"], index=0)
 pace_prediction = st.sidebar.selectbox("想定ペース", ["スローペース", "ミドルペース", "ハイペース"], index=1)
 
 # 距離カテゴリの自動判定表示
 if race_distance <= 1400:
-    dist_label = "⚡ 短距離 (スプリント) : スピード・前残り有利"
+    dist_label = "⚡ 短距離 : スピード・前残り絶対有利"
 elif race_distance <= 2000:
-    dist_label = "🎯 マイル〜中距離 : スピード＆スタミナの総合力"
+    dist_label = "🎯 マイル〜中距離 : スピード＆スタミナ総合力"
 else:
-    dist_label = "👑 長距離 (ステイヤー) : 騎手の腕前・折り合い重視"
+    dist_label = "👑 長距離 : 折り合い・騎手手腕・末脚勝負"
 st.sidebar.caption(f"**距離特性**: {dist_label}")
 
 st.sidebar.markdown("---")
@@ -676,6 +703,42 @@ def get_style_distance_eval(style: str, dist: int) -> tuple[float, str]:
         else:
             return 16.0, "◎ 後方脚溜め急襲 (+16)"
 
+def get_track_modifiers(track_str: str, condition_str: str):
+    """競馬場と馬場状態から、脚質ごとの補正とコース診断を算出"""
+    if "東京" in track_str:
+        track_style_bonus = {"逃げ": -8.0, "先行": 2.0, "差し": 14.0, "追込": 10.0}
+        track_desc = "東京 (直線525m・末脚炸裂)"
+    elif "中山" in track_str:
+        track_style_bonus = {"逃げ": 14.0, "先行": 12.0, "差し": -8.0, "追込": -16.0}
+        track_desc = "中山 (直線310m・急坂小回り前残り)"
+    elif "新潟" in track_str:
+        track_style_bonus = {"逃げ": -12.0, "先行": 0.0, "差し": 16.0, "追込": 14.0}
+        track_desc = "新潟 (直線659m・日本最長直線強襲)"
+    elif "阪神" in track_str:
+        track_style_bonus = {"逃げ": 2.0, "先行": 8.0, "差し": 8.0, "追込": 4.0}
+        track_desc = "阪神 (直線474m・急坂タフ)"
+    elif "京都" in track_str:
+        track_style_bonus = {"逃げ": 6.0, "先行": 8.0, "差し": 6.0, "追込": 0.0}
+        track_desc = "京都 (直線404m・平坦高速持続)"
+    elif any(k in track_str for k in ["小倉", "福島", "函館", "札幌"]):
+        track_style_bonus = {"逃げ": 16.0, "先行": 12.0, "差し": -10.0, "追込": -18.0}
+        track_desc = "小回り平坦 (前残り絶対有利)"
+    else:
+        track_style_bonus = {"逃げ": 0.0, "先行": 0.0, "差し": 0.0, "追込": 0.0}
+        track_desc = "標準コース"
+
+    if "重・不良" in condition_str:
+        cond_style_bonus = {"逃げ": 14.0, "先行": 9.0, "差し": -8.0, "追込": -15.0}
+        cond_desc = "☔ 重・不良 (泥濘スタミナ戦・前残り波乱)"
+    elif "稍重" in condition_str:
+        cond_style_bonus = {"逃げ": 5.0, "先行": 4.0, "差し": 0.0, "追込": -5.0}
+        cond_desc = "☁️ 稍重 (タフな馬場)"
+    else:
+        cond_style_bonus = {"逃げ": 0.0, "先行": 2.0, "差し": 2.0, "追込": 0.0}
+        cond_desc = "☀️ 良馬場 (スピード勝負)"
+
+    return track_style_bonus, cond_style_bonus, track_desc, cond_desc
+
 def calculate_predictions(
     df: pd.DataFrame,
     w_ability: float,
@@ -688,14 +751,16 @@ def calculate_predictions(
     最先端の非線形・ゲーム理論競馬AIロジック:
     1. 他馬の脚質構成による【展開力学（単騎逃げの利 vs 競り合い共倒れ）】
     2. レース距離 × 脚質による【距離展開適合（短距離前残り vs 長距離スタミナ末脚）】
-    3. 距離 × 騎手 / 距離 × 脚質の【クロスシナジー】
-    4. 能力突出馬の【非線形シグモイド格差拡大】
-    5. 期待値【激走穴馬（バリューホース）】自動検知
+    3. 競馬場 (コース特徴) × 馬場状態 (天候水分) による【コース物理補正】
+    4. 距離 × 騎手 / 距離 × 脚質の【クロスシナジー】
+    5. 能力突出馬の【非線形シグモイド格差拡大】
+    6. 期待値【激走穴馬（バリューホース）】自動検知
     """
     if df.empty:
         return df, {}
 
     dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
+    track_style_bonus, cond_style_bonus, track_desc, cond_desc = get_track_modifiers(track_name, track_condition)
 
     # 1. レース内の脚質分布（他馬とのゲーム理論的相互作用）を集計
     escape_count = int((df["脚質"] == "逃げ").sum())
@@ -717,6 +782,7 @@ def calculate_predictions(
     synergy_bonuses = []
     dist_bonus_scores = []
     dist_bonus_labels = []
+    track_cond_labels = []
     estimated_indices = []
     jockey_rates = []
 
@@ -773,7 +839,17 @@ def calculate_predictions(
         # ⑥ 【レース距離 × 脚質】の展開適合ボーナス
         dist_bonus_val, dist_bonus_lbl = get_style_distance_eval(style, race_distance)
 
-        total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val
+        # ⑦ 【競馬場 (コース特徴) × 馬場状態 (水分天候)】の脚質補正
+        t_val = track_style_bonus.get(style, 0.0) + cond_style_bonus.get(style, 0.0)
+        if t_val > 5:
+            tc_lbl = "◎ コース・馬場追い風"
+        elif t_val < -5:
+            tc_lbl = "▲ コース・馬場向かず"
+        else:
+            tc_lbl = "○ コース不問"
+        track_cond_labels.append(tc_lbl)
+
+        total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val
 
         ability_scores.append(round(ability, 2))
         pace_scores.append(round(base_pace + dynamic_score, 2))
@@ -788,7 +864,7 @@ def calculate_predictions(
     result_df["推定能力指数"] = estimated_indices
     result_df["騎手勝率(%)"] = jockey_rates
     result_df["距離展開評価"] = dist_bonus_labels
-    result_df["距離展開点"] = dist_bonus_scores
+    result_df["コース馬場評価"] = track_cond_labels
     result_df["総合スコア"] = np.round(scores, 2)
     result_df["能力スコア"] = ability_scores
     result_df["展開スコア"] = pace_scores
@@ -819,7 +895,9 @@ def calculate_predictions(
     meta = {
         "escape_count": escape_count,
         "lead_count": lead_count,
-        "pace_diagnosis": pace_diag
+        "pace_diagnosis": pace_diag,
+        "track_desc": track_desc,
+        "cond_desc": cond_desc
     }
     return result_df, meta
 
@@ -865,9 +943,11 @@ if st.session_state["has_run_prediction"]:
 if st.session_state["predicted_results"] is not None:
     results = st.session_state["predicted_results"]
     meta = st.session_state.get("predicted_meta", {})
+    t_desc = meta.get("track_desc", "標準コース")
+    c_desc = meta.get("cond_desc", "良馬場")
 
     # レース条件バッジ
-    st.info(f"📍 **設定レース条件**: 【{course_type} {race_distance}m】 / 想定ペース: **{pace_prediction}** ({dist_label}) ｜ ⚡ *サイドバーの距離変更に即座に連動して自動再計算中*")
+    st.info(f"📍 **設定レース条件**: 【{t_desc} / {course_type} {race_distance}m】 ｜ 馬場: **{c_desc}** ｜ ペース: **{pace_prediction}** ({dist_label}) ｜ ⚡ *条件変更に即座に連動して自動再計算中*")
 
     # 🤖 AI展開力学シミュレーション診断
     pace_diag_msg = meta.get("pace_diagnosis", "")
@@ -903,7 +983,7 @@ if st.session_state["predicted_results"] is not None:
 
     st.subheader("📊 全頭の予測着順一覧")
     display_columns = [
-        "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "脚質", "距離展開評価",
+        "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "脚質", "距離展開評価", "コース馬場評価",
         "勝率(%)", "総合スコア", "推定能力指数", "騎手勝率(%)",
         "能力スコア", "展開スコア", "騎手スコア", "展開力学", "シナジー"
     ]
@@ -915,7 +995,8 @@ if st.session_state["predicted_results"] is not None:
             "勝率(%)": st.column_config.ProgressColumn("勝率(%)", format="%.1f%%", min_value=0.0, max_value=100.0),
             "単勝人気": st.column_config.NumberColumn("人気", format="%d位"),
             "脚質": st.column_config.TextColumn("選択脚質"),
-            "距離展開評価": st.column_config.TextColumn("距離×脚質適合度"),
+            "距離展開評価": st.column_config.TextColumn("距離適合度"),
+            "コース馬場評価": st.column_config.TextColumn("コース・馬場適合"),
             "総合スコア": st.column_config.NumberColumn("総合スコア", format="%.2f"),
             "推定能力指数": st.column_config.NumberColumn("推定能力値", format="%d"),
             "騎手勝率(%)": st.column_config.NumberColumn("騎手勝率", format="%.1f%%"),
@@ -1204,6 +1285,7 @@ if st.session_state["predicted_results"] is not None:
             # ランキング損失関数 (実着順のペアに対して、非線形パラメータも含めて予測スコアの逆転を最小化)
             dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
             escape_count = int((merged_opt["脚質"] == "逃げ").sum())
+            track_style_bonus, cond_style_bonus, _, _ = get_track_modifiers(track_name, track_condition)
 
             def ranking_loss(weights):
                 w_a, w_p, w_j, w_esc, w_syn = weights
@@ -1247,7 +1329,10 @@ if st.session_state["predicted_results"] is not None:
                     # 距離×脚質展開ボーナス
                     dist_bonus_val, _ = get_style_distance_eval(style, race_distance)
 
-                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val)
+                    # 競馬場×馬場補正
+                    t_val = track_style_bonus.get(style, 0.0) + cond_style_bonus.get(style, 0.0)
+
+                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val)
 
                 scores_arr = np.array(calc_scores)
                 actual_ranks = merged_opt["実際の着順"].values
