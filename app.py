@@ -972,17 +972,17 @@ def calculate_predictions(
     if df.empty:
         return df, {}
 
-    # 指定がない場合は現在のセッション設定を参照
+    # 引数で指定がない場合は、サイドバーで現在選択されている設定（グローバル変数）をそのまま使用
     if race_distance is None:
-        race_distance = int(st.session_state.get("current_distance", 1600))
+        race_distance = int(st.session_state.get("current_distance", globals().get("race_distance", 1600)))
     if track_name is None:
-        track_name = "東京 (直線525m・末脚炸裂)"
+        track_name = globals().get("track_name", "東京 (直線525m・末脚炸裂)")
     if course_type is None:
-        course_type = "芝"
+        course_type = globals().get("course_type", "芝")
     if pace_prediction is None:
-        pace_prediction = "ミドルペース"
+        pace_prediction = globals().get("pace_prediction", "ミドルペース")
     if track_condition is None:
-        track_condition = "良馬場 (晴・乾燥 / 高速スピード＆キレ味)"
+        track_condition = globals().get("track_condition", "良馬場 (晴・乾燥 / 高速スピード＆キレ味)")
 
     dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
     track_style_bonus, cond_style_bonus, track_desc, cond_desc = get_track_modifiers(track_name, track_condition)
@@ -1249,7 +1249,12 @@ if st.session_state["has_run_prediction"]:
     else:
         results, meta = calculate_predictions(
             valid_df, weight_ability, weight_pace, weight_jockey,
-            weight_escape_dynamic, weight_synergy
+            weight_escape_dynamic, weight_synergy,
+            race_distance=race_distance,
+            track_name=track_name,
+            course_type=course_type,
+            pace_prediction=pace_prediction,
+            track_condition=track_condition
         )
         st.session_state["predicted_results"] = results
         st.session_state["predicted_meta"] = meta
