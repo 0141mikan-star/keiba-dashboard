@@ -7,6 +7,7 @@ import time
 import socket
 from PIL import Image
 from scipy.optimize import minimize
+from win5_simulator import render_win5_simulator
 
 # ==========================================
 # 1. ページ基本設定 (layout="wide") & モバイル最適化
@@ -236,6 +237,15 @@ def find_matched_past_race(df: pd.DataFrame, track: str, dist: int, race_db: dic
 # ==========================================
 # 2. サイドバー (レース設定 & 重み設定)
 # ==========================================
+st.sidebar.subheader("🧭 予想モード切替")
+app_mode = st.sidebar.radio(
+    "予想モード",
+    ["🏇 通常レース予想 (1レース集中)", "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)"],
+    index=0,
+    label_visibility="collapsed"
+)
+st.sidebar.markdown("---")
+
 st.sidebar.header("🏁 レース設定")
 
 if "current_distance" not in st.session_state:
@@ -483,6 +493,10 @@ with st.sidebar.expander("🔑 AI画像認識 API設定 (Gemini)"):
 # ==========================================
 # 3. メインエリア (タイトル & 画像アップロード)
 # ==========================================
+if app_mode == "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)":
+    render_win5_simulator(calculate_predictions, st.session_state["learned_weights"])
+    st.stop()
+
 st.title("🏇 競馬着順予測AIシミュレータ")
 st.caption(f"📱 **スマホでもそのまま使えます！** 同じWi-Fiに繋いだスマホで `{mobile_url}` を開くか、左上メニュー（>）内のQRコードをカメラで読み取ってください。")
 st.markdown(
@@ -939,7 +953,12 @@ def calculate_predictions(
     w_pace: float,
     w_jockey: float,
     w_escape_dynamic: float = 1.2,
-    w_synergy: float = 1.1
+    w_synergy: float = 1.1,
+    race_distance: int = None,
+    track_name: str = None,
+    course_type: str = None,
+    pace_prediction: str = None,
+    track_condition: str = None
 ) -> tuple[pd.DataFrame, dict]:
     """
     最先端の非線形・ゲーム理論競馬AIロジック:
@@ -952,6 +971,18 @@ def calculate_predictions(
     """
     if df.empty:
         return df, {}
+
+    # 指定がない場合は現在のセッション設定を参照
+    if race_distance is None:
+        race_distance = int(st.session_state.get("current_distance", 1600))
+    if track_name is None:
+        track_name = "東京 (直線525m・末脚炸裂)"
+    if course_type is None:
+        course_type = "芝"
+    if pace_prediction is None:
+        pace_prediction = "ミドルペース"
+    if track_condition is None:
+        track_condition = "良馬場 (晴・乾燥 / 高速スピード＆キレ味)"
 
     dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
     track_style_bonus, cond_style_bonus, track_desc, cond_desc = get_track_modifiers(track_name, track_condition)
