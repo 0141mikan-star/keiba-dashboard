@@ -947,6 +947,211 @@ def get_track_modifiers(track_str: str, condition_str: str):
 
     return track_style_bonus, cond_style_bonus, track_desc, cond_desc
 
+def assign_ai_marks(result_df: pd.DataFrame) -> pd.DataFrame:
+    """各馬の予測着順と穴馬フラグに基づいて競馬印（◎, ○, ▲, ☆, △, ー）を付与"""
+    marks = []
+    roles = []
+    total_h = len(result_df)
+
+    if "特注穴馬" not in result_df.columns:
+        result_df["特注穴馬"] = False
+
+    for idx, row in result_df.iterrows():
+        rank = int(row.get("予想着順数値", idx + 1))
+        is_upset = bool(row.get("特注穴馬", False))
+
+        if rank == 1:
+            marks.append("◎")
+            roles.append("本命 (軸馬)")
+        elif rank == 2:
+            marks.append("○")
+            roles.append("対抗 (連対有力)")
+        elif rank == 3:
+            if is_upset:
+                marks.append("☆")
+                roles.append("特注穴馬 (高配当)")
+            else:
+                marks.append("▲")
+                roles.append("単穴 (一発逆転)")
+        elif is_upset:
+            marks.append("☆")
+            roles.append("特注穴馬 (高配当)")
+        elif rank == 4:
+            marks.append("△")
+            roles.append("連下 (ヒモ・抑え)")
+        elif rank == 5 and total_h >= 6:
+            marks.append("△")
+            roles.append("連下 (抑え)")
+        else:
+            marks.append("ー")
+            roles.append("ー")
+
+    if "AI印" in result_df.columns:
+        result_df["AI印"] = marks
+    else:
+        result_df.insert(0, "AI印", marks)
+    result_df["推奨役割"] = roles
+    return result_df
+
+def generate_horse_recommendation_comment(
+    row: pd.Series,
+    meta: dict,
+    race_distance: int,
+    course_type: str
+) -> dict:
+    """各推奨馬の強み・好走根拠・買い方アドバイスを競馬理論に基づいて自動生成"""
+    h_num = int(row.get("馬番", 0))
+    h_name = str(row.get("馬名", ""))
+    j_name = str(row.get("騎手名", "騎手"))
+    pop = int(row.get("単勝人気", 5))
+    style = str(row.get("脚質", "先行"))
+    mark = str(row.get("AI印", "◎"))
+    role = str(row.get("推奨役割", "本命"))
+    score = float(row.get("総合スコア", 0.0))
+    win_rate = float(row.get("勝率(%)", 0.0))
+    ab_idx = int(row.get("推定能力指数", 80))
+    j_rate = float(row.get("騎手勝率(%)", 10.0))
+    exp_tag = str(row.get("AI学習経験値", ""))
+    dist_eval = str(row.get("距離展開評価", ""))
+    track_eval = str(row.get("コース馬場評価", ""))
+    synergy_val = float(row.get("シナジー", 0.0))
+    is_upset = bool(row.get("特注穴馬", False))
+
+    reasons = []
+
+    # 過去レース完全記憶の場合
+    if meta.get("past_race_matched", False):
+        r_name = meta.get("matched_race_name", "過去学習レース")
+        if mark == "◎":
+            reasons.append(f"過去記録レース（**{r_name}**）で実際に**1着勝利**を収めた確定データと完全一致！")
+            reasons.append("AI完全記憶システムにより、本レースで最も確実な勝者として自動選定。")
+            advice = "💡 **おすすめの買い方**: 単勝、および馬連・3連単の1着固定軸として盤石です。"
+        elif mark == "○":
+            reasons.append(f"過去記録レース（**{r_name}**）で**2着好走**した実績を100%再現。")
+            reasons.append("本命馬に迫る連対候補として極めて高い信頼度。")
+            advice = "💡 **おすすめの買い方**: 馬連・ワイドの相手本線として推奨。"
+        elif mark in ["▲", "☆"]:
+            reasons.append(f"過去確定データで**3着入線**を果たした実績を完全再現。")
+            reasons.append("馬券圏内（3着以内）への突入が証明されている確実な3番手候補。")
+            advice = "💡 **おすすめの買い方**: ワイド・3連複の3着候補として必ず押さえたい1頭。"
+        else:
+            reasons.append("過去確定データで上位入線を記録。ヒモ・抑えとして確実にマーク。")
+            advice = "💡 **おすすめの買い方**: 3連系の相手・抑え候補として推奨。"
+
+        return {
+            "mark": mark,
+            "role": role,
+            "horse_num": h_num,
+            "horse_name": h_name,
+            "jockey": j_name,
+            "pop": pop,
+            "score": score,
+            "win_rate": win_rate,
+            "ab_idx": ab_idx,
+            "reasons": reasons,
+            "advice": advice
+        }
+
+    # 通常AI予測時の分析ロジック
+    # 1. 地力・人気面
+    if ab_idx >= 92:
+        reasons.append(f"推定能力値 **{ab_idx}** とメンバー屈指の地力を誇り、実力・実績面で首位級の評価。")
+    elif is_upset:
+        reasons.append(f"単勝 **{pop}番人気** と世間の評価は控えめながら、AI総合指数で上位争いに食い込む【特注穴馬】！オッズ妙味はメンバー中随一。")
+    elif pop <= 2:
+        reasons.append(f"単勝 **{pop}番人気** の支持を集める実力馬。総合スコアでも高い安定感を発揮。")
+    else:
+        reasons.append(f"能力指数 **{ab_idx}** をマークし、上位陣と互角に渡り合えるポテンシャルを保持。")
+
+    # 2. 展開・脚質面
+    esc_cnt = meta.get("escape_count", 0)
+    if style == "逃げ" and esc_cnt == 1:
+        reasons.append("他馬との競り合いがない【単騎楽逃げ】が濃厚！マイペースを保ちやすく、前残りで直線押し切る絶好の展開。")
+    elif style in ["差し", "追込"] and esc_cnt >= 2:
+        reasons.append("逃げ争いによる【ハイペース前崩れ】が追い風！消耗戦で前がバテたところを、直線での鋭い末脚で一気に飲み込む形。")
+    elif style == "先行" and race_distance <= 1400:
+        reasons.append(f"短距離戦（{race_distance}m）のセオリーである【好位追走からの抜け出し】に合致。ロスなく立ち回れる有利な脚質。")
+    elif style in ["差し", "追込"] and race_distance >= 2200:
+        reasons.append(f"長距離戦（{race_distance}m）でのスタミナ温存・直線末脚勝負にピタリ適合。鋭い決め手が活きる条件。")
+    elif style == "先行" and esc_cnt == 0:
+        reasons.append("逃げ馬不在により、実質的にハナまたは好位2番手を楽に確保できる絶好のポジション取り。")
+    elif dist_eval:
+        reasons.append(f"距離展開適性: **{dist_eval}**")
+
+    # 3. 騎手・シナジー面
+    if j_rate >= 14.0:
+        reasons.append(f"名手・**{j_name}騎手**（勝率 {j_rate:.1f}%）の手綱捌きも心強く、勝負気配濃厚。")
+    if synergy_val >= 5.0:
+        reasons.append(f"条件×騎手/脚質の相乗効果（シナジー **+{synergy_val:.1f}点**）が大きく加点。")
+
+    # 4. コース・馬場適性
+    if "◎" in track_eval:
+        reasons.append(f"競馬場・馬場状態（{meta.get('track_desc', 'コース')} / {meta.get('cond_desc', '馬場')}）との適合度が非常に高い追い風。")
+
+    # 5. 学習経験値
+    if "実績" in exp_tag:
+        reasons.append(f"過去レースでの好走データ蓄積（**{exp_tag}**）により、過去実績からも裏付けあり。")
+
+    # 買い方アドバイス
+    if mark == "◎":
+        advice = "💡 **おすすめの買い方**: 単勝、および馬連・ワイドの「軸（1着候補・連軸）」として最も信頼できます。"
+    elif mark == "○":
+        advice = "💡 **おすすめの買い方**: 本命馬との「馬連・ワイド1点本線」、または本命逆転の頭（1着）狙いに最適。"
+    elif mark == "▲":
+        advice = "💡 **おすすめの買い方**: 展開次第で頭まで突き抜ける一発の破壊力。馬連流し・3連複フォーメーションの相手に推奨。"
+    elif mark == "☆":
+        advice = "💡 **おすすめの買い方**: 配当を跳ね上げるキーホース！ワイドで本命へ流すか、3連複のヒモに必ず組み込んで高配当奪取！"
+    elif mark == "△":
+        advice = "💡 **おすすめの買い方**: 2・3着の連下候補。3連複・3連単の相手（抑え・ヒモ）として手広くマーク推奨。"
+    else:
+        advice = "💡 **おすすめの買い方**: 馬券の相手候補としてマーク。"
+
+    return {
+        "mark": mark,
+        "role": role,
+        "horse_num": h_num,
+        "horse_name": h_name,
+        "jockey": j_name,
+        "pop": pop,
+        "score": score,
+        "win_rate": win_rate,
+        "ab_idx": ab_idx,
+        "reasons": reasons,
+        "advice": advice
+    }
+
+def select_recommended_horses(result_df: pd.DataFrame, max_count: int = 4) -> list[pd.Series]:
+    """推奨馬（◎, ○, ▲/☆, △等）を厳選ピックアップ"""
+    if result_df.empty:
+        return []
+
+    picked = []
+    picked_nums = set()
+
+    # 1. まず上位3頭 (1位◎, 2位○, 3位▲または☆) を追加
+    for idx in range(min(3, len(result_df))):
+        row = result_df.iloc[idx]
+        picked.append(row)
+        picked_nums.add(row["馬番"])
+
+    # 2. もし上位3頭以外に「特注穴馬」がいれば最優先で追加（高配当狙い）
+    upset_horses = result_df[result_df["特注穴馬"] == True]
+    for _, u_row in upset_horses.iterrows():
+        if u_row["馬番"] not in picked_nums and len(picked) < max_count:
+            picked.append(u_row)
+            picked_nums.add(u_row["馬番"])
+
+    # 3. まだ枠があり、4位以降の馬がいれば連下（△）として追加
+    for idx in range(3, len(result_df)):
+        if len(picked) >= max_count:
+            break
+        row = result_df.iloc[idx]
+        if row["馬番"] not in picked_nums:
+            picked.append(row)
+            picked_nums.add(row["馬番"])
+
+    return picked
+
 def calculate_predictions(
     df: pd.DataFrame,
     w_ability: float,
@@ -1032,6 +1237,7 @@ def calculate_predictions(
         result_df["展開力学"] = [0.0] * total_len
         result_df["シナジー"] = [0.0] * total_len
         result_df["特注穴馬"] = [False] * total_len
+        result_df = assign_ai_marks(result_df)
 
         meta = {
             "past_race_matched": True,
@@ -1217,6 +1423,8 @@ def calculate_predictions(
         if int(row["単勝人気"]) >= 4 and int(row["予想着順数値"]) <= 3:
             result_df.at[idx, "特注穴馬"] = True
 
+    result_df = assign_ai_marks(result_df)
+
     meta = {
         "past_race_matched": False,
         "escape_count": escape_count,
@@ -1315,7 +1523,7 @@ if st.session_state["predicted_results"] is not None:
     st.subheader("🏆 予測結果サマリー (上位3頭)")
     col1, col2, col3 = st.columns(3)
     cols = [col1, col2, col3]
-    medals = ["🥇 1着候補", "🥈 2着候補", "🥉 3着候補"]
+    medals = ["🥇 1着候補 (本命 ◎)", "🥈 2着候補 (対抗 ○)", "🥉 3着候補 (単穴 ▲)"]
 
     for i in range(min(3, len(results))):
         horse = results.iloc[i]
@@ -1326,9 +1534,68 @@ if st.session_state["predicted_results"] is not None:
                 delta=f"勝率 {horse['勝率(%)']}% (総合スコア: {horse['総合スコア']})"
             )
 
+    # ------------------------------------------
+    # 🌟 AI厳選推奨馬ピックアップ (印・根拠・買い方)
+    # ------------------------------------------
+    st.markdown("---")
+    st.subheader("🌟 AI厳選推奨馬ピックアップ (注目馬・解説つき)")
+    st.caption("AIが能力指数・展開利・妙味を多角的に分析し、本レースで買うべき推奨馬（◎ ○ ▲ ☆ △）を厳選解説！")
+
+    rec_horses = select_recommended_horses(results, max_count=4)
+    if rec_horses:
+        mark_colors = {
+            "◎": {"bg": "#dc3545", "role": "本命 (軸馬)"},
+            "○": {"bg": "#0d6efd", "role": "対抗 (連対有力)"},
+            "▲": {"bg": "#198754", "role": "単穴 (一発逆転)"},
+            "☆": {"bg": "#fd7e14", "role": "特注穴馬 (高配当)"},
+            "△": {"bg": "#6f42c1", "role": "連下 (ヒモ・抑え)"},
+            "ー": {"bg": "#6c757d", "role": "注目"}
+        }
+
+        for rec_row in rec_horses:
+            rec_info = generate_horse_recommendation_comment(rec_row, meta, race_distance, course_type)
+            mark = rec_info["mark"]
+            cfg = mark_colors.get(mark, mark_colors["ー"])
+
+            with st.container(border=True):
+                col_head1, col_head2 = st.columns([3, 2])
+                with col_head1:
+                    st.markdown(
+                        f"""
+                        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px;">
+                            <span style="background-color: {cfg['bg']}; color: white; padding: 3px 10px; border-radius: 4px; font-weight: bold; font-size: 14px;">
+                                {mark} {rec_info['role']}
+                            </span>
+                            <span style="font-size: 18px; font-weight: bold;">
+                                {rec_info['horse_num']}番 {rec_info['horse_name']}
+                            </span>
+                            <span style="color: #666; font-size: 14px;">
+                                ({rec_info['jockey']})
+                            </span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                with col_head2:
+                    st.markdown(
+                        f"""
+                        <div style="text-align: right; font-size: 13px; color: #555; padding-top: 4px;">
+                            単勝 <b>{rec_info['pop']}位</b> ｜ 勝率 <b>{rec_info['win_rate']}%</b> ｜ 総合スコア <b>{rec_info['score']}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                st.markdown("**💬 AI推奨根拠:**")
+                for r in rec_info["reasons"]:
+                    st.markdown(f"- {r}")
+
+                st.info(rec_info["advice"])
+
+    st.markdown("---")
     st.subheader("📊 全頭の予測着順一覧")
     display_columns = [
-        "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "脚質", "AI学習経験値", "距離展開評価", "コース馬場評価",
+        "AI印", "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "脚質", "AI学習経験値", "距離展開評価", "コース馬場評価",
         "勝率(%)", "総合スコア", "推定能力指数", "騎手勝率(%)",
         "能力スコア", "展開スコア", "騎手スコア", "展開力学", "シナジー"
     ]
@@ -1337,6 +1604,7 @@ if st.session_state["predicted_results"] is not None:
     st.dataframe(
         filtered_display,
         column_config={
+            "AI印": st.column_config.TextColumn("印", help="AI推奨印（◎本命、○対抗、▲単穴、☆特注穴、△連下）"),
             "勝率(%)": st.column_config.ProgressColumn("勝率(%)", format="%.1f%%", min_value=0.0, max_value=100.0),
             "単勝人気": st.column_config.NumberColumn("人気", format="%d位"),
             "脚質": st.column_config.TextColumn("選択脚質"),
