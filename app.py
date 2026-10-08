@@ -3186,15 +3186,18 @@ if st.session_state["predicted_results"] is not None:
         odds_cols = st.columns(len(active_bets))
         for idx, b in enumerate(active_bets):
             with odds_cols[idx]:
+                raw_val = float(b.get("odds", 10.0))
+                safe_val = round(max(1.1, min(raw_val, 999999.0)), 1)
                 adj_odds = st.number_input(
                     f"{b['name'].split(' ')[0]} {b['name'].split(' ')[1]}",
                     min_value=1.1,
-                    max_value=999.0,
-                    value=float(b["odds"]),
-                    step=0.1,
+                    max_value=999999.0,
+                    value=safe_val,
+                    step=0.5 if safe_val > 100 else 0.1,
                     key=f"adj_odds_{b.get('key_id', idx)}"
                 )
                 b["odds"] = adj_odds
+
 
     # 5. 資金配分計算
     dutch_res = calculate_dutching_allocation(active_bets, budget=st.session_state["bet_budget"], mode=mode_sel)
