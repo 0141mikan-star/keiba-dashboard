@@ -446,7 +446,10 @@ if len(hist) > 0 or len(r_db) > 0 or len(h_mem) > 0:
                 return False
         wide_cnt = sum(1 for h in hist if is_wide_hit(h))
 
+        trio_cnt = sum(1 for h in hist if "的中" in str(h.get("3連複", "")) or "的中" in str(h.get("3連複的中", "")))
+
         st.sidebar.write(f"📚 **通算学習レース**: {len(hist)} 戦")
+        st.sidebar.write(f"👑 **3連複的中**: {trio_cnt}戦 ({trio_cnt / len(hist) * 100:.1f}%)")
         st.sidebar.write(f"⚖️ **馬連BOX的中**: {umaren_cnt}戦 ({umaren_cnt / len(hist) * 100:.1f}%)")
         st.sidebar.write(f"🤝 **ワイド圏的中**: {wide_cnt}戦 ({wide_cnt / len(hist) * 100:.1f}%)")
         st.sidebar.write(f"🎯 **単勝的中率**: {win_cnt / len(hist) * 100:.1f}% ({win_cnt}/{len(hist)})")
@@ -997,6 +1000,173 @@ def get_ev_grade(ev: float) -> tuple[str, str]:
         return "B (標準適正)", "⚖️"
     else:
         return "C (過剰人気・妙味薄)", "⚠️"
+
+def generate_sanrenpuku_strategies(results_df: pd.DataFrame) -> dict:
+    """
+    3連複（三連複）をガチで当てるためのプロのAI3大戦略生成:
+    1. 【軸1頭フォーメーション（点数を絞りつつ高配当も網羅）】
+       - 1列目: ◎ (1位)
+       - 2列目: ○, ▲ (2位, 3位)
+       - 3列目: ○, ▲, ☆ (特注穴馬), △ (4〜5位)
+    2. 【的中率最優先・4頭BOX（軸崩れリスクゼロ・高的中率）】
+       - 上位厳選4頭（4点）
+    3. 【軸2頭ながし（超高配当・厚張り勝負）】
+       - 軸: ◎ - ○
+       - 相手: ▲, ☆, △
+    """
+    if len(results_df) < 3:
+        return {}
+
+    from itertools import combinations
+
+    h1 = results_df.iloc[0]  # ◎ 本命
+    h2 = results_df.iloc[1]  # ○ 対抗
+    h3 = results_df.iloc[2]  # ▲ 単穴
+    h4 = results_df.iloc[3] if len(results_df) >= 4 else None
+    h5 = results_df.iloc[4] if len(results_df) >= 5 else None
+
+    # 特注穴馬（もし居れば）
+    upset_rows = results_df[results_df["特注穴馬"] == True]
+    up_horse = None
+    if len(upset_rows) > 0:
+        for _, u_cand in upset_rows.iterrows():
+            if u_cand["馬番"] != h1["馬番"]:
+                up_horse = u_cand
+                break
+
+    # ------------------------------------------
+    # 戦略①: 軸1頭フォーメーション (点数絞り 5〜7点)
+    # ------------------------------------------
+    third_candidates = [h2, h3]
+    if up_horse is not None and up_horse["馬番"] not in [h2["馬番"], h3["馬番"]]:
+        third_candidates.append(up_horse)
+    if h4 is not None and (up_horse is None or h4["馬番"] != up_horse["馬番"]):
+        third_candidates.append(h4)
+    if len(third_candidates) < 4 and h5 is not None and (up_horse is None or h5["馬番"] != up_horse["馬番"]):
+        third_candidates.append(h5)
+
+    formation_bets = []
+    formation_seen = set()
+    for m2 in [h2, h3]:
+        for m3 in third_candidates:
+            if m2["馬番"] == m3["馬番"]:
+                continue
+            trio_nums = tuple(sorted([int(h1["馬番"]), int(m2["馬番"]), int(m3["馬番"])]))
+            if trio_nums not in formation_seen:
+                formation_seen.add(trio_nums)
+                name_map = {
+                    int(h1["馬番"]): h1["馬名"],
+                    int(m2["馬番"]): m2["馬名"],
+                    int(m3["馬番"]): m3["馬名"]
+                }
+                names_str = f"{name_map[trio_nums[0]]} - {name_map[trio_nums[1]]} - {name_map[trio_nums[2]]}"
+
+                o1 = float(h1.get("想定単勝オッズ", 2.2))
+                o2 = float(m2.get("想定単勝オッズ", 3.8))
+                o3 = float(m3.get("想定単勝オッズ", 5.6))
+                odds_val = estimate_trio_odds(o1, o2, o3)
+
+                is_upset_combo = (up_horse is not None and int(up_horse["馬番"]) in trio_nums)
+                is_main = (set(trio_nums) == {int(h1["馬番"]), int(h2["馬番"]), int(h3["馬番"])})
+
+                if is_main:
+                    badge = "🥇 本線鉄板"
+                elif is_upset_combo:
+                    badge = "🔥 穴馬直撃・高配当"
+                else:
+                    badge = "🛡️ 抑え・好配当"
+
+                formation_bets.append({
+                    "nums": trio_nums,
+                    "nums_str": f"{trio_nums[0]} - {trio_nums[1]} - {trio_nums[2]}",
+                    "names_str": names_str,
+                    "odds": odds_val,
+                    "badge": badge,
+                    "is_upset": is_upset_combo
+                })
+
+    formation_bets.sort(key=lambda x: (0 if "本線" in x["badge"] else (1 if "穴馬" in x["badge"] else 2), x["odds"]))
+
+    # ------------------------------------------
+    # 戦略②: 上位厳選4頭BOX (計4点・軸崩れゼロ)
+    # ------------------------------------------
+    box_horses = [h1, h2, h3]
+    if up_horse is not None and up_horse["馬番"] not in [h1["馬番"], h2["馬番"], h3["馬番"]]:
+        box_horses.append(up_horse)
+    elif h4 is not None:
+        box_horses.append(h4)
+
+    box4_bets = []
+    for combo in combinations(box_horses, 3):
+        trio_nums = tuple(sorted([int(c["馬番"]) for c in combo]))
+        name_map = {int(c["馬番"]): c["馬名"] for c in combo}
+        names_str = f"{name_map[trio_nums[0]]} - {name_map[trio_nums[1]]} - {name_map[trio_nums[2]]}"
+        o_list = [float(c.get("想定単勝オッズ", 3.0)) for c in combo]
+        odds_val = estimate_trio_odds(o_list[0], o_list[1], o_list[2])
+        is_upset_combo = (up_horse is not None and int(up_horse["馬番"]) in trio_nums)
+        box4_bets.append({
+            "nums": trio_nums,
+            "nums_str": f"{trio_nums[0]} - {trio_nums[1]} - {trio_nums[2]}",
+            "names_str": names_str,
+            "odds": odds_val,
+            "badge": "🔥 穴絡み" if is_upset_combo else "⚖️ BOX本線",
+            "is_upset": is_upset_combo
+        })
+
+    # ------------------------------------------
+    # 戦略③: 軸2頭ながし (計3〜4点・厚張り勝負)
+    # ------------------------------------------
+    axis2_targets = [h3]
+    if up_horse is not None and up_horse["馬番"] not in [h1["馬番"], h2["馬番"], h3["馬番"]]:
+        axis2_targets.append(up_horse)
+    if h4 is not None and h4["馬番"] not in [t["馬番"] for t in axis2_targets]:
+        axis2_targets.append(h4)
+    if h5 is not None and len(axis2_targets) < 4 and h5["馬番"] not in [t["馬番"] for t in axis2_targets]:
+        axis2_targets.append(h5)
+
+    axis2_bets = []
+    for tgt in axis2_targets:
+        trio_nums = tuple(sorted([int(h1["馬番"]), int(h2["馬番"]), int(tgt["馬番"])]))
+        name_map = {
+            int(h1["馬番"]): h1["馬名"],
+            int(h2["馬番"]): h2["馬名"],
+            int(tgt["馬番"]): tgt["馬名"]
+        }
+        names_str = f"{name_map[trio_nums[0]]} - {name_map[trio_nums[1]]} - {name_map[trio_nums[2]]}"
+        o1 = float(h1.get("想定単勝オッズ", 2.2))
+        o2 = float(h2.get("想定単勝オッズ", 3.8))
+        o3 = float(tgt.get("想定単勝オッズ", 5.6))
+        odds_val = estimate_trio_odds(o1, o2, o3)
+        is_upset_combo = (up_horse is not None and int(up_horse["馬番"]) == int(tgt["馬番"]))
+        axis2_bets.append({
+            "nums": trio_nums,
+            "nums_str": f"{trio_nums[0]} - {trio_nums[1]} - {trio_nums[2]}",
+            "names_str": names_str,
+            "odds": odds_val,
+            "badge": "🔥 特注穴馬" if is_upset_combo else ("🥇 本線" if tgt["馬番"] == h3["馬番"] else "🛡️ 抑え"),
+            "is_upset": is_upset_combo
+        })
+
+    return {
+        "formation": {
+            "name": "🎯 【戦略①】 軸1頭フォーメーション (点数絞り＆高配当両取り)",
+            "sub": f"軸: {h1['馬番']}番 ｜ 2列目: {h2['馬番']},{h3['馬番']}番 ｜ 3列目: {len(third_candidates)}頭 （計{len(formation_bets)}点）",
+            "bets": formation_bets,
+            "desc": "本命◎を軸に据え、2列目に有力馬、3列目に穴馬・抑えまで網羅。点数を5〜7点に抑えて無駄買いを排除し、回収率と的中率を極大化するプロの買い方！"
+        },
+        "box": {
+            "name": "🎲 【戦略②】 上位厳選4頭BOX (軸崩れリスクゼロ・高的中率)",
+            "sub": f"対象4頭: {', '.join([str(b['馬番']) + '番 ' + str(b['馬名']) for b in box_horses])} （計4点）",
+            "bets": box4_bets,
+            "desc": "「本命が出遅れて飛んだ…」という悲劇を完全回避！選んだ4頭のどの3頭が来ても必ず当たる最強のセーフティBOX買い！"
+        },
+        "axis2": {
+            "name": "🚀 【戦略③】 軸2頭ながし (極小点数・資金集中厚張り)",
+            "sub": f"軸2頭: {h1['馬番']}番 - {h2['馬番']}番 ＝ 相手: {len(axis2_targets)}頭 （計{len(axis2_bets)}点）",
+            "bets": axis2_bets,
+            "desc": "上位2頭（◎と○）の実力が抜けている時に絶大な威力を発揮！点数がわずか3〜4点なので、1点に厚く張ってドカンと勝ち切る勝負師の買い方！"
+        }
+    }
 
 def get_draw_bias(h_num: int, total_horses: int, track_str: str, course_type: str, distance: int) -> tuple[float, str]:
     """コース×距離×馬番による物理的な枠順バイアス（有利不利）を精密算出"""
@@ -2113,6 +2283,68 @@ if st.session_state["predicted_results"] is not None:
                 )
 
     # ==========================================
+    # 👑 3連複（三連複）完全攻略ナビゲーター (プロの当て方・3大戦略)
+    # ==========================================
+    st.markdown("---")
+    st.subheader("👑 3連複（三連複）完全攻略ナビゲーター")
+    st.caption("AI指数・展開分析に基づき、「本気で3連複を当てにいく」ためのプロの3大戦略を自動生成！状況に合わせて最適な買い方を選べます。")
+
+    trio_strat = generate_sanrenpuku_strategies(results)
+    if trio_strat:
+        tab_t1, tab_t2, tab_t3 = st.tabs([
+            "🎯 【戦略①】 軸1頭フォーメーション (点数絞り＆高配当)",
+            "🎲 【戦略②】 上位厳選4頭BOX (軸崩れゼロ・高的中率)",
+            "🚀 【戦略③】 軸2頭ながし (極小点数・厚張り勝負)"
+        ])
+
+        with tab_t1:
+            st1 = trio_strat["formation"]
+            st.markdown(f"#### {st1['name']}")
+            st.info(f"📋 **構成**: {st1['sub']}\n\n💡 **プロの戦略解説**: {st1['desc']}")
+
+            t1_rows = []
+            for b in st1["bets"]:
+                t1_rows.append({
+                    "買い目": f"3連複 {b['nums_str']}",
+                    "組み合わせ馬名": b["names_str"],
+                    "想定オッズ": f"{b['odds']:.1f}倍",
+                    "狙い目・位置づけ": b["badge"]
+                })
+            st.dataframe(pd.DataFrame(t1_rows), use_container_width=True, hide_index=True)
+
+        with tab_t2:
+            st2 = trio_strat["box"]
+            st.markdown(f"#### {st2['name']}")
+            st.info(f"📋 **構成**: {st2['sub']}\n\n💡 **プロの戦略解説**: {st2['desc']}")
+
+            t2_rows = []
+            for b in st2["bets"]:
+                t2_rows.append({
+                    "買い目": f"3連複 {b['nums_str']}",
+                    "組み合わせ馬名": b["names_str"],
+                    "想定オッズ": f"{b['odds']:.1f}倍",
+                    "狙い目・位置づけ": b["badge"]
+                })
+            st.dataframe(pd.DataFrame(t2_rows), use_container_width=True, hide_index=True)
+
+        with tab_t3:
+            st3 = trio_strat["axis2"]
+            st.markdown(f"#### {st3['name']}")
+            st.info(f"📋 **構成**: {st3['sub']}\n\n💡 **プロの戦略解説**: {st3['desc']}")
+
+            t3_rows = []
+            for b in st3["bets"]:
+                t3_rows.append({
+                    "買い目": f"3連複 {b['nums_str']}",
+                    "組み合わせ馬名": b["names_str"],
+                    "想定オッズ": f"{b['odds']:.1f}倍",
+                    "狙い目・位置づけ": b["badge"]
+                })
+            st.dataframe(pd.DataFrame(t3_rows), use_container_width=True, hide_index=True)
+
+        st.caption("※ 上記の買い目は、下の「💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ」でワンクリックでそのままダッチング計算（均等払戻）できます。")
+
+    # ==========================================
     # 💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ
     # ==========================================
     st.markdown("---")
@@ -2125,6 +2357,9 @@ if st.session_state["predicted_results"] is not None:
         plan_sel = st.selectbox(
             "🎯 シミュレーション対象の買い目プラン",
             options=[
+                "🎯 3連複 戦略①: 軸1頭フォーメーション (点数絞り・5〜7点)",
+                "🎲 3連複 戦略②: 上位厳選4頭BOX (計4点・軸崩れゼロ)",
+                "🚀 3連複 戦略③: 軸2頭ながし (極小3〜4点・厚張り勝負)",
                 "⚖️ プラン1: 馬連 3頭BOX (本線3点)",
                 "🛡️ プラン2: ワイド 3頭BOX (手堅く3点)",
                 "🚀 プラン3: 一撃高配当 (馬連穴流し & 3連複)",
@@ -2192,7 +2427,33 @@ if st.session_state["predicted_results"] is not None:
         o3 = float(h3.get("想定単勝オッズ", 5.6))
         o4 = float(h4.get("想定単勝オッズ", 8.2))
 
-        if "プラン1" in plan_sel:
+        trio_data = generate_sanrenpuku_strategies(results)
+
+        if "3連複 戦略①" in plan_sel and trio_data:
+            for idx, b in enumerate(trio_data["formation"]["bets"]):
+                badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
+                active_bets.append({
+                    "name": f"3連複 {b['nums_str']} ({b['names_str']}) [{badge_lbl}]",
+                    "odds": b["odds"],
+                    "key_id": f"trio_f_{idx}"
+                })
+        elif "3連複 戦略②" in plan_sel and trio_data:
+            for idx, b in enumerate(trio_data["box"]["bets"]):
+                badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
+                active_bets.append({
+                    "name": f"3連複 {b['nums_str']} ({b['names_str']}) [{badge_lbl}]",
+                    "odds": b["odds"],
+                    "key_id": f"trio_b_{idx}"
+                })
+        elif "3連複 戦略③" in plan_sel and trio_data:
+            for idx, b in enumerate(trio_data["axis2"]["bets"]):
+                badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
+                active_bets.append({
+                    "name": f"3連複 {b['nums_str']} ({b['names_str']}) [{badge_lbl}]",
+                    "odds": b["odds"],
+                    "key_id": f"trio_a_{idx}"
+                })
+        elif "プラン1" in plan_sel:
             active_bets = [
                 {"name": f"馬連 {h1['馬番']} - {h2['馬番']} ({h1['馬名']}-{h2['馬名']})", "odds": estimate_quinella_odds(o1, o2), "key_id": "p1_1"},
                 {"name": f"馬連 {h1['馬番']} - {h3['馬番']} ({h1['馬名']}-{h3['馬名']})", "odds": estimate_quinella_odds(o1, o3), "key_id": "p1_2"},
@@ -2230,6 +2491,7 @@ if st.session_state["predicted_results"] is not None:
                 {"name": f"馬連 {h1['馬番']} - {h4['馬番']} ({h1['馬名']}-{h4['馬名']})", "odds": estimate_quinella_odds(o1, o4), "key_id": "p4_3"},
                 {"name": f"馬連 {h2['馬番']} - {h3['馬番']} ({h2['馬名']}-{h3['馬名']})", "odds": estimate_quinella_odds(o2, o3), "key_id": "p4_4"},
             ]
+
 
     # 4. オッズ微調整 expander
     with st.expander("🔍 **オッズを手動で微調整する（リアルタイムの確定オッズに合わせる）**", expanded=False):
@@ -2449,27 +2711,44 @@ if st.session_state["predicted_results"] is not None:
 
     top3_pred_names = set(comp_df[comp_df["予想着順数値"] <= 3]["馬名"])
     place_hits = len(top3_pred_names.intersection(actual_top3_names))
-    
+
     # 馬連BOX(3点) 的中判定: 確定1着と2着の両方がAI予想上位3頭に含まれているか
     umaren_hit = (len(top3_pred_names.intersection(actual_top2_names)) == 2)
     # ワイドBOX(3点) 的中判定: AI上位3頭のうち2頭以上が3着以内に入ったか
     wide_hit = (place_hits >= 2)
 
-    col_v1, col_v2, col_v3 = st.columns(3)
+    # 3連複 (三連複) 的中判定
+    # ① 本線完全的中 (上位3頭独占): place_hits == 3
+    # ② 厳選4頭BOX / フォーメーション的中: 確定1〜3着の全3頭が、AI上位4頭または特注穴馬プールに含まれているか
+    upset_names = set(results[results["特注穴馬"] == True]["馬名"]) if "特注穴馬" in results.columns else set()
+    top4_names = set(comp_df[comp_df["予想着順数値"] <= 4]["馬名"])
+    box4_pool = top3_pred_names.union(upset_names).union(top4_names)
+    trio_perfect_hit = (place_hits == 3)
+    trio_box_hit = (len(box4_pool.intersection(actual_top3_names)) == 3)
+    trio_hit = (trio_perfect_hit or trio_box_hit)
+
+    col_v1, col_v2, col_v3, col_v4 = st.columns(4)
     with col_v1:
         if umaren_hit:
-            st.success("🎉 **推奨① 馬連BOX: 【的中！！】**\n上位3頭でワンツー決着！ナイス的中です！")
+            st.success("🎉 **馬連BOX: 【的中！！】**\n上位3頭でワンツー決着！")
         elif win_hit:
-            st.success(f"🎯 **単勝予想: 【的中！】**\n◎ {top1_pred['馬名']} が見事1着に入線！")
+            st.success(f"🎯 **単勝予想: 【的中！】**\n◎ {top1_pred['馬名']} が1着入線！")
         else:
-            st.warning(f"❌ **馬連BOX: 【不的中】**\n1着: {act_1st_name} / 2着: {act_2nd_name}")
+            st.warning(f"❌ **馬連BOX: 【不的中】**\n1着: {act_1st_name}\n2着: {act_2nd_name}")
     with col_v2:
         if wide_hit:
             hit_label = "トリプル的中（総取り！）" if place_hits == 3 else "ダブル/本線的中"
-            st.success(f"🤝 **推奨② ワイドBOX: 【的中！！】**\n上位3頭中 {place_hits}頭好走（{hit_label}）")
+            st.success(f"🤝 **ワイドBOX: 【的中！！】**\n上位3頭中 {place_hits}頭好走（{hit_label}）")
         else:
-            st.info(f"🏅 **3着以内好走**: {place_hits} / 3頭\n上位3頭中、{place_hits}頭が3着以内に入線")
+            st.info(f"🏅 **3着内好走**: {place_hits} / 3頭\n上位3頭中、{place_hits}頭が入線")
     with col_v3:
+        if trio_perfect_hit:
+            st.success("👑 **3連複: 【本線完全的中！！】**\n上位3頭で1・2・3着を独占！1点勝負でも大的中！")
+        elif trio_box_hit:
+            st.success("🎯 **3連複: 【フォーメーション的中！】**\n厳選買い目（BOX/フォーメーション）で的中奪取！")
+        else:
+            st.warning("❌ **3連複: 【不的中】**\nヒモ抜けまたは波乱決着")
+    with col_v4:
         avg_err = comp_df["着順誤差"].mean()
         st.metric("全頭の平均着順誤差", f"{avg_err:.1f}着", help="数値が小さいほど全頭の順位予測の精度が高い")
 
@@ -2602,6 +2881,7 @@ if st.session_state["predicted_results"] is not None:
                 "学習日時": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
                 "コース・距離": f"{course_type} {race_distance}m",
                 "想定ペース": pace_prediction,
+                "3連複": "👑 本線完全的中" if trio_perfect_hit else ("⭕ フォーメーション的中" if trio_box_hit else "❌ 不的中"),
                 "馬連BOX(3点)": "⭕ 的中" if umaren_hit else "❌ 不的中",
                 "ワイドBOX(3点)": "⭕ 的中" if wide_hit else "❌ 不的中",
                 "単勝的中": "⭕ 的中" if win_hit else "❌ 不的中",
@@ -2622,6 +2902,10 @@ if st.session_state["predicted_results"] is not None:
             insights = []
             insights.append(f"🧠 **【過去レース完全記憶（Tier 1）】** このレースの確定着順（全{len(actual_ranks_dict)}頭）を永久保存しました。次回同じ出走馬・レースを入力した際は100%完全再現して的中させます。")
             insights.append(f"🐎 **【個別競走馬メモリー更新（Tier 2）】** 出走全{len(comp_df)}頭の実績・人気着順ギャップを馬メモリーに反映しました。別レースに出走した際にも実力差として自動適用されます。")
+            if trio_perfect_hit:
+                insights.append("👑 **【3連複 本線完全的中】** AI推奨上位3頭がそのまま1・2・3着を独占！3連複の最高峰的中で特大払戻を獲得しました！")
+            elif trio_box_hit:
+                insights.append("🎯 **【3連複 的中】** AI推奨の3連複厳選買い目（BOX/フォーメーション）で確定3頭を完全網羅して的中しました！")
             if umaren_hit:
                 insights.append("🎉 **【馬連BOX的中】** AI推奨上位3頭で1・2着を独占的中しました！")
             elif wide_hit:
