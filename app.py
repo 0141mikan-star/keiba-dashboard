@@ -2607,16 +2607,16 @@ if st.session_state["predicted_results"] is not None:
                             if margin > 0:
                                 loss += margin ** 2
 
-                # 正則化項 (極端な偏りを防ぐ安定化項)
-                reg = 0.02 * (
-                    (w_a - 1.5)**2 + (w_p - 1.2)**2 + (w_j - 0.9)**2 +
+                # 正則化項 (極端な偏りを防ぐ安定化項: 標準バランスへの引き戻し)
+                reg = 0.06 * (
+                    (w_a - 1.5)**2 + (w_p - 1.0)**2 + (w_j - 1.0)**2 +
                     (w_esc - 1.2)**2 + (w_syn - 1.1)**2
                 )
                 return loss + reg
 
             # 最適化の実行 (5次元パラメータ探索)
             initial_guess = [weight_ability, weight_pace, weight_jockey, weight_escape_dynamic, weight_synergy]
-            bounds = [(0.0, 3.0), (0.0, 3.0), (0.0, 3.0), (0.0, 3.0), (0.0, 3.0)]
+            bounds = [(1.0, 2.5), (0.5, 2.2), (0.5, 2.0), (0.5, 2.0), (0.5, 2.0)]
 
             opt_res = minimize(ranking_loss, initial_guess, method="L-BFGS-B", bounds=bounds)
 
@@ -2626,20 +2626,20 @@ if st.session_state["predicted_results"] is not None:
             target_e = float(opt_res.x[3])
             target_s = float(opt_res.x[4])
 
-            # ★ 一戦の波乱でモデルが崩壊（ゼロ麻痺）しないためのモメンタム学習（学習率 35%）
-            alpha = 0.35
+            # ★ 一戦の波乱でモデルが崩壊（ゼロ麻痺）しないためのモメンタム学習（学習率 25%）
+            alpha = 0.25
             new_w_ability = round(float(weight_ability * (1 - alpha) + target_a * alpha), 2)
             new_w_pace = round(float(weight_pace * (1 - alpha) + target_p * alpha), 2)
             new_w_jockey = round(float(weight_jockey * (1 - alpha) + target_j * alpha), 2)
             new_w_escape = round(float(weight_escape_dynamic * (1 - alpha) + target_e * alpha), 2)
             new_w_synergy = round(float(weight_synergy * (1 - alpha) + target_s * alpha), 2)
 
-            # 最低安全リミッター（能力や展開の重みが0近くに潰れるのを防止）
-            new_w_ability = max(0.6, min(3.0, new_w_ability))
-            new_w_pace = max(0.5, min(3.0, new_w_pace))
-            new_w_jockey = max(0.4, min(3.0, new_w_jockey))
-            new_w_escape = max(0.5, min(3.0, new_w_escape))
-            new_w_synergy = max(0.4, min(3.0, new_w_synergy))
+            # 最低安全リミッター（基礎能力が潰れて穴馬偏重になるのを防止）
+            new_w_ability = max(1.0, min(2.5, new_w_ability))
+            new_w_pace = max(0.6, min(2.2, new_w_pace))
+            new_w_jockey = max(0.6, min(2.0, new_w_jockey))
+            new_w_escape = max(0.6, min(2.0, new_w_escape))
+            new_w_synergy = max(0.5, min(2.0, new_w_synergy))
 
             delta_a = round(new_w_ability - weight_ability, 2)
             delta_p = round(new_w_pace - weight_pace, 2)
