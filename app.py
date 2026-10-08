@@ -424,7 +424,21 @@ if len(hist) > 0 or len(r_db) > 0 or len(h_mem) > 0:
     st.sidebar.subheader("💾 AI学習データ (保存中)")
     if len(hist) > 0:
         win_cnt = sum(1 for h in hist if h.get("単勝的中") == "⭕ 的中" or h.get("win_hit", False))
+        umaren_cnt = sum(1 for h in hist if h.get("馬連BOX(3点)") == "⭕ 的中")
+        # 3着以内に2頭以上入っていればワイド的中
+        def is_wide_hit(h):
+            if h.get("ワイドBOX(3点)") == "⭕ 的中":
+                return True
+            try:
+                hits = int(str(h.get("3着内好走", "0")).split("/")[0])
+                return hits >= 2
+            except Exception:
+                return False
+        wide_cnt = sum(1 for h in hist if is_wide_hit(h))
+
         st.sidebar.write(f"📚 **通算学習レース**: {len(hist)} 戦")
+        st.sidebar.write(f"⚖️ **馬連BOX的中**: {umaren_cnt}戦 ({umaren_cnt / len(hist) * 100:.1f}%)")
+        st.sidebar.write(f"🤝 **ワイド圏的中**: {wide_cnt}戦 ({wide_cnt / len(hist) * 100:.1f}%)")
         st.sidebar.write(f"🎯 **単勝的中率**: {win_cnt / len(hist) * 100:.1f}% ({win_cnt}/{len(hist)})")
     st.sidebar.write(f"🧠 **完全記憶レース**: {len(r_db)} レース")
     st.sidebar.write(f"🐎 **学習済み競走馬**: {len(h_mem)} 頭")
@@ -1052,6 +1066,16 @@ def calculate_predictions(
         # ② 展開・脚質ベース
         style = str(row.get("脚質", "先行"))
         pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_mult.get(style, 1.0)
+        
+        # ★ ダート短距離 (<=1400m) のハイペース補正: 前残り物理法則を反映
+        if course_type == "ダート" and race_distance <= 1400 and pace_prediction == "ハイペース":
+            if style == "先行":
+                pace_mult = max(pace_mult, 1.05)  # 好位追走は失速せず抜け出す勝ちパターン
+            elif style == "逃げ":
+                pace_mult = max(pace_mult, 0.85)  # 逃げ粘りの減点を緩和
+            elif style in ["差し", "追込"]:
+                pace_mult = min(pace_mult, 1.05)  # 短距離ダートで後ろから届く過大評価を抑制
+
         base_pace = 50.0 * w_pace * pace_mult
 
         # ③ 【展開力学】他馬との相互作用（単騎逃げの利 vs 競り合い共倒れ）
@@ -1060,15 +1084,19 @@ def calculate_predictions(
             if escape_count == 1:
                 dynamic_score += 26.0 * w_escape_dynamic  # 単騎逃げ特大ボーナス
             elif escape_count >= 2:
-                dynamic_score -= 22.0 * w_escape_dynamic  # 競り合い共倒れ減点
+                esc_pen = 15.0 if (course_type == "ダート" and race_distance <= 1400) else 22.0
+                dynamic_score -= esc_pen * w_escape_dynamic  # 競り合い共倒れ減点
         elif style in ["差し", "追込"]:
             if escape_count >= 2:
-                dynamic_score += 20.0 * w_escape_dynamic  # ハイペース前崩れの漁夫の利
+                bon = 10.0 if (course_type == "ダート" and race_distance <= 1400) else 20.0
+                dynamic_score += bon * w_escape_dynamic  # ハイペース前崩れの漁夫の利
             elif escape_count <= 1:
                 dynamic_score -= 14.0 * w_escape_dynamic  # 前が止まらず届かない減点
         elif style == "先行":
             if escape_count == 0:
                 dynamic_score += 15.0 * w_escape_dynamic  # 逃げ不在で楽に先手を取れる利
+            elif escape_count >= 2 and course_type == "ダート" and race_distance <= 1400:
+                dynamic_score += 14.0 * w_escape_dynamic  # 逃げ争いを離れた好位で見ながら直線抜け出す黄金パターン！
 
         # ④ 騎手能力ベース
         j_name = str(row.get("騎手名", ""))
@@ -1304,74 +1332,104 @@ if st.session_state["predicted_results"] is not None:
 
         col_bet1, col_bet2, col_bet3 = st.columns(3)
 
-        # プラン1: 堅実・本命派
+        # プラン1: 【最優先・本命】 馬連BOX (3点) ＆ 馬連流し
         with col_bet1:
-            st.markdown("#### 🛡️ ①【堅実・的中重視】")
-            st.markdown(
-                f"""
-                **推奨馬券: 単勝 ＆ ワイド**
-                * 🎯 **単勝**: **{h1['馬番']}番** {h1['馬名']}
-                * 🤝 **ワイド**: **{h1['馬番']} - {h2['馬番']}** (本線1点)
-                
-                ---
-                * **推奨度**: ⭐⭐⭐⭐⭐
-                * **狙い**: 勝率トップの◎{h1['馬名']}と対抗○{h2['馬名']}による手堅い的中狙い。
-                * **資金配分例 (1,000円)**:
-                  - 単勝 {h1['馬番']}: 500円
-                  - ワイド {h1['馬番']}-{h2['馬番']}: 500円
-                """
-            )
-
-        # プラン2: バランス・王道派
-        with col_bet2:
-            st.markdown("#### ⚖️ ②【王道・バランス】")
+            st.markdown("#### ⚖️ ①【王道・バランス（本命）】")
             if h3 is not None:
                 st.markdown(
                     f"""
-                    **推奨馬券: 馬連 流し (2点)**
-                    * 🎯 **軸馬**: **{h1['馬番']}番** {h1['馬名']}
-                    * 相手: **{h2['馬番']}番** ({h2['馬名']})、**{h3['馬番']}番** ({h3['馬名']})
-                    * **買い目**: **{h1['馬番']} - {h2['馬番']}, {h3['馬番']}** (計2点)
+                    **推奨馬券: 馬連 3頭BOX (計3点)**
+                    * 🎯 **対象3頭**: **{h1['馬番']}番** ({h1['馬名']}), **{h2['馬番']}番** ({h2['馬名']}), **{h3['馬番']}番** ({h3['馬名']})
+                    * 🤝 **買い目 (計3点)**:
+                      - **{h1['馬番']} - {h2['馬番']}**
+                      - **{h1['馬番']} - {h3['馬番']}**
+                      - **{h2['馬番']} - {h3['馬番']}**
                     
                     ---
-                    * **推奨度**: ⭐⭐⭐⭐☆
-                    * **狙い**: 的中率とオッズ妙味を両立した競馬ファンの王道スタイル。
+                    * **推奨度**: ⭐⭐⭐⭐⭐
+                    * **狙い**: 上位3頭のどの2頭が入っても的中！軸が2着に崩れても、対抗同士で決まっても高配当を逃さない最強バランス。
                     * **資金配分例 (1,000円)**:
-                      - 馬連 {h1['馬番']}-{h2['馬番']}: 700円 (本線)
-                      - 馬連 {h1['馬番']}-{h3['馬番']}: 300円 (抑え)
+                      - 馬連 {h1['馬番']}-{h2['馬番']}: 500円 (本線)
+                      - 馬連 {h1['馬番']}-{h3['馬番']}: 300円 (本線)
+                      - 馬連 {h2['馬番']}-{h3['馬番']}: 200円 (波乱・高配当)
                     """
                 )
             else:
                 st.markdown(
                     f"""
-                    **推奨馬券: 馬連 (1点)**
+                    **推奨馬券: 馬連 (1点勝負)**
                     * **買い目**: **{h1['馬番']} - {h2['馬番']}**
                     * **資金配分例**: 1,000円 (1点勝負)
                     """
                 )
 
-        # プラン3: 高配当・一撃狙い
-        with col_bet3:
-            st.markdown("#### 🚀 ③【高配当・一撃狙い】")
+        # プラン2: 【手堅くプラス・的中特化】 ワイドBOX (3点)
+        with col_bet2:
+            st.markdown("#### 🛡️ ②【的中最優先・手堅く回収】")
             if h3 is not None:
-                bet3_text = f"**{h1['馬番']} - {h2['馬番']} - {h3['馬番']}** (1点集中)"
-                if h4 is not None:
-                    bet3_extra = f"\n  - 3連複 {h1['馬番']}-{h2['馬番']}-{h4['馬番']}: 300円 (高配当抑え)"
-                    bet3_main_alloc = "700円"
-                else:
-                    bet3_extra = ""
-                    bet3_main_alloc = "1,000円"
-
                 st.markdown(
                     f"""
-                    **推奨馬券: 3連複 集中勝負**
-                    * 🎯 **本線**: {bet3_text}
+                    **推奨馬券: ワイド 3頭BOX (計3点)**
+                    * 🎯 **買い目 (計3点)**:
+                      - **{h1['馬番']} - {h2['馬番']}**
+                      - **{h1['馬番']} - {h3['馬番']}**
+                      - **{h2['馬番']} - {h3['馬番']}**
+                    
+                    ---
+                    * **推奨度**: ⭐⭐⭐⭐☆ (的中率 60〜75%)
+                    * **狙い**: 3着以内の2頭が入れば的中！3頭すべて好走なら**トリプル的中（3点総取り）**で大勝！
+                    * **資金配分例 (1,000円)**:
+                      - ワイド {h1['馬番']}-{h2['馬番']}: 400円
+                      - ワイド {h1['馬番']}-{h3['馬番']}: 300円
+                      - ワイド {h2['馬番']}-{h3['馬番']}: 300円
+                    """
+                )
+            else:
+                st.markdown(
+                    f"""
+                    **推奨馬券: ワイド (1点)**
+                    * **買い目**: **{h1['馬番']} - {h2['馬番']}**
+                    * **資金配分例**: 1,000円 (1点勝負)
+                    """
+                )
+
+        # プラン3: 【オッズ跳ね狙い・馬連穴流し / 3連複】
+        with col_bet3:
+            st.markdown("#### 🚀 ③【高配当・一撃狙い】")
+            upset_rows = results[results["特注穴馬"] == True]
+            if len(upset_rows) > 0 and h3 is not None:
+                up_horse = upset_rows.iloc[0]
+                st.markdown(
+                    f"""
+                    **推奨馬券: 馬連 穴流し ＆ 3連複**
+                    * 🎯 **本命**: **{h1['馬番']}番** ({h1['馬名']})
+                    * 🔥 **激走穴馬**: **{up_horse['馬番']}番** ({up_horse['馬名']})
+                    * **買い目**: 
+                      - 馬連 **{h1['馬番']} - {up_horse['馬番']}** (高配当直撃)
+                      - 3連複 **{h1['馬番']} - {h2['馬番']} - {up_horse['馬番']}**
                     
                     ---
                     * **推奨度**: ⭐⭐⭐☆☆
-                    * **狙い**: AI総合スコア上位馬による上位独占を狙い撃つ高回収率特化プラン。
+                    * **狙い**: AIが検知した激走穴馬が絡んだ時の跳ね配当（万馬券級）を一本釣り。
                     * **資金配分例 (1,000円)**:
-                      - 3連複 {h1['馬番']}-{h2['馬番']}-{h3['馬番']}: {bet3_main_alloc} (本命){bet3_extra}
+                      - 馬連 {h1['馬番']}-{up_horse['馬番']}: 500円
+                      - 3連複 {h1['馬番']}-{h2['馬番']}-{up_horse['馬番']}: 500円
+                    """
+                )
+            elif h3 is not None and h4 is not None:
+                st.markdown(
+                    f"""
+                    **推奨馬券: 3連複 軸1頭ながし (3点)**
+                    * 🎯 **軸馬**: **{h1['馬番']}番** ({h1['馬名']})
+                    * 相手: {h2['馬番']}番, {h3['馬番']}番, {h4['馬番']}番
+                    * **買い目**: **{h1['馬番']} - {h2['馬番']}, {h3['馬番']}, {h4['馬番']}**
+                    
+                    ---
+                    * **推奨度**: ⭐⭐⭐☆☆
+                    * **狙い**: 上位独占による好配当・万馬券狙い。
+                    * **資金配分例 (1,000円)**:
+                      - 3連複 {h1['馬番']}-{h2['馬番']}-{h3['馬番']}: 600円
+                      - 3連複 {h1['馬番']}-{h2['馬番']}-{h4['馬番']}: 400円
                     """
                 )
             else:
@@ -1509,18 +1567,36 @@ if st.session_state["predicted_results"] is not None:
     top1_pred = comp_df[comp_df["予想着順数値"] == 1].iloc[0]
     win_hit = (top1_pred["実際の着順"] == 1)
 
+    actual_1st = comp_df[comp_df["実際の着順"] == 1]
+    actual_2nd = comp_df[comp_df["実際の着順"] == 2]
+    act_1st_name = actual_1st.iloc[0]["馬名"] if len(actual_1st) > 0 else ""
+    act_2nd_name = actual_2nd.iloc[0]["馬名"] if len(actual_2nd) > 0 else ""
+
+    actual_top2_names = set(comp_df[comp_df["実際の着順"] <= 2]["馬名"])
+    actual_top3_names = set(comp_df[comp_df["実際の着順"] <= 3]["馬名"])
+
     top3_pred_names = set(comp_df[comp_df["予想着順数値"] <= 3]["馬名"])
-    top3_actual_names = set(comp_df[comp_df["実際の着順"] <= 3]["馬名"])
-    place_hits = len(top3_pred_names.intersection(top3_actual_names))
+    place_hits = len(top3_pred_names.intersection(actual_top3_names))
     
+    # 馬連BOX(3点) 的中判定: 確定1着と2着の両方がAI予想上位3頭に含まれているか
+    umaren_hit = (len(top3_pred_names.intersection(actual_top2_names)) == 2)
+    # ワイドBOX(3点) 的中判定: AI上位3頭のうち2頭以上が3着以内に入ったか
+    wide_hit = (place_hits >= 2)
+
     col_v1, col_v2, col_v3 = st.columns(3)
     with col_v1:
-        if win_hit:
-            st.success("🎯 **単勝予想: 【的中！】**\n1着候補が見事1着に入線しました！")
+        if umaren_hit:
+            st.success("🎉 **推奨① 馬連BOX: 【的中！！】**\n上位3頭でワンツー決着！ナイス的中です！")
+        elif win_hit:
+            st.success(f"🎯 **単勝予想: 【的中！】**\n◎ {top1_pred['馬名']} が見事1着に入線！")
         else:
-            st.warning(f"❌ **単勝予想: 【不的中】**\n1着候補: {top1_pred['馬名']} (実際は{int(top1_pred['実際の着順'])}着)")
+            st.warning(f"❌ **馬連BOX: 【不的中】**\n1着: {act_1st_name} / 2着: {act_2nd_name}")
     with col_v2:
-        st.info(f"🏅 **3着以内好走率**: {place_hits} / 3頭的中\n予想上位3頭中、{place_hits}頭が3着以内に入線")
+        if wide_hit:
+            hit_label = "トリプル的中（総取り！）" if place_hits == 3 else "ダブル/本線的中"
+            st.success(f"🤝 **推奨② ワイドBOX: 【的中！！】**\n上位3頭中 {place_hits}頭好走（{hit_label}）")
+        else:
+            st.info(f"🏅 **3着以内好走**: {place_hits} / 3頭\n上位3頭中、{place_hits}頭が3着以内に入線")
     with col_v3:
         avg_err = comp_df["着順誤差"].mean()
         st.metric("全頭の平均着順誤差", f"{avg_err:.1f}着", help="数値が小さいほど全頭の順位予測の精度が高い")
@@ -1579,6 +1655,14 @@ if st.session_state["predicted_results"] is not None:
 
                     style = str(r["脚質"])
                     pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_mult.get(style, 1.0)
+                    if course_type == "ダート" and race_distance <= 1400 and pace_prediction == "ハイペース":
+                        if style == "先行":
+                            pace_mult = max(pace_mult, 1.05)
+                        elif style == "逃げ":
+                            pace_mult = max(pace_mult, 0.85)
+                        elif style in ["差し", "追込"]:
+                            pace_mult = min(pace_mult, 1.05)
+
                     base_pace = 50.0 * w_p * pace_mult
 
                     # 展開力学
@@ -1587,14 +1671,19 @@ if st.session_state["predicted_results"] is not None:
                         if escape_count == 1:
                             dynamic_score += 26.0 * w_esc
                         elif escape_count >= 2:
-                            dynamic_score -= 22.0 * w_esc
+                            esc_pen = 15.0 if (course_type == "ダート" and race_distance <= 1400) else 22.0
+                            dynamic_score -= esc_pen * w_esc
                     elif style in ["差し", "追込"]:
                         if escape_count >= 2:
-                            dynamic_score += 20.0 * w_esc
+                            bon = 10.0 if (course_type == "ダート" and race_distance <= 1400) else 20.0
+                            dynamic_score += bon * w_esc
                         elif escape_count <= 1:
                             dynamic_score -= 14.0 * w_esc
-                    elif style == "先行" and escape_count == 0:
-                        dynamic_score += 15.0 * w_esc
+                    elif style == "先行":
+                        if escape_count == 0:
+                            dynamic_score += 15.0 * w_esc
+                        elif escape_count >= 2 and course_type == "ダート" and race_distance <= 1400:
+                            dynamic_score += 14.0 * w_esc
 
                     j_rate = float(r["騎手勝率(%)"])
                     base_jockey = j_rate * w_j * 3.0 * dist_jk_factor
@@ -1787,6 +1876,8 @@ if st.session_state["predicted_results"] is not None:
                 "学習日時": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
                 "コース・距離": f"{course_type} {race_distance}m",
                 "想定ペース": pace_prediction,
+                "馬連BOX(3点)": "⭕ 的中" if umaren_hit else "❌ 不的中",
+                "ワイドBOX(3点)": "⭕ 的中" if wide_hit else "❌ 不的中",
                 "単勝的中": "⭕ 的中" if win_hit else "❌ 不的中",
                 "3着内好走": f"{place_hits}/3頭",
                 "学習後重み(能力/展開/騎手/力学/相乗)": f"{new_w_ability:.2f}/{new_w_pace:.2f}/{new_w_jockey:.2f}/{new_w_escape:.2f}/{new_w_synergy:.2f}"
