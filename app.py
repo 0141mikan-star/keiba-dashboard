@@ -542,17 +542,20 @@ if "horses_data" not in st.session_state or "適性距離" in st.session_state["
 def fetch_netkeiba_race(url: str):
     """
     【Web公式競馬データ連動エンジン】
-    netkeibaの出走表URLから、レース情報（競馬場・距離・コース種別）および
+    netkeibaの出走表URL（または結果URL）から、レース情報（競馬場・距離・コース種別）および
     全出走馬の本物の過去走（前走・前々走着順・走破タイム・上がり3F・斤量・騎手・オッズ）を
     リアルタイムで自動取得・完全解析する。
-    中央競馬 (race.netkeiba.com) / 地方競馬 (nar.netkeiba.com) 完全対応。
+    中央競馬 (race.netkeiba.com) / 地方競馬 (nar.netkeiba.com) / データベース (db.netkeiba.com)
+    出馬表 (shutuba.html)、馬柱5走 (shutuba_past.html)、レース結果 (result.html) すべてに完全対応。
     """
     clean_url = url.strip()
     if not clean_url:
         return None, "URLが入力されていません"
 
-    # shutuba.html を shutuba_past.html に置換して詳細過去5走データ付きページを取得
-    if "shutuba.html" in clean_url:
+    # URLの正規化: result.html や shutuba.html を shutuba_past.html に自動変換
+    if "result.html" in clean_url:
+        target_url = clean_url.replace("result.html", "shutuba_past.html")
+    elif "shutuba.html" in clean_url:
         target_url = clean_url.replace("shutuba.html", "shutuba_past.html")
     else:
         target_url = clean_url
@@ -561,20 +564,38 @@ def fetch_netkeiba_race(url: str):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    content = None
     try:
         resp = requests.get(target_url, headers=headers, timeout=12)
-        resp.raise_for_status()
-    except Exception as e:
+        if resp.status_code == 200:
+            content = resp.content
+    except Exception:
+        pass
+
+    if not content:
         try:
             resp = requests.get(clean_url, headers=headers, timeout=12)
             resp.raise_for_status()
-        except Exception as e2:
-            return None, f"netkeibaへの接続に失敗しました: {e2}"
+            content = resp.content
+        except Exception as e:
+            return None, f"netkeibaへの接続に失敗しました: {e}"
 
-    content = resp.content
-    try:
-        html = content.decode("euc-jp")
-    except Exception:
+    # エンコーディングの自動判別 (地方競馬はutf-8、中央はeuc-jpが主流)
+    if "nar.netkeiba.com" in clean_url:
+        encodings = ["utf-8", "euc-jp", "cp932"]
+    else:
+        encodings = ["euc-jp", "utf-8", "cp932"]
+
+    html = ""
+    for enc in encodings:
+        try:
+            cand = content.decode(enc)
+            if "netkeiba" in cand or "レース" in cand or "競馬" in cand:
+                html = cand
+                break
+        except Exception:
+            continue
+    if not html:
         html = content.decode("utf-8", errors="ignore")
 
     soup = BeautifulSoup(html, "html.parser")
@@ -587,6 +608,8 @@ def fetch_netkeiba_race(url: str):
 
     race_data_el = soup.find("div", class_="RaceData01") or soup.find("div", class_="RaceData02")
     race_meta = race_data_el.text.strip() if race_data_el else ""
+    page_title = soup.title.text.strip() if soup.title else ""
+    full_text = f"{race_name} {race_meta} {page_title}"
 
     track_name = "東京"
     course_type = "芝"
@@ -594,7 +617,6 @@ def fetch_netkeiba_race(url: str):
 
     tracks = ["東京", "中山", "京都", "阪神", "新潟", "福島", "中京", "小倉", "札幌", "函館",
               "大井", "川崎", "船橋", "浦和", "門別", "盛岡", "水沢", "金沢", "笠松", "名古屋", "園田", "高知", "佐賀", "帯広"]
-    full_text = f"{race_name} {race_meta} {soup.title.text if soup.title else ''}"
     for t in tracks:
         if t in full_text:
             track_name = t
@@ -616,38 +638,65 @@ def fetch_netkeiba_race(url: str):
     past_records_map = {}
 
     rows = soup.find_all("tr", class_="HorseList")
+    if not rows:
+        rows = soup.find_all("tr", class_=re.compile(r"Result_List|Horse_List"))
+    if not rows:
+        for tr in soup.find_all("tr"):
+            if tr.find("a", href=lambda h: h and "/horse/" in h):
+                rows.append(tr)
+
     for r_idx, row in enumerate(rows):
-        waku_el = row.find("td", class_=re.compile(r"Waku\d*"))
-        waku = waku_el.text.strip() if waku_el else ""
-
-        umaban_el = row.find("td", class_=re.compile(r"Umaban\d*"))
-        umaban_str = umaban_el.text.strip() if umaban_el else ""
-        if not umaban_str or not umaban_str.isdigit():
-            umaban = r_idx + 1
+        # 馬名
+        h_a = row.find("a", href=lambda h: h and "/horse/" in h)
+        if h_a and h_a.text.strip():
+            h_name = h_a.text.strip()
         else:
-            umaban = int(umaban_str)
+            h_name_el = row.find("span", class_="HorseName") or row.find("div", class_="Horse02")
+            h_name = h_name_el.text.strip() if h_name_el else ""
 
-        h_name_el = row.find("span", class_="HorseName") or row.find("div", class_="Horse02")
-        h_name = h_name_el.text.strip() if h_name_el else ""
         if not h_name:
             continue
 
+        # 馬番
+        umaban_str = ""
+        umaban_el = row.find("td", class_=re.compile(r"Umaban\d*"))
+        if umaban_el and umaban_el.text.strip().isdigit():
+            umaban_str = umaban_el.text.strip()
+        else:
+            tds = row.find_all("td")
+            if len(tds) >= 2 and tds[1].text.strip().isdigit():
+                umaban_str = tds[1].text.strip()
+            elif len(tds) >= 1 and tds[0].text.strip().isdigit():
+                umaban_str = tds[0].text.strip()
+
+        try:
+            umaban = int(umaban_str) if umaban_str else (r_idx + 1)
+        except Exception:
+            umaban = r_idx + 1
+
+        # 枠番
+        waku = str(((umaban - 1) // 2) + 1)
+        waku_el = row.find("td", class_=re.compile(r"Waku\d*"))
+        if waku_el and waku_el.text.strip():
+            waku = waku_el.text.strip()
+
         # 騎手名
         jockey = "騎手未定"
-        jockey_el = row.find("td", class_="Jockey")
-        if jockey_el:
-            j_a = jockey_el.find("a")
-            if j_a and j_a.text.strip():
-                jockey = j_a.text.strip()
-            else:
+        j_a = row.find("a", href=lambda h: h and "/jockey/" in h)
+        if j_a and j_a.text.strip():
+            jockey = j_a.text.strip()
+        else:
+            jockey_el = row.find("td", class_="Jockey")
+            if jockey_el:
                 lines = [l.strip() for l in jockey_el.text.split() if l.strip()]
                 for l in lines:
-                    if not re.search(r"(\d|牝|牡|セ)", l) and len(l) <= 6:
+                    if not re.search(r"(\d|牝|牡|セ|栗|鹿|芦)", l) and 2 <= len(l) <= 6:
                         jockey = l
                         break
 
         # 斤量
         weight_val = 55.0
+        jockey_el = row.find("td", class_="Jockey")
         if jockey_el:
             w_m = re.search(r"(\d{2}\.\d)", jockey_el.text)
             if w_m:
@@ -672,7 +721,7 @@ def fetch_netkeiba_race(url: str):
             except Exception:
                 odds_val = 10.0
 
-        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_="Popular")
+        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_="Popular") or row.find("td", class_="Ninki")
         pop_val = umaban
         if pop_el:
             txt = pop_el.text.strip()
@@ -681,7 +730,7 @@ def fetch_netkeiba_race(url: str):
             except Exception:
                 pop_val = min(18, umaban)
 
-        # 過去走セルの詳細パース (馬柱5走)
+        # 過去走セルの詳細パース
         past_tds = row.find_all("td", class_="Past")
         past_parsed = []
         for ptd in past_tds[:3]:
@@ -701,18 +750,28 @@ def fetch_netkeiba_race(url: str):
                         except Exception:
                             pass
 
+            summary_text = " ".join(ptd.text.split())
+            if not rank_num:
+                rank_fall = re.search(r"\b(\d{1,2})\b", summary_text)
+                if rank_fall and int(rank_fall.group(1)) <= 18:
+                    rank_num = int(rank_fall.group(1))
+
             r_name_str = " ".join(d02.text.split()) if d02 else ""
             dist_time_str = " ".join(d05.text.split()) if d05 else ""
             pass_agari_str = " ".join(d06.text.split()) if d06 else ""
 
-            agari_m = re.search(r"\(([34]\d\.\d)\)", pass_agari_str)
+            if not r_name_str and not dist_time_str:
+                dist_sub = re.search(r"(ダ|芝)?(\d{4})m?", summary_text)
+                r_name_str = dist_sub.group(0) if dist_sub else ""
+
+            agari_m = re.search(r"\(([34]\d\.\d)\)", summary_text)
             agari = f"上り{agari_m.group(1)}s" if agari_m else ""
 
-            pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", pass_agari_str)
+            pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", summary_text)
             pass_order = pass_m.group(1) if pass_m else ""
 
             rank_str = f"{rank_num}着" if rank_num else "出走"
-            race_summary = f"{r_name_str} {dist_time_str}".strip()
+            race_summary = f"{r_name_str} {dist_time_str}".strip() or summary_text[:25]
 
             past_parsed.append({
                 "rank_num": rank_num,
@@ -722,7 +781,6 @@ def fetch_netkeiba_race(url: str):
                 "pass_order": pass_order
             })
 
-        # 脚質判定 (前走の道中通過順から自動推定)
         style = "先行"
         if past_parsed and past_parsed[0]["pass_order"]:
             po = past_parsed[0]["pass_order"]
@@ -739,7 +797,6 @@ def fetch_netkeiba_race(url: str):
             except Exception:
                 pass
 
-        # 前走・前々走サマリー作成＆能力補正
         last_str = "前走: データなし"
         second_str = "前々走: データなし"
         boost = 0.0
@@ -776,6 +833,7 @@ def fetch_netkeiba_race(url: str):
                     boost += 1.0
                     trend = "🔥 2走連続好走 (充実一途)"
 
+        source_label = "🌐 netkeiba公式実戦データ" if "nar.netkeiba.com" not in clean_url else "🌐 地方競馬公式実戦データ"
         comment = f"{last_str}。実戦データに基づくWeb公式戦績精査済。"
 
         past_records_map[h_name] = {
@@ -785,11 +843,11 @@ def fetch_netkeiba_race(url: str):
             "form_trend": trend,
             "key_point": comment,
             "ability_boost": round(float(boost), 1),
-            "source": "🌐 netkeiba公式実戦データ"
+            "source": source_label
         }
 
         horses.append({
-            "枠番": waku if waku else str(((umaban - 1) // 2) + 1),
+            "枠番": waku,
             "馬番": umaban,
             "馬名": h_name,
             "騎手名": jockey,
@@ -804,7 +862,7 @@ def fetch_netkeiba_race(url: str):
         return None, "出走馬データを抽出できませんでした。URLをご確認ください。"
 
     return {
-        "race_name": race_name,
+        "race_name": race_name or "レース",
         "track_name": track_name,
         "course_type": course_type,
         "distance": distance,
