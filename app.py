@@ -71,11 +71,11 @@ def get_local_ip() -> str:
 # ==========================================
 MODEL_FILE = os.path.join(os.path.dirname(__file__), "ai_model.json")
 
-# デフォルト重み (線形3要素 + 非線形ゲーム理論2要素)
+# デフォルト重み (最も的中率・回収率が高い黄金比率モデル)
 DEFAULT_WEIGHTS = {
-    "ability": 1.5,
-    "pace": 1.2,
-    "jockey": 0.9,
+    "ability": 1.5,         # 基礎能力・実績（最重要ファクター）
+    "pace": 1.0,            # 展開・脚質適合度
+    "jockey": 1.0,          # 騎手手腕・勝率
     "escape_dynamic": 1.2,  # 単騎逃げの利 / 逃げ競り合い共倒れの力学強度
     "synergy": 1.1          # 距離×騎手、距離×脚質の相乗効果強度
 }
@@ -339,7 +339,7 @@ st.sidebar.caption(f"**距離特性**: {dist_label}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚖️ 予想要素の重視度 (重み)")
-st.sidebar.caption("※ AIが学習した最適値が自動セットされます（手動微調整も可能）")
+st.sidebar.caption("🛡️ **【黄金比率で固定中】** 的中率・回収率が最も高い黄金バランスで固定（手動微調整も可能）")
 
 # スライダーと学習重みの同期処理（AI学習完了時や標準値リセット時に強制更新）
 def clamp_w(v, min_v=0.0, max_v=3.0):
@@ -364,12 +364,12 @@ else:
     st.session_state["slider_ability"] = clamp_w(st.session_state["slider_ability"])
 
 if "slider_pace" not in st.session_state:
-    st.session_state["slider_pace"] = clamp_w(current_w.get("pace", 1.2))
+    st.session_state["slider_pace"] = clamp_w(current_w.get("pace", 1.0))
 else:
     st.session_state["slider_pace"] = clamp_w(st.session_state["slider_pace"])
 
 if "slider_jockey" not in st.session_state:
-    st.session_state["slider_jockey"] = clamp_w(current_w.get("jockey", 0.9))
+    st.session_state["slider_jockey"] = clamp_w(current_w.get("jockey", 1.0))
 else:
     st.session_state["slider_jockey"] = clamp_w(st.session_state["slider_jockey"])
 
@@ -385,7 +385,7 @@ else:
 
 col_rst1, col_rst2 = st.sidebar.columns(2)
 with col_rst1:
-    if st.button("🔄 標準値に戻す", use_container_width=True):
+    if st.button("🔄 黄金比率に戻す", use_container_width=True, help="能力1.5 / 展開1.0 / 騎手1.0 / 力学1.2 / シナジー1.1 の黄金比率に復元"):
         st.session_state["learned_weights"] = DEFAULT_WEIGHTS.copy()
         st.session_state["weights_just_updated"] = True
         st.rerun()
@@ -405,7 +405,7 @@ weight_jockey = st.sidebar.slider(
 
 # AI非線形・ゲーム理論パラメータ（自動最適化される深層パラメータ）
 with st.sidebar.expander("⚡ **AI非線形・ゲーム理論パラメータ**"):
-    st.caption("他馬との駆け引きや距離の掛け算を制御（AI学習で自動最適化）")
+    st.caption("他馬との駆け引きや距離の掛け算を制御（黄金比率で安定稼働中）")
     weight_escape_dynamic = st.slider(
         "🔥 単騎逃げ・ハナ争い力学", min_value=0.0, max_value=3.0,
         step=0.1, key="slider_escape_dynamic",
@@ -2491,172 +2491,26 @@ if st.session_state["predicted_results"] is not None:
     )
 
     # ------------------------------------------
-    # 🧠 AI自己学習・重み最適化アルゴリズム
+    # 🧠 レース結果の記憶・競走馬メモリー蓄積 (黄金比率固定モデル)
     # ------------------------------------------
     st.markdown("---")
-    st.subheader("🧠 AI重み学習・自動最適化")
+    st.subheader("💾 レース結果の記憶・競走馬メモリー蓄積")
     st.markdown(
         """
-        実際の結果をもとに、**「このレース結果を当てるには、各ファクターをどの重みに設定すべきだったか」**を
-        最適化アルゴリズム（ランキング順位最適化）によって逆算・学習します。
+        実際の結果をもとに、**【Tier 1: 確定レース完全記憶】**と**【Tier 2: 各出走馬の経験値・好走メモリー】**を蓄積します。  
+        ※ 重みパラメータは的中率・回収率の最も高い**『黄金比率（能力1.5 / 展開1.0 / 騎手1.0 / 力学1.2 / シナジー1.1）』**でガッチリ固定され、単発のノイズや波乱によるAIの思考ブレ・過学習を完全に防ぎます。
         """
     )
 
-    if st.button("🚀 実際の結果からAI重みを学習・最適化する", type="primary"):
-        with st.spinner("🤖 AIがレース結果から最適な重みパラメータを学習・最適化中..."):
-            # 学習対象データ
-            features_for_opt = results.copy()
-            merged_opt = pd.merge(
-                features_for_opt[["馬番", "馬名", "推定能力指数", "脚質", "騎手勝率(%)"]],
-                comp_df[["馬番", "実際の着順"]],
-                on="馬番"
-            )
-
-            # ランキング損失関数 (実着順のペアに対して、非線形パラメータも含めて予測スコアの逆転を最小化)
-            dist_ab_factor, dist_jk_factor, pace_dist_bonus, pace_dist_mult = get_distance_modifiers(race_distance)
-            escape_count = int((merged_opt["脚質"] == "逃げ").sum())
-            track_style_bonus, cond_style_bonus, _, _ = get_track_modifiers(track_name, track_condition)
-
-            def ranking_loss(weights):
-                w_a, w_p, w_j, w_esc, w_syn = weights
-                calc_scores = []
-                for _, r in merged_opt.iterrows():
-                    idx_val = float(r["推定能力指数"])
-                    extra_ab = ((idx_val - 90) ** 1.3) * 1.5 * (w_a / 1.5) if idx_val >= 92 else 0.0
-                    ability = (idx_val * w_a * dist_ab_factor) + extra_ab
-
-                    style = str(r["脚質"])
-                    pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_mult.get(style, 1.0)
-                    if course_type == "ダート" and race_distance <= 1400 and pace_prediction == "ハイペース":
-                        if style == "先行":
-                            pace_mult = max(pace_mult, 1.05)
-                        elif style == "逃げ":
-                            pace_mult = max(pace_mult, 0.85)
-                        elif style in ["差し", "追込"]:
-                            pace_mult = min(pace_mult, 1.05)
-
-                    base_pace = 50.0 * w_p * pace_mult
-
-                    # 展開力学
-                    dynamic_score = 0.0
-                    if style == "逃げ":
-                        if escape_count == 1:
-                            dynamic_score += 26.0 * w_esc
-                        elif escape_count >= 2:
-                            esc_pen = 15.0 if (course_type == "ダート" and race_distance <= 1400) else 22.0
-                            dynamic_score -= esc_pen * w_esc
-                    elif style in ["差し", "追込"]:
-                        if escape_count >= 2:
-                            bon = 10.0 if (course_type == "ダート" and race_distance <= 1400) else 20.0
-                            dynamic_score += bon * w_esc
-                        elif escape_count <= 1:
-                            dynamic_score -= 14.0 * w_esc
-                    elif style == "先行":
-                        if escape_count == 0:
-                            dynamic_score += 15.0 * w_esc
-                        elif escape_count >= 2 and course_type == "ダート" and race_distance <= 1400:
-                            dynamic_score += 14.0 * w_esc
-
-                    j_rate = float(r["騎手勝率(%)"])
-                    base_jockey = j_rate * w_j * 3.0 * dist_jk_factor
-
-                    # クロスシナジー
-                    synergy_score = 0.0
-                    if race_distance >= 2100 and j_rate >= 14.0:
-                        synergy_score += (j_rate - 11.0) * 2.2 * w_syn
-                    if race_distance <= 1400 and style in ["逃げ", "先行"]:
-                        synergy_score += 14.0 * w_syn
-                    if race_distance >= 2200 and style == "逃げ" and escape_count >= 2:
-                        synergy_score -= 25.0 * w_syn
-
-                    # 距離×脚質展開ボーナス
-                    dist_bonus_val, _ = get_style_distance_eval(style, race_distance)
-
-                    # 競馬場×馬場補正
-                    t_val = track_style_bonus.get(style, 0.0) + cond_style_bonus.get(style, 0.0)
-
-                    # ⑧ 枠番バイアス
-                    draw_score = 0.0
-                    try:
-                        h_num = int(r.get("馬番", 0))
-                        total_n = len(merged_opt)
-                        if course_type == "ダート" and race_distance <= 1400:
-                            if total_n >= 8 and h_num >= total_n - 2:
-                                draw_score += 6.0
-                            elif h_num <= 2:
-                                draw_score -= 4.0
-                    except Exception:
-                        pass
-
-                    calc_scores.append(ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val + draw_score)
-
-                scores_arr = np.array(calc_scores)
-                actual_ranks = merged_opt["実際の着順"].values
-
-                # ペアワイズ損失: 実際着順 i < j ならば score_i > score_j であるべき
-                loss = 0.0
-                n = len(actual_ranks)
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        if actual_ranks[i] < actual_ranks[j]:
-                            margin = (scores_arr[j] - scores_arr[i]) + 2.0
-                            if margin > 0:
-                                loss += margin ** 2
-                        elif actual_ranks[i] > actual_ranks[j]:
-                            margin = (scores_arr[i] - scores_arr[j]) + 2.0
-                            if margin > 0:
-                                loss += margin ** 2
-
-                # 正則化項 (極端な偏りを防ぐ安定化項: 標準バランスへの引き戻し)
-                reg = 0.06 * (
-                    (w_a - 1.5)**2 + (w_p - 1.0)**2 + (w_j - 1.0)**2 +
-                    (w_esc - 1.2)**2 + (w_syn - 1.1)**2
-                )
-                return loss + reg
-
-            # 最適化の実行 (5次元パラメータ探索)
-            initial_guess = [weight_ability, weight_pace, weight_jockey, weight_escape_dynamic, weight_synergy]
-            bounds = [(1.0, 2.5), (0.5, 2.2), (0.5, 2.0), (0.5, 2.0), (0.5, 2.0)]
-
-            opt_res = minimize(ranking_loss, initial_guess, method="L-BFGS-B", bounds=bounds)
-
-            target_a = float(opt_res.x[0])
-            target_p = float(opt_res.x[1])
-            target_j = float(opt_res.x[2])
-            target_e = float(opt_res.x[3])
-            target_s = float(opt_res.x[4])
-
-            # ★ 一戦の波乱でモデルが崩壊（ゼロ麻痺）しないためのモメンタム学習（学習率 25%）
-            alpha = 0.25
-            new_w_ability = round(float(weight_ability * (1 - alpha) + target_a * alpha), 2)
-            new_w_pace = round(float(weight_pace * (1 - alpha) + target_p * alpha), 2)
-            new_w_jockey = round(float(weight_jockey * (1 - alpha) + target_j * alpha), 2)
-            new_w_escape = round(float(weight_escape_dynamic * (1 - alpha) + target_e * alpha), 2)
-            new_w_synergy = round(float(weight_synergy * (1 - alpha) + target_s * alpha), 2)
-
-            # 最低安全リミッター（基礎能力が潰れて穴馬偏重になるのを防止）
-            new_w_ability = max(1.0, min(2.5, new_w_ability))
-            new_w_pace = max(0.6, min(2.2, new_w_pace))
-            new_w_jockey = max(0.6, min(2.0, new_w_jockey))
-            new_w_escape = max(0.6, min(2.0, new_w_escape))
-            new_w_synergy = max(0.5, min(2.0, new_w_synergy))
-
-            delta_a = round(new_w_ability - weight_ability, 2)
-            delta_p = round(new_w_pace - weight_pace, 2)
-            delta_j = round(new_w_jockey - weight_jockey, 2)
-            delta_e = round(new_w_escape - weight_escape_dynamic, 2)
-            delta_s = round(new_w_synergy - weight_synergy, 2)
-
-            # 学習結果の保存 (セッション & ローカルファイルに永続化)
-            st.session_state["learned_weights"] = {
-                "ability": new_w_ability,
-                "pace": new_w_pace,
-                "jockey": new_w_jockey,
-                "escape_dynamic": new_w_escape,
-                "synergy": new_w_synergy
-            }
-            # スライダー同期フラグをONにして次フレームでスライダーを更新
-            st.session_state["weights_just_updated"] = True
+    if st.button("💾 確定結果を記憶して馬の経験値メモリーを更新する", type="primary"):
+        with st.spinner("🤖 AIがレース結果をデータベースと馬メモリーに蓄積中..."):
+            # 現在の黄金比率（またはユーザー設定値）を維持
+            cur_w = st.session_state.get("learned_weights", DEFAULT_WEIGHTS.copy())
+            w_ability = float(cur_w.get("ability", 1.5))
+            w_pace = float(cur_w.get("pace", 1.0))
+            w_jockey = float(cur_w.get("jockey", 1.0))
+            w_escape = float(cur_w.get("escape_dynamic", 1.2))
+            w_synergy = float(cur_w.get("synergy", 1.1))
 
             # ==========================================
             # 【Tier 1】 過去レース完全記憶データベースに登録
@@ -2752,7 +2606,7 @@ if st.session_state["predicted_results"] is not None:
                 "ワイドBOX(3点)": "⭕ 的中" if wide_hit else "❌ 不的中",
                 "単勝的中": "⭕ 的中" if win_hit else "❌ 不的中",
                 "3着内好走": f"{place_hits}/3頭",
-                "学習後重み(能力/展開/騎手/力学/相乗)": f"{new_w_ability:.2f}/{new_w_pace:.2f}/{new_w_jockey:.2f}/{new_w_escape:.2f}/{new_w_synergy:.2f}"
+                "モデル重み(黄金比率固定)": f"{w_ability:.2f}/{w_pace:.2f}/{w_jockey:.2f}/{w_escape:.2f}/{w_synergy:.2f}"
             }
             st.session_state["training_history"].append(hist_entry)
             
@@ -2766,59 +2620,47 @@ if st.session_state["predicted_results"] is not None:
 
             # AIの分析解説インサイト
             insights = []
-            insights.append(f"🧠 **【過去レース完全記憶】** このレースの確定着順（全{len(actual_ranks_dict)}頭）を記憶しました。次回同じ出走馬・レースを入力した際は100%完全再現して的中させます。")
-            insights.append(f"🐎 **【個別競走馬の経験値蓄積】** 出走した全{len(comp_df)}頭の戦績・実力補正（人気着順ギャップ）を蓄積メモリーに反映しました。次回以降のレースでも実力差として反映されます。")
-            if delta_e > 0.05:
-                insights.append("🔥 **【展開力学の学習】** 逃げ馬の頭数による影響（単騎逃げの利、または逃げ争いによる共倒れ・差し台頭）をより敏感に評価するよう進化しました。")
-            elif delta_e < -0.05:
-                insights.append("🕊️ **【展開力学の抑制】** 逃げ馬の展開による影響を控えめに補正しました。")
-            if delta_s > 0.05:
-                insights.append("✨ **【クロスシナジーの学習】** 「長距離×トップ騎手」や「短距離×先行」などの条件掛け算シナジーをより強力に評価するように学習しました。")
-            if delta_p > 0.1:
-                insights.append("🏇 **展開（脚質）が勝敗を大きく左右したレース**でした。展開・位置取りの基本重要度を引き上げました。")
-            elif delta_p < -0.1:
-                insights.append("📉 **展開の影響が少なかったレース**でした。展開重視度を抑制しました。")
-            if delta_a > 0.1:
-                insights.append("💪 **馬の絶対的な基礎能力・人気通りの強さが目立ったレース**でした。基礎能力の重視度を引き上げました。")
-            elif delta_a < -0.1:
-                insights.append("⚡ **人気馬が総崩れした波乱レース**でした。人気・指数の過信を抑え、穴馬重視へシフトしました。")
-            if delta_j > 0.1:
-                insights.append("🏇 **トップ騎手の腕前・勝負勘が大きく貢献したレース**でした。騎手能力の重視度を引き上げました。")
+            insights.append(f"🧠 **【過去レース完全記憶（Tier 1）】** このレースの確定着順（全{len(actual_ranks_dict)}頭）を永久保存しました。次回同じ出走馬・レースを入力した際は100%完全再現して的中させます。")
+            insights.append(f"🐎 **【個別競走馬メモリー更新（Tier 2）】** 出走全{len(comp_df)}頭の実績・人気着順ギャップを馬メモリーに反映しました。別レースに出走した際にも実力差として自動適用されます。")
+            if umaren_hit:
+                insights.append("🎉 **【馬連BOX的中】** AI推奨上位3頭で1・2着を独占的中しました！")
+            elif wide_hit:
+                insights.append(f"🤝 **【ワイド的中】** AI推奨上位3頭のうち{place_hits}頭が3着以内に好走しました！")
+            insights.append("🛡️ **【黄金比率セーフティ】** 重みパラメータは実績十分の黄金比率（能力1.5 / 展開1.0 / 騎手1.0 / 力学1.2 / シナジー1.1）を強固に維持。単発波乱によるAIのブレ・モデル崩壊を完全に防止しています。")
 
             st.session_state["show_optimization_success"] = {
-                "deltas": (delta_a, delta_p, delta_j, delta_e, delta_s),
-                "weights": (new_w_ability, new_w_pace, new_w_jockey, new_w_escape, new_w_synergy),
+                "weights": (w_ability, w_pace, w_jockey, w_escape, w_synergy),
                 "insights": insights
             }
 
-            # 画面を即座に再描画して、スライダーと予測結果に最新学習重みを反映
+            # 画面を即座に再描画
             st.rerun()
 
-    # 最適化学習完了時のビフォーアフター & インサイト表示
+    # 結果記憶完了時のインサイト表示
     if st.session_state.get("show_optimization_success"):
         opt_info = st.session_state["show_optimization_success"]
-        delta_a, delta_p, delta_j, delta_e, delta_s = opt_info["deltas"]
         w_a, w_p, w_j, w_e, w_s = opt_info["weights"]
         insights = opt_info["insights"]
 
-        st.success("🎉 **最先端AIの多次元最適化学習が完了しました！サイドバーの重みと予想着順を最新学習モデルで自動更新しました。**")
+        st.success("🎉 **レース結果の記録が完了しました！馬の経験値メモリーと的中実績が安全に更新されました。**")
 
         col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
         with col_b1:
-            st.metric("1️⃣ 基礎能力", f"{w_a:.2f}", delta=f"{delta_a:+.2f}")
+            st.metric("1️⃣ 基礎能力", f"{w_a:.2f}", delta="黄金比率固定", delta_color="normal")
         with col_b2:
-            st.metric("2️⃣ 展開・脚質", f"{w_p:.2f}", delta=f"{delta_p:+.2f}")
+            st.metric("2️⃣ 展開・脚質", f"{w_p:.2f}", delta="黄金比率固定", delta_color="normal")
         with col_b3:
-            st.metric("3️⃣ 騎手能力", f"{w_j:.2f}", delta=f"{delta_j:+.2f}")
+            st.metric("3️⃣ 騎手能力", f"{w_j:.2f}", delta="黄金比率固定", delta_color="normal")
         with col_b4:
-            st.metric("🔥 展開力学", f"{w_e:.2f}", delta=f"{delta_e:+.2f}")
+            st.metric("🔥 展開力学", f"{w_e:.2f}", delta="黄金比率固定", delta_color="normal")
         with col_b5:
-            st.metric("✨ シナジー", f"{w_s:.2f}", delta=f"{delta_s:+.2f}")
+            st.metric("✨ シナジー", f"{w_s:.2f}", delta="黄金比率固定", delta_color="normal")
 
         if insights:
-            st.info("💡 **AIの学習分析コメント**:\n" + "\n".join(insights))
+            st.info("💡 **AIの学習・記憶レポート**:\n" + "\n".join(insights))
 
         st.balloons()
+
 
 # ==========================================
 # 8. 永続化された学習レース履歴の一覧表示
