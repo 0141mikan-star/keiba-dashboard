@@ -947,6 +947,245 @@ def get_track_modifiers(track_str: str, condition_str: str):
 
     return track_style_bonus, cond_style_bonus, track_desc, cond_desc
 
+# ==========================================
+# オッズ推定＆期待値・最強AIアルゴリズム
+# ==========================================
+POPULARITY_BASE_ODDS = {
+    1: 2.2, 2: 3.8, 3: 5.6, 4: 8.2, 5: 12.0,
+    6: 18.0, 7: 26.0, 8: 38.0, 9: 55.0, 10: 78.0,
+    11: 105.0, 12: 145.0, 13: 195.0, 14: 260.0, 15: 340.0,
+    16: 430.0, 17: 530.0, 18: 650.0
+}
+
+def estimate_single_odds(pop: int, win_rate: float = None, total_horses: int = 14) -> float:
+    """単勝人気とAI勝率から単勝想定オッズを推定"""
+    base = POPULARITY_BASE_ODDS.get(int(pop), 10.0 + int(pop) * 15.0)
+    scale = (max(5, total_horses) / 14.0) ** 0.35
+    odds = base * scale
+    if win_rate is not None and win_rate > 35.0 and int(pop) <= 2:
+        odds = min(odds, round(max(1.3, 100.0 / (win_rate * 1.4)), 1))
+    return round(max(1.1, odds), 1)
+
+def estimate_quinella_odds(o1: float, o2: float) -> float:
+    """2頭の単勝オッズから馬連想定オッズを推定（ハーヴィル・モデル回帰）"""
+    val = ((max(1.1, o1) * max(1.1, o2)) ** 0.72) * 0.95
+    return round(max(1.3, val), 1)
+
+def estimate_wide_odds(o1: float, o2: float) -> float:
+    """2頭の単勝オッズからワイド想定オッズを推定"""
+    umaren = estimate_quinella_odds(o1, o2)
+    val = umaren * 0.36
+    return round(max(1.1, val), 1)
+
+def estimate_trio_odds(o1: float, o2: float, o3: float) -> float:
+    """3頭の単勝オッズから3連複想定オッズを推定"""
+    val = ((max(1.1, o1) * max(1.1, o2) * max(1.1, o3)) ** 0.60) * 0.85
+    return round(max(2.0, val), 1)
+
+def calculate_expected_value(prob_pct: float, odds: float) -> float:
+    """AI勝率(%)と想定オッズから期待値（EV = Expected Value）を算出"""
+    ev = (float(prob_pct) / 100.0) * float(odds)
+    return round(ev, 2)
+
+def get_ev_grade(ev: float) -> tuple[str, str]:
+    """期待値のグレードと評価アイコン"""
+    if ev >= 1.20:
+        return "S (激熱・特大妙味)", "🔥"
+    elif ev >= 1.00:
+        return "A (プラス期待値)", "✨"
+    elif ev >= 0.80:
+        return "B (標準適正)", "⚖️"
+    else:
+        return "C (過剰人気・妙味薄)", "⚠️"
+
+def get_draw_bias(h_num: int, total_horses: int, track_str: str, course_type: str, distance: int) -> tuple[float, str]:
+    """コース×距離×馬番による物理的な枠順バイアス（有利不利）を精密算出"""
+    if total_horses <= 4 or h_num <= 0:
+        return 0.0, "○ 枠順不問"
+
+    # 新潟直線1000m（外ラチ無双）
+    if "新潟" in track_str and distance == 1000 and course_type == "芝":
+        if h_num >= total_horses - 2:
+            return 10.0, "👑 外ラチ沿い絶対有利 (+10)"
+        elif h_num <= 3:
+            return -8.0, "✕ 内枠荒れ馬場不利 (-8)"
+
+    # 東京 芝2000m（2角ポケット・大外枠致命的不利）
+    if "東京" in track_str and distance == 2000 and course_type == "芝":
+        if h_num >= total_horses - 2:
+            return -8.0, "✕ 2角ポケット大外距離ロス (-8)"
+        elif h_num <= 4:
+            return 6.0, "◎ 内枠イン経済コース (+6)"
+
+    # 中山 ダ1200m / 阪神 ダ1400m（芝スタート外枠加速無双）
+    if ("中山" in track_str and distance == 1200 and course_type == "ダート") or \
+       ("阪神" in track_str and distance == 1400 and course_type == "ダート"):
+        if h_num >= total_horses - 2:
+            return 8.0, "⚡ 芝スタート外枠加速有利 (+8)"
+        elif h_num <= 2:
+            return -5.0, "▲ 内枠芝距離短＆砂被り (-5)"
+
+    # ダート短距離 (<=1400m) 一般（外枠砂被り回避有利）
+    if course_type == "ダート" and distance <= 1400:
+        if h_num >= total_horses - 2:
+            return 5.0, "○ 外枠スムーズ加速有利 (+5)"
+        elif h_num <= 2:
+            return -4.0, "▲ 内枠砂被り包まれ警戒 (-4)"
+
+    # 小回り芝 (中山・小倉・福島・札幌・函館) 内枠利
+    if any(k in track_str for k in ["中山", "小倉", "福島", "札幌", "函館"]) and course_type == "芝" and distance <= 1800:
+        if h_num <= 3:
+            return 4.0, "○ 小回り内ラチ最短距離 (+4)"
+        elif h_num >= total_horses - 1:
+            return -3.0, "▲ 外外回らされ距離ロス (-3)"
+
+    return 0.0, "○ 枠順フラット"
+
+def diagnose_race_volatility(results_df: pd.DataFrame, escape_count: int) -> dict:
+    """レースの波乱度（荒れ度）と勝負度をAIが自動診断"""
+    if results_df.empty:
+        return {
+            "level": "中波乱 (混戦模様)",
+            "stars": "★★★☆☆",
+            "badge_color": "#0d6efd",
+            "confidence": "Aランク",
+            "summary": "上位拮抗の混戦レース。相手選びが鍵。",
+            "bet_strategy": "⚖️ 上位3頭のBOX買いが手堅い戦略！"
+        }
+
+    top1 = results_df.iloc[0]
+    top1_win = float(top1.get("勝率(%)", 20.0))
+    top1_pop = int(top1.get("単勝人気", 1))
+
+    if top1_win >= 42.0 and top1_pop == 1 and escape_count <= 1:
+        return {
+            "level": "低波乱 (鉄板・本命堅調)",
+            "stars": "★☆☆☆☆",
+            "badge_color": "#198754",
+            "confidence": "Sランク (鉄板勝負レース)",
+            "summary": "1強ムード濃厚！本命馬の軸信頼度が突出しており、点数を絞って資金集中すべきレース。",
+            "bet_strategy": "🎯 本命1頭軸の馬連・ワイド1〜2点に資金集中で高回収！"
+        }
+    elif escape_count >= 2 or top1_win < 24.0 or (len(results_df) >= 3 and results_df.iloc[2].get("特注穴馬", False)):
+        return {
+            "level": "特大波乱 (荒れる警報発令)",
+            "stars": "★★★★★",
+            "badge_color": "#dc3545",
+            "confidence": "Bランク (一撃万馬券狙い)",
+            "summary": "逃げ争い激化や実力伯仲により大波乱必至！人気馬総崩れの一撃高配当チャンス。",
+            "bet_strategy": "🚀 特注穴馬を組み込んだ3連複や馬連穴流しで高配当を一本釣り！"
+        }
+    else:
+        return {
+            "level": "中波乱 (標準・混戦模様)",
+            "stars": "★★★☆☆",
+            "badge_color": "#0d6efd",
+            "confidence": "Aランク (王道バランス)",
+            "summary": "実力馬3〜4頭による好勝負。展開次第で着順が入れ替わる最も馬券妙味のあるレース。",
+            "bet_strategy": "⚖️ 上位3頭の馬連BOX・ワイドBOXで手堅く回収！"
+        }
+
+def calculate_dutching_allocation(bets: list[dict], budget: int = 3000, mode: str = "均等払戻（トリガミ完全防止）") -> dict:
+    """
+    トリガミ完全防止＆最適資金配分アルゴリズム（ダッチング電卓）:
+    - 均等払戻モード: どの買い目が当たっても手元に残る払戻金がほぼ均等になるように配分
+    - AI期待値傾斜配分: 本線に厚く、抑えは元返し
+    - 均等購入: 全て同額
+    """
+    if not bets or budget < len(bets) * 100:
+        budget = max(len(bets) * 100, 1000)
+
+    n = len(bets)
+    odds_list = [max(1.1, float(b.get("odds", 2.0))) for b in bets]
+    inv_odds = [1.0 / o for o in odds_list]
+    inv_sum = sum(inv_odds)
+    comp_odds = 1.0 / inv_sum if inv_sum > 0 else 1.0
+
+    allocations = [100] * n
+
+    if mode == "均等払戻（トリガミ完全防止）":
+        raw_amounts = [(budget * inv / inv_sum) for inv in inv_odds]
+        allocations = [max(100, int(r // 100) * 100) for r in raw_amounts]
+        curr_total = sum(allocations)
+        diff = budget - curr_total
+
+        while diff >= 100:
+            returns = [allocations[i] * odds_list[i] for i in range(n)]
+            min_idx = int(np.argmin(returns))
+            allocations[min_idx] += 100
+            diff -= 100
+
+        while diff <= -100:
+            returns = [allocations[i] * odds_list[i] for i in range(n)]
+            eligible = [i for i in range(n) if allocations[i] > 100]
+            if not eligible:
+                break
+            max_idx = eligible[int(np.argmax([returns[i] for i in eligible]))]
+            allocations[max_idx] -= 100
+            diff += 100
+
+    elif mode == "AI期待値傾斜配分":
+        hedge_total = 0
+        for i in range(1, n):
+            needed = int(np.ceil((budget / odds_list[i]) / 100.0) * 100)
+            needed = max(100, min(needed, budget // 2))
+            allocations[i] = needed
+            hedge_total += needed
+
+        main_budget = max(100, budget - hedge_total)
+        allocations[0] = main_budget
+
+    else:  # 均等購入
+        each = (budget // n // 100) * 100
+        each = max(100, each)
+        allocations = [each] * n
+        rem = budget - sum(allocations)
+        if rem >= 100:
+            allocations[0] += rem
+
+    actual_total = sum(allocations)
+    results = []
+    has_torigami = False
+
+    for i, b in enumerate(bets):
+        amt = allocations[i]
+        odds = odds_list[i]
+        ret = int(round(amt * odds))
+        profit = ret - actual_total
+        roi = round((ret / actual_total) * 100.0, 1)
+        is_tori = ret < actual_total
+
+        if is_tori:
+            has_torigami = True
+
+        results.append({
+            "name": b.get("name", f"買い目{i+1}"),
+            "odds": odds,
+            "ev": b.get("ev", 1.0),
+            "amount": amt,
+            "return": ret,
+            "profit": profit,
+            "roi": roi,
+            "is_torigami": is_tori
+        })
+
+    min_ret = min(r["return"] for r in results)
+    max_ret = max(r["return"] for r in results)
+    min_roi = min(r["roi"] for r in results)
+    max_roi = max(r["roi"] for r in results)
+
+    return {
+        "items": results,
+        "actual_total": actual_total,
+        "composite_odds": round(comp_odds, 2),
+        "min_return": min_ret,
+        "max_return": max_ret,
+        "min_roi": min_roi,
+        "max_roi": max_roi,
+        "has_torigami": has_torigami,
+        "all_profitable": not has_torigami
+    }
+
 def assign_ai_marks(result_df: pd.DataFrame) -> pd.DataFrame:
     """各馬の予測着順と穴馬フラグに基づいて競馬印（◎, ○, ▲, ☆, △, ー）を付与"""
     marks = []
@@ -1016,6 +1255,10 @@ def generate_horse_recommendation_comment(
     track_eval = str(row.get("コース馬場評価", ""))
     synergy_val = float(row.get("シナジー", 0.0))
     is_upset = bool(row.get("特注穴馬", False))
+    odds = float(row.get("想定単勝オッズ", 5.0))
+    ev = float(row.get("期待値(EV)", 1.0))
+    ev_grade = str(row.get("期待値ランク", "⚖️ B (標準適正)"))
+    draw_eval = str(row.get("枠順評価", "○ 枠順フラット"))
 
     reasons = []
 
@@ -1048,6 +1291,10 @@ def generate_horse_recommendation_comment(
             "score": score,
             "win_rate": win_rate,
             "ab_idx": ab_idx,
+            "odds": odds,
+            "ev": ev,
+            "ev_grade": ev_grade,
+            "draw_eval": draw_eval,
             "reasons": reasons,
             "advice": advice
         }
@@ -1084,11 +1331,17 @@ def generate_horse_recommendation_comment(
     if synergy_val >= 5.0:
         reasons.append(f"条件×騎手/脚質の相乗効果（シナジー **+{synergy_val:.1f}点**）が大きく加点。")
 
-    # 4. コース・馬場適性
+    # 4. コース・馬場・枠順物理適性
+    if "👑" in draw_eval or "⚡" in draw_eval or "◎" in draw_eval:
+        reasons.append(f"枠順物理バイアス: **{draw_eval}**")
     if "◎" in track_eval:
         reasons.append(f"競馬場・馬場状態（{meta.get('track_desc', 'コース')} / {meta.get('cond_desc', '馬場')}）との適合度が非常に高い追い風。")
 
-    # 5. 学習経験値
+    # 5. AI期待値・オッズ妙味
+    if ev >= 1.15:
+        reasons.append(f"AI期待値（EV）**{ev:.2f}**（{ev_grade}）！勝率に対して想定単勝オッズ（**{odds:.1f}倍**）が甘く、期待値面で最高水準。")
+
+    # 6. 学習経験値
     if "実績" in exp_tag:
         reasons.append(f"過去レースでの好走データ蓄積（**{exp_tag}**）により、過去実績からも裏付けあり。")
 
@@ -1116,6 +1369,10 @@ def generate_horse_recommendation_comment(
         "score": score,
         "win_rate": win_rate,
         "ab_idx": ab_idx,
+        "odds": odds,
+        "ev": ev,
+        "ev_grade": ev_grade,
+        "draw_eval": draw_eval,
         "reasons": reasons,
         "advice": advice
     }
@@ -1239,13 +1496,41 @@ def calculate_predictions(
         result_df["特注穴馬"] = [False] * total_len
         result_df = assign_ai_marks(result_df)
 
+        est_odds_list = []
+        ev_list = []
+        ev_grades = []
+        for idx, row in result_df.iterrows():
+            pop_val = int(row.get("単勝人気", 5))
+            w_rate = float(row.get("勝率(%)", 10.0))
+            o_val = estimate_single_odds(pop_val, w_rate, total_len)
+            ev_val = calculate_expected_value(w_rate, o_val)
+            grade_text, grade_icon = get_ev_grade(ev_val)
+            est_odds_list.append(o_val)
+            ev_list.append(ev_val)
+            ev_grades.append(f"{grade_icon} {grade_text}")
+
+        result_df["想定単勝オッズ"] = est_odds_list
+        result_df["期待値(EV)"] = ev_list
+        result_df["期待値ランク"] = ev_grades
+        result_df["枠順評価"] = ["👑 過去完全一致" for _ in range(total_len)]
+
+        volatility = {
+            "level": "低波乱 (過去完全記憶・鉄板)",
+            "stars": "★☆☆☆☆",
+            "badge_color": "#198754",
+            "confidence": "Sランク (完全再現)",
+            "summary": f"過去確定レース（{matched_race.get('race_name', '過去学習レース')}）の着順を100%完全再現中！1着〜最下位まで確定済み。",
+            "bet_strategy": "🎯 1着固定・連勝1点で回収率を極大化できます！"
+        }
+
         meta = {
             "past_race_matched": True,
             "matched_race_name": matched_race.get("race_name", "過去学習レース"),
             "matched_date": matched_race.get("date", ""),
             "track_desc": track_desc,
             "cond_desc": cond_desc,
-            "learned_horses_count": len(rec_ranks)
+            "learned_horses_count": len(rec_ranks),
+            "volatility": volatility
         }
         return result_df, meta
 
@@ -1270,6 +1555,7 @@ def calculate_predictions(
     dist_bonus_scores = []
     dist_bonus_labels = []
     track_cond_labels = []
+    draw_labels = []
     estimated_indices = []
     jockey_rates = []
     exp_labels = []
@@ -1366,18 +1652,16 @@ def calculate_predictions(
             tc_lbl = "○ コース不問"
         track_cond_labels.append(tc_lbl)
 
-        # ⑧ 【枠番・馬番バイアス】（ダート短距離の外枠有利・砂被り回避）
+        # ⑧ 【枠番・馬番バイアス】（コース×距離×馬番の物理バイアス）
         draw_score = 0.0
+        draw_lbl = "○ 枠順フラット"
         try:
             h_num = int(row.get("馬番", 0))
             total_n = len(df)
-            if course_type == "ダート" and race_distance <= 1400:
-                if total_n >= 8 and h_num >= total_n - 2:
-                    draw_score += 6.0  # 外枠（砂被らずスムーズ加速有利）
-                elif h_num <= 2:
-                    draw_score -= 4.0  # 最内枠（砂被り・包まれリスク）
+            draw_score, draw_lbl = get_draw_bias(h_num, total_n, track_name, course_type, race_distance)
         except Exception:
             pass
+        draw_labels.append(draw_lbl)
 
         total = ability + base_pace + dynamic_score + base_jockey + synergy_score + dist_bonus_val + t_val + draw_score
 
@@ -1395,6 +1679,7 @@ def calculate_predictions(
     result_df["騎手勝率(%)"] = jockey_rates
     result_df["距離展開評価"] = dist_bonus_labels
     result_df["コース馬場評価"] = track_cond_labels
+    result_df["枠順評価"] = draw_labels
     result_df["AI学習経験値"] = exp_labels
     result_df["総合スコア"] = np.round(scores, 2)
     result_df["能力スコア"] = ability_scores
@@ -1425,6 +1710,28 @@ def calculate_predictions(
 
     result_df = assign_ai_marks(result_df)
 
+    # ⑨ 【想定単勝オッズ & AI期待値(EV)インテリジェンス】
+    est_odds_list = []
+    ev_list = []
+    ev_grades = []
+    total_horses = len(result_df)
+    for idx, row in result_df.iterrows():
+        pop_val = int(row.get("単勝人気", 5))
+        w_rate = float(row.get("勝率(%)", 10.0))
+        o_val = estimate_single_odds(pop_val, w_rate, total_horses)
+        ev_val = calculate_expected_value(w_rate, o_val)
+        grade_text, grade_icon = get_ev_grade(ev_val)
+        est_odds_list.append(o_val)
+        ev_list.append(ev_val)
+        ev_grades.append(f"{grade_icon} {grade_text}")
+
+    result_df["想定単勝オッズ"] = est_odds_list
+    result_df["期待値(EV)"] = ev_list
+    result_df["期待値ランク"] = ev_grades
+
+    # レース波乱度・勝負度診断
+    volatility = diagnose_race_volatility(result_df, escape_count)
+
     meta = {
         "past_race_matched": False,
         "escape_count": escape_count,
@@ -1432,7 +1739,8 @@ def calculate_predictions(
         "pace_diagnosis": pace_diag,
         "track_desc": track_desc,
         "cond_desc": cond_desc,
-        "learned_horses_count": sum(1 for e in exp_labels if "実績" in e)
+        "learned_horses_count": sum(1 for e in exp_labels if "実績" in e),
+        "volatility": volatility
     }
     return result_df, meta
 
@@ -1501,6 +1809,28 @@ if st.session_state["predicted_results"] is not None:
         )
     elif meta.get("learned_horses_count", 0) > 0:
         st.info(f"🐎 **【個別馬の学習経験値を適用中】** 出走馬のうち {meta['learned_horses_count']} 頭に過去レースの学習実績・実力補正値（AI学習経験値）が加算されています。レースを重ねるごとに精度が自動向上します。")
+
+    # 🎯 最強AIレース波乱度・勝負度診断
+    vol_info = meta.get("volatility", {})
+    if vol_info:
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%); padding: 14px 20px; border-radius: 8px; color: white; margin-bottom: 12px; border-left: 6px solid {vol_info.get('badge_color', '#0d6efd')};">
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+                    <span style="font-size: 16px; font-weight: bold;">
+                        🎯 【最強AIレース診断】 {vol_info.get('level', '')} ｜ 波乱度: {vol_info.get('stars', '★★★☆☆')} ｜ 自信度: <span style="color: #ffeb3b;">{vol_info.get('confidence', '')}</span>
+                    </span>
+                </div>
+                <div style="margin-top: 6px; font-size: 14px; opacity: 0.95;">
+                    {vol_info.get('summary', '')}
+                </div>
+                <div style="margin-top: 6px; font-size: 13px; color: #a5d6a7; font-weight: bold;">
+                    {vol_info.get('bet_strategy', '')}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     # 🤖 AI展開力学シミュレーション診断
     pace_diag_msg = meta.get("pace_diagnosis", "")
@@ -1580,7 +1910,8 @@ if st.session_state["predicted_results"] is not None:
                     st.markdown(
                         f"""
                         <div style="text-align: right; font-size: 13px; color: #555; padding-top: 4px;">
-                            単勝 <b>{rec_info['pop']}位</b> ｜ 勝率 <b>{rec_info['win_rate']}%</b> ｜ 総合スコア <b>{rec_info['score']}</b>
+                            単勝 <b>{rec_info['pop']}位</b> ({rec_info.get('odds', 5.0)}倍) ｜ <b>{rec_info.get('ev_grade', '')}</b><br>
+                            勝率 <b>{rec_info['win_rate']}%</b> ｜ 総合スコア <b>{rec_info['score']}</b>
                         </div>
                         """,
                         unsafe_allow_html=True
@@ -1595,8 +1926,8 @@ if st.session_state["predicted_results"] is not None:
     st.markdown("---")
     st.subheader("📊 全頭の予測着順一覧")
     display_columns = [
-        "AI印", "予想着順", "馬番", "馬名", "単勝人気", "騎手名", "脚質", "AI学習経験値", "距離展開評価", "コース馬場評価",
-        "勝率(%)", "総合スコア", "推定能力指数", "騎手勝率(%)",
+        "AI印", "予想着順", "馬番", "馬名", "単勝人気", "想定単勝オッズ", "期待値ランク", "騎手名", "脚質", "枠順評価", "AI学習経験値", "距離展開評価", "コース馬場評価",
+        "勝率(%)", "期待値(EV)", "総合スコア", "推定能力指数", "騎手勝率(%)",
         "能力スコア", "展開スコア", "騎手スコア", "展開力学", "シナジー"
     ]
     filtered_display = results[[c for c in display_columns if c in results.columns]]
@@ -1605,7 +1936,11 @@ if st.session_state["predicted_results"] is not None:
         filtered_display,
         column_config={
             "AI印": st.column_config.TextColumn("印", help="AI推奨印（◎本命、○対抗、▲単穴、☆特注穴、△連下）"),
+            "想定単勝オッズ": st.column_config.NumberColumn("想定オッズ", format="%.1f倍", help="人気・AI勝率に基づく想定オッズ"),
+            "期待値ランク": st.column_config.TextColumn("AI期待値", help="オッズ妙味（S:激熱、A:プラス、B:適正、C:過剰人気）"),
+            "枠順評価": st.column_config.TextColumn("枠順バイアス"),
             "勝率(%)": st.column_config.ProgressColumn("勝率(%)", format="%.1f%%", min_value=0.0, max_value=100.0),
+            "期待値(EV)": st.column_config.NumberColumn("EV指数", format="%.2f", help="期待値 = 勝率×オッズ"),
             "単勝人気": st.column_config.NumberColumn("人気", format="%d位"),
             "脚質": st.column_config.TextColumn("選択脚質"),
             "AI学習経験値": st.column_config.TextColumn("AI学習経験値 (蓄積メモリー)"),
@@ -1776,6 +2111,207 @@ if st.session_state["predicted_results"] is not None:
                     * **資金配分例**: 各500円
                     """
                 )
+
+    # ==========================================
+    # 💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ
+    # ==========================================
+    st.markdown("---")
+    st.subheader("💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ")
+    st.caption("「何円賭けたら何円返ってくるか？」をリアルタイム計算！どれが当たってもトリガミ（投資金割れ）にならず利益が出るようAIがオッズから最適配分を自動算出します。")
+
+    # 1. プラン・配分モードの選択
+    col_dutch_p, col_dutch_m = st.columns([1.2, 1.2])
+    with col_dutch_p:
+        plan_sel = st.selectbox(
+            "🎯 シミュレーション対象の買い目プラン",
+            options=[
+                "⚖️ プラン1: 馬連 3頭BOX (本線3点)",
+                "🛡️ プラン2: ワイド 3頭BOX (手堅く3点)",
+                "🚀 プラン3: 一撃高配当 (馬連穴流し & 3連複)",
+                "🏆 上位厳選 4点集中買い (馬連1-2, 1-3, 1-4, 2-3)"
+            ],
+            index=0
+        )
+    with col_dutch_m:
+        mode_sel = st.selectbox(
+            "⚙️ 資金配分ポリシー",
+            options=[
+                "🛡️ 均等払戻（トリガミ完全防止・どれが当たっても均等プラス）",
+                "🚀 AI期待値傾斜配分（本線で特大回収・抑えは元返し）",
+                "⚖️ 均等購入（比較用）"
+            ],
+            index=0,
+            help="「均等払戻」を選ぶと、オッズの低い目は厚く、高い目は薄く買い、どの目が当たってもほぼ同じ手取り利益になります。"
+        )
+
+    # 2. 予算入力＆クイックボタン
+    if "bet_budget" not in st.session_state:
+        st.session_state["bet_budget"] = 3000
+
+    col_b_in, col_b_quick = st.columns([1.5, 2.5])
+    with col_b_in:
+        current_budget = st.number_input(
+            "💵 総投資予算 (円)",
+            min_value=300,
+            max_value=100000,
+            value=int(st.session_state["bet_budget"]),
+            step=500,
+            help="賭けたい合計金額を入力してください（100円単位）"
+        )
+        st.session_state["bet_budget"] = current_budget
+
+    with col_b_quick:
+        st.caption("⚡ クイック予算ボタン:")
+        qb_cols = st.columns(5)
+        if qb_cols[0].button("1,000円", use_container_width=True, key="qb_1000"):
+            st.session_state["bet_budget"] = 1000
+            st.rerun()
+        if qb_cols[1].button("2,000円", use_container_width=True, key="qb_2000"):
+            st.session_state["bet_budget"] = 2000
+            st.rerun()
+        if qb_cols[2].button("3,000円", use_container_width=True, key="qb_3000"):
+            st.session_state["bet_budget"] = 3000
+            st.rerun()
+        if qb_cols[3].button("5,000円", use_container_width=True, key="qb_5000"):
+            st.session_state["bet_budget"] = 5000
+            st.rerun()
+        if qb_cols[4].button("10,000円", use_container_width=True, key="qb_10000"):
+            st.session_state["bet_budget"] = 10000
+            st.rerun()
+
+    # 3. 買い目とオッズの準備
+    active_bets = []
+    if len(results) >= 2:
+        h1 = results.iloc[0]
+        h2 = results.iloc[1]
+        h3 = results.iloc[2] if len(results) >= 3 else h2
+        h4 = results.iloc[3] if len(results) >= 4 else h3
+
+        o1 = float(h1.get("想定単勝オッズ", 2.2))
+        o2 = float(h2.get("想定単勝オッズ", 3.8))
+        o3 = float(h3.get("想定単勝オッズ", 5.6))
+        o4 = float(h4.get("想定単勝オッズ", 8.2))
+
+        if "プラン1" in plan_sel:
+            active_bets = [
+                {"name": f"馬連 {h1['馬番']} - {h2['馬番']} ({h1['馬名']}-{h2['馬名']})", "odds": estimate_quinella_odds(o1, o2), "key_id": "p1_1"},
+                {"name": f"馬連 {h1['馬番']} - {h3['馬番']} ({h1['馬名']}-{h3['馬名']})", "odds": estimate_quinella_odds(o1, o3), "key_id": "p1_2"},
+                {"name": f"馬連 {h2['馬番']} - {h3['馬番']} ({h2['馬名']}-{h3['馬名']})", "odds": estimate_quinella_odds(o2, o3), "key_id": "p1_3"},
+            ]
+        elif "プラン2" in plan_sel:
+            active_bets = [
+                {"name": f"ワイド {h1['馬番']} - {h2['馬番']} ({h1['馬名']}-{h2['馬名']})", "odds": estimate_wide_odds(o1, o2), "key_id": "p2_1"},
+                {"name": f"ワイド {h1['馬番']} - {h3['馬番']} ({h1['馬名']}-{h3['馬名']})", "odds": estimate_wide_odds(o1, o3), "key_id": "p2_2"},
+                {"name": f"ワイド {h2['馬番']} - {h3['馬番']} ({h2['馬名']}-{h3['馬名']})", "odds": estimate_wide_odds(o2, o3), "key_id": "p2_3"},
+            ]
+        elif "プラン3" in plan_sel:
+            upset_rows = results[results["特注穴馬"] == True]
+            up_h = None
+            if len(upset_rows) > 0:
+                for _, u_cand in upset_rows.iterrows():
+                    if u_cand["馬番"] != h1["馬番"]:
+                        up_h = u_cand
+                        break
+            if up_h is None:
+                up_h = h3
+            o_up = float(up_h.get("想定単勝オッズ", 12.0))
+
+            trio_nums = sorted([int(h1["馬番"]), int(up_h["馬番"]), int(h2["馬番"])])
+            trio_names = f"{h1['馬名']} - {up_h['馬名']} - {h2['馬名']}"
+
+            active_bets = [
+                {"name": f"馬連 {h1['馬番']} - {up_h['馬番']} ({h1['馬名']}-{up_h['馬名']}) [穴本線]", "odds": estimate_quinella_odds(o1, o_up), "key_id": "p3_1"},
+                {"name": f"3連複 {trio_nums[0]}-{trio_nums[1]}-{trio_nums[2]} ({trio_names}) [高配当]", "odds": estimate_trio_odds(o1, o2, o_up), "key_id": "p3_2"},
+            ]
+        else:
+            active_bets = [
+                {"name": f"馬連 {h1['馬番']} - {h2['馬番']} ({h1['馬名']}-{h2['馬名']})", "odds": estimate_quinella_odds(o1, o2), "key_id": "p4_1"},
+                {"name": f"馬連 {h1['馬番']} - {h3['馬番']} ({h1['馬名']}-{h3['馬名']})", "odds": estimate_quinella_odds(o1, o3), "key_id": "p4_2"},
+                {"name": f"馬連 {h1['馬番']} - {h4['馬番']} ({h1['馬名']}-{h4['馬名']})", "odds": estimate_quinella_odds(o1, o4), "key_id": "p4_3"},
+                {"name": f"馬連 {h2['馬番']} - {h3['馬番']} ({h2['馬名']}-{h3['馬名']})", "odds": estimate_quinella_odds(o2, o3), "key_id": "p4_4"},
+            ]
+
+    # 4. オッズ微調整 expander
+    with st.expander("🔍 **オッズを手動で微調整する（リアルタイムの確定オッズに合わせる）**", expanded=False):
+        st.caption("AIが自動算出した想定オッズが表示されています。競馬場やネット投票のオッズに合わせて数値を直接変更できます。")
+        odds_cols = st.columns(len(active_bets))
+        for idx, b in enumerate(active_bets):
+            with odds_cols[idx]:
+                adj_odds = st.number_input(
+                    f"{b['name'].split(' ')[0]} {b['name'].split(' ')[1]}",
+                    min_value=1.1,
+                    max_value=999.0,
+                    value=float(b["odds"]),
+                    step=0.1,
+                    key=f"adj_odds_{b.get('key_id', idx)}"
+                )
+                b["odds"] = adj_odds
+
+    # 5. 資金配分計算
+    dutch_res = calculate_dutching_allocation(active_bets, budget=st.session_state["bet_budget"], mode=mode_sel)
+
+    # 6. サマリーメトリック
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.metric(
+            "🎯 合計投資金額",
+            f"{dutch_res['actual_total']:,}円",
+            delta=f"{len(dutch_res['items'])}点 買い"
+        )
+    with col_m2:
+        st.metric(
+            "💵 的中時想定払戻",
+            f"{dutch_res['min_return']:,}円 〜 {dutch_res['max_return']:,}円",
+            delta=f"合成オッズ {dutch_res['composite_odds']}倍"
+        )
+    with col_m3:
+        st.metric(
+            "📈 的中時回収率",
+            f"{dutch_res['min_roi']:.1f}% 〜 {dutch_res['max_roi']:.1f}%",
+            delta=f"利益 +{dutch_res['min_return'] - dutch_res['actual_total']:,}円〜"
+        )
+    with col_m4:
+        if dutch_res["all_profitable"]:
+            st.metric(
+                "🛡️ トリガミ判定",
+                "✅ 完全防止！",
+                delta="どの目が当たっても黒字",
+                delta_color="normal"
+            )
+        else:
+            st.metric(
+                "🛡️ トリガミ判定",
+                "⚠️ トリガミ危険あり",
+                delta="一部の目で投資割れ",
+                delta_color="inverse"
+            )
+
+    # 7. 計算結果テーブル
+    table_data = []
+    for item in dutch_res["items"]:
+        table_data.append({
+            "買い目": item["name"],
+            "オッズ": f"{item['odds']:.1f}倍",
+            "推奨購入金額": f"{item['amount']:,}円",
+            "的中時払戻金": f"{item['return']:,}円",
+            "純利益": f"{item['profit']:+,}円",
+            "回収率": f"{item['roi']:.1f}%",
+            "トリガミ判定": "⚠️ トリガミ損" if item["is_torigami"] else "✅ 利益確定"
+        })
+
+    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+    # 8. AIアドバイス
+    if dutch_res["all_profitable"]:
+        st.success(
+            f"🎉 **【トリガミ回避成功！】** 上記の推奨購入金額通りに購入すれば、**どの買い目が当たっても絶対にマイナスになりません！**\n\n"
+            f"🎯 **最低払戻**: **{dutch_res['min_return']:,}円**（純利益 **+{dutch_res['min_return'] - dutch_res['actual_total']:,}円** / 回収率 **{dutch_res['min_roi']:.1f}%**）が手元に戻ります。"
+        )
+    else:
+        st.warning(
+            f"⚠️ **【トリガミ警告】** 一部の買い目で的中払戻が投資額（{dutch_res['actual_total']:,}円）を下回っています。\n\n"
+            f"💡 **解決策**: 資金配分ポリシーを「🛡️ 均等払戻（トリガミ完全防止）」に設定するか、総予算を増額、またはオッズの低すぎる買い目を削ることを推奨します。"
+        )
 
     # ==========================================
     # 7. 実際の結果入力 & 答え合わせ & AI自己学習
