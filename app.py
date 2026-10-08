@@ -1433,25 +1433,57 @@ if st.session_state["predicted_results"] is not None:
         with col_bet3:
             st.markdown("#### 🚀 ③【高配当・一撃狙い】")
             upset_rows = results[results["特注穴馬"] == True]
-            if len(upset_rows) > 0 and h3 is not None:
-                up_horse = upset_rows.iloc[0]
-                st.markdown(
-                    f"""
-                    **推奨馬券: 馬連 穴流し ＆ 3連複**
-                    * 🎯 **本命**: **{h1['馬番']}番** ({h1['馬名']})
-                    * 🔥 **激走穴馬**: **{up_horse['馬番']}番** ({up_horse['馬名']})
-                    * **買い目**: 
-                      - 馬連 **{h1['馬番']} - {up_horse['馬番']}** (高配当直撃)
-                      - 3連複 **{h1['馬番']} - {h2['馬番']} - {up_horse['馬番']}**
-                    
-                    ---
-                    * **推奨度**: ⭐⭐⭐☆☆
-                    * **狙い**: AIが検知した激走穴馬が絡んだ時の跳ね配当（万馬券級）を一本釣り。
-                    * **資金配分例 (1,000円)**:
-                      - 馬連 {h1['馬番']}-{up_horse['馬番']}: 500円
-                      - 3連複 {h1['馬番']}-{h2['馬番']}-{up_horse['馬番']}: 500円
-                    """
-                )
+            # 穴馬が存在し、かつ本命(h1)とは異なる馬番の穴馬を取得
+            up_horse = None
+            if len(upset_rows) > 0:
+                for _, u_cand in upset_rows.iterrows():
+                    if u_cand["馬番"] != h1["馬番"]:
+                        up_horse = u_cand
+                        break
+
+            if up_horse is not None and h3 is not None:
+                # 3連複の3頭目を選定（h1およびup_horseと重複しない上位馬）
+                third_horse = None
+                for _, r_cand in results.iterrows():
+                    if r_cand["馬番"] != h1["馬番"] and r_cand["馬番"] != up_horse["馬番"]:
+                        third_horse = r_cand
+                        break
+
+                if third_horse is not None:
+                    # 馬番順に昇順ソートして重複のない美しい買い目を生成
+                    sanrenpuku_nums = sorted([int(h1["馬番"]), int(up_horse["馬番"]), int(third_horse["馬番"])])
+                    sanrenpuku_str = f"**{sanrenpuku_nums[0]} - {sanrenpuku_nums[1]} - {sanrenpuku_nums[2]}**"
+                    umaren_nums = sorted([int(h1["馬番"]), int(up_horse["馬番"])])
+                    umaren_str = f"**{umaren_nums[0]} - {umaren_nums[1]}**"
+
+                    st.markdown(
+                        f"""
+                        **推奨馬券: 馬連 穴流し ＆ 3連複**
+                        * 🎯 **本命**: **{h1['馬番']}番** ({h1['馬名']})
+                        * 🔥 **激走穴馬**: **{up_horse['馬番']}番** ({up_horse['馬名']})
+                        * 🤝 **相手**: **{third_horse['馬番']}番** ({third_horse['馬名']})
+                        * **買い目**: 
+                          - 馬連 {umaren_str} (高配当直撃)
+                          - 3連複 {sanrenpuku_str} (穴馬絡み万馬券狙い)
+                        
+                        ---
+                        * **推奨度**: ⭐⭐⭐☆☆
+                        * **狙い**: AIが検知した激走穴馬が絡んだ時の跳ね配当（万馬券級）を一本釣り。
+                        * **資金配分例 (1,000円)**:
+                          - 馬連 {umaren_str}: 500円
+                          - 3連複 {sanrenpuku_str}: 500円
+                        """
+                    )
+                else:
+                    st.markdown(
+                        f"""
+                        **推奨馬券: 馬連 穴流し**
+                        * 🎯 **本命**: **{h1['馬番']}番** ({h1['馬名']})
+                        * 🔥 **激走穴馬**: **{up_horse['馬番']}番** ({up_horse['馬名']})
+                        * **買い目**: 馬連 **{h1['馬番']} - {up_horse['馬番']}**
+                        * **資金配分例**: 1,000円 (1点勝負)
+                        """
+                    )
             elif h3 is not None and h4 is not None:
                 st.markdown(
                     f"""
