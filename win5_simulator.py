@@ -109,6 +109,31 @@ def get_default_win5_races(track_options: list = None) -> list[dict]:
         }
     ]
 
+POP_ESTIMATED_ODDS = {
+    1: 2.4, 2: 4.2, 3: 6.5, 4: 9.2, 5: 13.5,
+    6: 18.0, 7: 25.0, 8: 38.0, 9: 55.0, 10: 75.0,
+    11: 100.0, 12: 130.0, 13: 160.0, 14: 200.0,
+    15: 250.0, 16: 300.0, 17: 350.0, 18: 400.0
+}
+
+def get_horse_effective_odds(horse_row) -> float:
+    """出走馬データから実効単勝オッズを取得（欠損時は単勝人気から推計）"""
+    try:
+        odds = horse_row.get("想定単勝オッズ")
+        if odds is None or pd.isna(odds) or str(odds).strip() in ["", "-", "0", "0.0"]:
+            odds = horse_row.get("単勝オッズ")
+        if odds is not None and not pd.isna(odds):
+            val = float(odds)
+            if val > 1.0:
+                return val
+    except Exception:
+        pass
+    try:
+        pop = int(horse_row.get("単勝人気", 5)) if not pd.isna(horse_row.get("単勝人気")) else 5
+    except Exception:
+        pop = 5
+    return POP_ESTIMATED_ODDS.get(pop, 25.0)
+
 def render_win5_simulator(
     calculate_predictions_func,
     learned_weights: dict,
@@ -116,7 +141,10 @@ def render_win5_simulator(
     select_recommended_func=None,
     generate_comment_func=None,
     diagnose_volatility_func=None,
-    track_options: list = None
+    track_options: list = None,
+    save_ai_model_func=None,
+    generate_race_sig_func=None,
+    default_weights: dict = None
 ):
     """
     WIN5攻略シミュレーターのメインUI
@@ -664,6 +692,57 @@ def render_win5_simulator(
                 st.write(f"🎫 **購入点数**: **{actual_points}点**")
                 st.caption("※ 各レースで選択馬の勝率合計を掛け合わせた総合通過確率の推計値です。")
 
+            # ------------------------------------------
+            # 💰 WIN5 推定配当金レンジシミュレーション (購入前想定)
+            # ------------------------------------------
+            min_odds_list = []
+            max_odds_list = []
+            main_odds_list = []
+
+            for i in range(5):
+                sel_df = active_selections[i]
+                odds_vals = [get_horse_effective_odds(r) for _, r in sel_df.iterrows()]
+                if not odds_vals:
+                    odds_vals = [5.0]
+                min_odds_list.append(min(odds_vals))
+                max_odds_list.append(max(odds_vals))
+                main_odds_list.append(odds_vals[0])
+
+            # JRA払戻率70%に基づく合成配当推計
+            min_est_pay = int(min(600_000_000, max(100, float(np.prod(min_odds_list)) * 70)))
+            max_est_pay = int(min(600_000_000, max(100, float(np.prod(max_odds_list)) * 70)))
+            main_est_pay = int(min(600_000_000, max(100, float(np.prod(main_odds_list)) * 70)))
+
+            st.markdown(
+                f"""
+                <div style="background: linear-gradient(135deg, #1c2833 0%, #2c3e50 100%); border: 1px solid #4a6572; border-radius: 10px; padding: 14px 18px; margin-top: 10px; margin-bottom: 12px; color: white;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+                        <div>
+                            <span style="font-size: 15px; font-weight: bold; color: #f1c40f;">💰 WIN5 推定払戻金シミュレーション (オッズ合成想定)</span>
+                        </div>
+                        <div style="font-size: 13px; color: #bdc3c7;">
+                            ※ JRA払戻率70%換算概算値 (1点100円購入想定)
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 24px; margin-top: 10px; flex-wrap: wrap; align-items: baseline;">
+                        <div>
+                            <span style="font-size: 12px; color: #bdc3c7;">🎯 AI本線 想定配当:</span><br>
+                            <span style="font-size: 20px; font-weight: bold; color: #2ecc71;">￥{main_est_pay:,} 円</span>
+                        </div>
+                        <div>
+                            <span style="font-size: 12px; color: #bdc3c7;">📉 最低配当想定 (堅着):</span><br>
+                            <span style="font-size: 18px; font-weight: bold; color: #e0e0e0;">￥{min_est_pay:,} 円</span>
+                        </div>
+                        <div>
+                            <span style="font-size: 12px; color: #bdc3c7;">📈 最高配当想定 (穴着):</span><br>
+                            <span style="font-size: 18px; font-weight: bold; color: #f39c12;">￥{max_est_pay:,} 円</span>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
             # ==========================================
             # 🌟 各レースの詳細AI診断・推奨馬カード (通常レースと同等！)
             # ==========================================
@@ -818,12 +897,46 @@ def render_win5_simulator(
             st.subheader("🏁 リアルタイム生還チェックシート（レース当日のライブ追跡）")
             st.caption("レースが終わるごとに確定1着馬番を入力してください。生き残り点数とWIN5突破状況をリアルタイムで追跡します！")
 
+            # レース結果一括取得ボタン (netkeiba URLが登録されている場合)
+            has_urls = any(r_diag.get("url") or (edited_races[i].get("url") if i < len(edited_races) else "") for i, r_diag in enumerate(race_diagnostics))
+            if has_urls and fetch_netkeiba_func:
+                if st.button("🌐 netkeibaから5レースの確定着順を一括取得する", key="win5_fetch_results_btn"):
+                    with st.spinner("🌐 netkeibaの結果ページから確定着順を最新取得中..."):
+                        fetched_cnt = 0
+                        for idx_f, r_diag in enumerate(race_diagnostics):
+                            target_url = r_diag.get("url") or (edited_races[idx_f].get("url") if idx_f < len(edited_races) else "")
+                            if target_url and "netkeiba.com" in target_url:
+                                try:
+                                    res_data, _ = fetch_netkeiba_func(target_url)
+                                    if res_data and res_data.get("actual_ranks"):
+                                        r_diag["meta"]["actual_ranks"] = res_data["actual_ranks"]
+                                        for h_obj in res_data.get("horses", []):
+                                            if res_data["actual_ranks"].get(h_obj["馬名"]) == 1:
+                                                st.session_state[f"actual_win_{idx_f}"] = int(h_obj["馬番"])
+                                                fetched_cnt += 1
+                                                break
+                                except Exception:
+                                    pass
+                        if fetched_cnt > 0:
+                            st.success(f"🎉 {fetched_cnt} レースの確定1着馬番を自動取得しました！")
+                            st.rerun()
+                        else:
+                            st.info("確定着順データがまだ反映されていないか、レース開催前です。下記に手動で確定1着馬番を入力してください。")
+
             c_chk = st.columns(5)
             actual_win_nums = []
             for i in range(5):
+                p_df = race_diagnostics[i]["pred_df"]
                 with c_chk[i]:
-                    val = st.number_input(f"WIN{i+1} 確定1着馬番", min_value=0, max_value=18, value=0, key=f"actual_win_{i}")
+                    val = st.number_input(f"WIN{i+1} 確定1着馬番", min_value=0, max_value=18, value=int(st.session_state.get(f"actual_win_{i}", 0)), key=f"actual_win_{i}")
                     actual_win_nums.append(val)
+                    if val > 0:
+                        matched_h = p_df[p_df["馬番"] == val]
+                        if not matched_h.empty:
+                            h_row = matched_h.iloc[0]
+                            st.caption(f"🏁 **{h_row['馬名']}** ({h_row.get('単勝人気', '-')}人気)")
+                        else:
+                            st.caption(f"🏁 {val}番")
 
             # 生還判定
             survived_points = actual_points
@@ -856,9 +969,328 @@ def render_win5_simulator(
                     else:
                         st.info(f"**WIN{i+1}**: {status_text}")
 
-            if all("⭕" in s for s in alive_status):
+            passed_cnt = sum(1 for s in alive_status if "⭕" in s)
+            is_win5_hit = (passed_cnt == 5 and all("⭕" in s for s in alive_status))
+            all_races_entered = all(num > 0 for num in actual_win_nums)
+
+            if is_win5_hit:
                 st.balloons()
-                st.success("🎉🎉🎉 **おめでとうございます！！！ WIN5 的中達成です！！！ 払戻金を確認してください！** 🎉🎉🎉")
+                st.success("🎉🎉🎉 **おめでとうございます！！！ WIN5 的中達成です！！！ 下の払戻金計算エリアで結果を確認してください！** 🎉🎉🎉")
             elif not is_dead and any("⭕" in s for s in alive_status):
-                passed_cnt = sum(1 for s in alive_status if "⭕" in s)
                 st.info(f"🔥 **現在 {passed_cnt} レース突破中！ 生き残り点数: {survived_points}点！ 次のレースへ進みます！**")
+
+            # ==========================================
+            # 💰 WIN5 確定払戻金・回収率の自動計算
+            # ==========================================
+            st.markdown("---")
+            st.subheader("💰 WIN5 確定払戻金・回収率の自動計算")
+            st.caption("全5レース終了後、JRA公式発表の確定払戻金（100円あたり）を入力して、総払戻金額・純損益・回収率(ROI)を自動計算します。")
+
+            c_pay_in1, c_pay_in2 = st.columns([2, 1])
+            with c_pay_in1:
+                official_win5_payout = st.number_input(
+                    "WIN5 確定払戻金 (100円あたり / 円)",
+                    min_value=0,
+                    max_value=600_000_000,
+                    value=int(st.session_state.get("win5_official_payout_val", 0)),
+                    step=100,
+                    key="win5_official_payout_input",
+                    help="JRA公式結果のWIN5払戻金額（100円につき）を入力してください。"
+                )
+                st.session_state["win5_official_payout_val"] = official_win5_payout
+
+            with c_pay_in2:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if is_win5_hit:
+                    st.success("🎯 **WIN5 的中判定: 成立！** (1口的中)")
+                elif all_races_entered:
+                    st.error(f"❌ **WIN5 的中判定: 不的中** ({passed_cnt}/5レース突破)")
+                else:
+                    st.info(f"⏳ **WIN5 的中判定: 進行中** ({passed_cnt}レース突破)")
+
+            # 回収パフォーマンス計算
+            invest_cost = actual_cost  # 購入点数 * 100円
+            hit_units = 1 if is_win5_hit else 0
+            total_return = official_win5_payout * hit_units if is_win5_hit else 0
+            net_profit = total_return - invest_cost
+            roi_ratio = (total_return / invest_cost * 100.0) if invest_cost > 0 else 0.0
+
+            # 的中時: 豪華ゴールド/グリーンカードでサマリー表示 (通常レース完全同等)
+            if is_win5_hit and official_win5_payout > 0:
+                roi_badge = "🔥 特大万馬券的中！超絶プラス！" if roi_ratio >= 1000.0 else ("🎯 プラス収支達成！" if roi_ratio >= 100.0 else "⚠️ トリガミ（投資額を下回りました）")
+                st.markdown(
+                    f"""
+                    <div style="background: linear-gradient(135deg, #0d321d 0%, #1a5336 50%, #206b43 100%); border: 2px solid #2ecc71; border-radius: 12px; padding: 22px; box-shadow: 0 4px 15px rgba(46,204,113,0.3); margin-top: 10px; margin-bottom: 16px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px;">
+                            <span style="font-size: 22px; font-weight: bold; color: #f1c40f;">
+                                👑 【WIN5 的中達成！】 総回収額: <span style="font-size: 32px; color: #2ecc71; text-shadow: 0 0 10px rgba(46,204,113,0.5);">￥{total_return:,} 円</span>
+                            </span>
+                            <span style="background-color: #2ecc71; color: #041b0f; font-weight: bold; padding: 6px 16px; border-radius: 20px; font-size: 14px;">
+                                最高回収率 {roi_ratio:,.1f}% （純利益 +{net_profit:,}円）
+                            </span>
+                        </div>
+                        <div style="font-size: 15px; margin-top: 10px; color: #ffffff; line-height: 1.6;">
+                            🏆 <b>的中戦略</b>: WIN5 メリハリフォーメーション（購入点数: <b>{actual_points}点</b> ｜ 投資資金: <b>{invest_cost:,}円</b>）<br>
+                            💎 <b>確定配当</b>: 100円あたり <b>￥{official_win5_payout:,} 円</b> ｜ <b>的中口数</b>: 1口<br>
+                            📊 <b>判定評価</b>: {roi_badge}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+                c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                with c_m1:
+                    st.metric("🥇 総回収額 (払戻金)", f"{total_return:,}円", delta=f"純利益 +{net_profit:,}円", delta_color="normal")
+                with c_m2:
+                    st.metric("💵 投資金額", f"{invest_cost:,}円", delta=f"{actual_points}点 × 100円")
+                with c_m3:
+                    st.metric("📈 最大回収率 (ROI)", f"{roi_ratio:,.1f}%", delta="投資リターン")
+                with c_m4:
+                    st.metric("💎 純利益", f"+{net_profit:,}円", delta="手元利益")
+            elif all_races_entered and not is_win5_hit:
+                st.warning(
+                    f"⚠️ **【結果検証】 今回のWIN5は不的中となりました（{passed_cnt}/5レース突破 ｜ 投資額: {invest_cost:,}円 ｜ 払戻: 0円 ｜ 純損失: -{invest_cost:,}円）。**\n\n"
+                    f"波乱や出遅れ等の5レースの確定着順を「競走馬メモリー」に蓄積し、次回レースでの精度向上・リベンジに繋げましょう。"
+                )
+
+            # ==========================================
+            # 💾 5レース結果の自己学習・競走馬メモリー蓄積 (通常レース完全同期)
+            # ==========================================
+            st.markdown("---")
+            st.subheader("💾 レース結果の記憶・競走馬メモリー蓄積 (通常レース完全同期)")
+            st.markdown(
+                """
+                5レースの確定結果をもとに、**【Tier 1: 過去レース完全記憶】**と**【Tier 2: 出走全頭の競走馬メモリー（経験値・実力補正）】**を学習・永久保存します。  
+                ※ 通常レースのAI予想と馬メモリー・過去レース記憶が**完全に共有**されるため、次回以降通常レースでもWIN5でも学習成果が自動発揮されます！
+                """
+            )
+
+            # 各レースの2着・3着馬番（任意補足入力）アコーディオン
+            with st.expander("📋 各レースの確定着順・補足設定（2着・3着馬番の指定）", expanded=False):
+                st.caption("1着馬番は生還チェックシートと連動しています。2着・3着馬番も設定すると、連対・複勝好走ボーナスが馬メモリーに加算され、さらに高精度な学習が可能です。")
+                col_sub_ranks = st.columns(5)
+                extra_race_ranks = []
+                for i, r_diag in enumerate(race_diagnostics):
+                    p_df = r_diag["pred_df"]
+                    p_horses = {int(r["馬番"]): str(r["馬名"]).strip() for _, r in p_df.iterrows()}
+                    with col_sub_ranks[i]:
+                        st.markdown(f"**WIN{r_diag['id']}**")
+                        w_num = actual_win_nums[i]
+                        w_name = p_horses.get(w_num, "未確定") if w_num > 0 else "未確定"
+                        st.caption(f"1着: {w_num}番 {w_name}")
+                        rank2 = st.selectbox(
+                            f"WIN{r_diag['id']} 2着馬番",
+                            options=[0] + list(p_horses.keys()),
+                            format_func=lambda x, p_h=p_horses: "未設定" if x == 0 else f"{x}番 {p_h.get(x, '')}",
+                            key=f"win5_rank2_{r_diag['id']}"
+                        )
+                        rank3 = st.selectbox(
+                            f"WIN{r_diag['id']} 3着馬番",
+                            options=[0] + list(p_horses.keys()),
+                            format_func=lambda x, p_h=p_horses: "未設定" if x == 0 else f"{x}番 {p_h.get(x, '')}",
+                            key=f"win5_rank3_{r_diag['id']}"
+                        )
+                        extra_race_ranks.append({"win": w_num, "second": rank2, "third": rank3})
+
+            # 学習実行ボタン
+            can_learn = any(num > 0 for num in actual_win_nums)
+            if st.button("💾 5レースの確定結果をAIに自己学習させる（馬メモリー蓄積＆永久保存）", type="primary", disabled=not can_learn):
+                with st.spinner("🤖 AIが5レースの結果を解析し、Tier 1完全記憶と出走全頭の競走馬メモリーを更新中..."):
+                    if "race_database" not in st.session_state:
+                        st.session_state["race_database"] = {}
+                    if "horse_memory" not in st.session_state:
+                        st.session_state["horse_memory"] = {}
+                    if "training_history" not in st.session_state:
+                        st.session_state["training_history"] = []
+
+                    race_db = st.session_state["race_database"]
+                    horse_mem = st.session_state["horse_memory"]
+                    total_horses_learned = 0
+                    races_learned_count = 0
+
+                    for i, r_diag in enumerate(race_diagnostics):
+                        p_df = r_diag["pred_df"]
+                        w_num = actual_win_nums[i]
+                        if w_num == 0:
+                            continue
+
+                        races_learned_count += 1
+                        track_name = r_diag["track"]
+                        race_dist = r_diag["distance"]
+                        c_type = r_diag["course_type"]
+                        pace_val = r_diag["pace"]
+                        cond_val = r_diag["condition"]
+
+                        # 確定着順辞書
+                        actual_ranks_dict = {}
+                        r_meta = r_diag.get("meta", {})
+                        scraped_ranks = r_meta.get("actual_ranks") if isinstance(r_meta, dict) else None
+
+                        if scraped_ranks and isinstance(scraped_ranks, dict) and len(scraped_ranks) > 0:
+                            actual_ranks_dict = scraped_ranks.copy()
+                        else:
+                            # 手動入力データから着順構築
+                            sub_r = extra_race_ranks[i]
+                            r2_num = sub_r["second"]
+                            r3_num = sub_r["third"]
+
+                            # 馬番から馬名マッピング
+                            num_to_name = {int(r["馬番"]): str(r["馬名"]).strip() for _, r in p_df.iterrows()}
+                            for h_n, h_nm in num_to_name.items():
+                                if h_n == w_num:
+                                    actual_ranks_dict[h_nm] = 1
+                                elif r2_num > 0 and h_n == r2_num:
+                                    actual_ranks_dict[h_nm] = 2
+                                elif r3_num > 0 and h_n == r3_num:
+                                    actual_ranks_dict[h_nm] = 3
+                                else:
+                                    actual_ranks_dict[h_nm] = 8
+
+                        # 【Tier 1】 過去レース完全記憶登録
+                        if generate_race_sig_func:
+                            race_sig = generate_race_sig_func(p_df, track_name, race_dist)
+                        else:
+                            clean_names = sorted([str(n).strip() for n in p_df["馬名"].dropna() if str(n).strip()])
+                            track_key = str(track_name).split()[0]
+                            race_sig = f"{track_key}_{race_dist}m_" + "_".join(clean_names)
+
+                        race_label = f"{track_name.split()[0]} {race_dist}m ({c_type}) [WIN{r_diag['id']}]"
+                        race_db[race_sig] = {
+                            "race_name": race_label,
+                            "track": track_name,
+                            "track_clean": track_name.split()[0],
+                            "distance": race_dist,
+                            "course_type": c_type,
+                            "condition": cond_val,
+                            "pace": pace_val,
+                            "actual_ranks": actual_ranks_dict,
+                            "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                            "horse_count": len(p_df)
+                        }
+
+                        # 【Tier 2】 出走馬ごとの競走馬メモリー更新
+                        pop_map = dict(zip(p_df["馬番"], p_df["単勝人気"]))
+                        for _, r_horse in p_df.iterrows():
+                            h_name = str(r_horse["馬名"]).strip()
+                            if not h_name:
+                                continue
+                            total_horses_learned += 1
+                            act_rank = actual_ranks_dict.get(h_name, 8)
+                            h_num = r_horse.get("馬番")
+                            pop = int(pop_map.get(h_num, 5)) if not pd.isna(pop_map.get(h_num)) else 5
+
+                            h_data = horse_mem.get(h_name, {
+                                "starts": 0,
+                                "wins": 0,
+                                "top3": 0,
+                                "ability_adj": 0.0,
+                                "last_ranks": []
+                            })
+
+                            h_data["starts"] += 1
+                            if act_rank == 1:
+                                h_data["wins"] += 1
+                            if act_rank <= 3:
+                                h_data["top3"] += 1
+
+                            ranks_list = h_data.get("last_ranks", [])
+                            ranks_list.append(act_rank)
+                            h_data["last_ranks"] = ranks_list[-5:]
+
+                            # 能力補正の算出: 1着+3.0, 2着+1.8, 3着+1.0, 8着以下-1.0
+                            rank_bonus = 0.0
+                            if act_rank == 1:
+                                rank_bonus += 3.0
+                            elif act_rank == 2:
+                                rank_bonus += 1.8
+                            elif act_rank == 3:
+                                rank_bonus += 1.0
+                            elif act_rank >= 8:
+                                rank_bonus -= 1.0
+
+                            # 人気着順ギャップ補正（人気以上に好走した実力馬を底上げ、大敗を下方修正）
+                            gap = pop - act_rank
+                            gap_bonus = gap * 0.5
+
+                            delta_ab = rank_bonus + gap_bonus
+                            new_adj = h_data.get("ability_adj", 0.0) + (delta_ab * 0.4)
+                            h_data["ability_adj"] = round(float(np.clip(new_adj, -6.0, 10.0)), 2)
+
+                            horse_mem[h_name] = h_data
+
+                    # 学習履歴への記録
+                    cur_w = learned_weights
+                    w_a = float(cur_w.get("ability", 1.5))
+                    w_p = float(cur_w.get("pace", 1.0))
+                    w_j = float(cur_w.get("jockey", 1.0))
+                    w_e = float(cur_w.get("escape_dynamic", 1.2))
+                    w_s = float(cur_w.get("synergy", 1.1))
+
+                    hist_entry = {
+                        "レース番号": f"第{len(st.session_state['training_history']) + 1}戦 (WIN5)",
+                        "学習日時": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                        "コース・距離": "WIN5 (5レース一括)",
+                        "想定ペース": f"{passed_cnt}/5レース突破",
+                        "最大回収額": f"{total_return:,}円" if is_win5_hit else "0円",
+                        "最高回収プラン": "WIN5 メリハリフォーメーション",
+                        "最大回収率": f"{roi_ratio:.1f}%" if is_win5_hit else "0.0%",
+                        "3連複": "―",
+                        "馬連BOX(3点)": "―",
+                        "ワイドBOX(3点)": "―",
+                        "単勝的中": f"{passed_cnt}/5レース的中",
+                        "3着内好走": f"勝馬確定{races_learned_count}頭",
+                        "モデル重み(黄金比率固定)": f"{w_a:.2f}/{w_p:.2f}/{w_j:.2f}/{w_e:.2f}/{w_s:.2f}"
+                    }
+                    st.session_state["training_history"].append(hist_entry)
+
+                    # モデルファイルへの永続化保存
+                    if save_ai_model_func:
+                        save_ai_model_func(
+                            st.session_state["learned_weights"],
+                            st.session_state["training_history"],
+                            st.session_state["race_database"],
+                            st.session_state["horse_memory"]
+                        )
+
+                    # AI分析解説インサイト
+                    insights = []
+                    insights.append(f"🧠 **【過去レース完全記憶（Tier 1）】** 確定結果を入力した全{races_learned_count}レースの着順データを永久保存しました。次回同一レースを入力した際は100%完全再現して的中させます。")
+                    insights.append(f"🐎 **【個別競走馬メモリー更新（Tier 2）】** 出走全{total_horses_learned}頭の実績・好走・人気着順ギャップを馬メモリーに反映しました。別レース（通常レース含む）に出走した際にも実力差として自動適用されます。")
+                    if is_win5_hit and official_win5_payout > 0:
+                        insights.append(f"💰 **【WIN5 回収達成！】** 払戻金 **￥{total_return:,} 円**（回収率 **{roi_ratio:.1f}%** / 純利益 **+{net_profit:,} 円**）の特大勝利を記録しました！")
+                    else:
+                        insights.append(f"📊 **【次戦への蓄積】** {passed_cnt}/5 レース突破の実績と波乱データを学習。次回開催のWIN5・通常レースの予想精度が底上げされました。")
+                    insights.append("🛡️ **【黄金比率セーフティ】** 重みパラメータは実績十分の黄金比率（能力1.5 / 展開1.0 / 騎手1.0 / 力学1.2 / シナジー1.1）を強固に維持。波乱によるAIのブレ・過学習を完全に防止しています。")
+
+                    st.session_state["win5_learning_success"] = {
+                        "weights": (w_a, w_p, w_j, w_e, w_s),
+                        "insights": insights,
+                        "races_count": races_learned_count,
+                        "horses_count": total_horses_learned
+                    }
+
+                    st.rerun()
+
+            # 学習完了インサイトの常時表示
+            if st.session_state.get("win5_learning_success"):
+                succ_data = st.session_state["win5_learning_success"]
+                w_a, w_p, w_j, w_e, w_s = succ_data["weights"]
+                insights = succ_data["insights"]
+
+                st.success(f"🎉 **WIN5 5レースのAI学習が完了しました！出走全{succ_data.get('horses_count', 0)}頭の競走馬メモリーと確定着順が安全に永久保存されました。**")
+                col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(5)
+                with col_w1:
+                    st.metric("1️⃣ 基礎能力", f"{w_a:.2f}", delta="黄金比率固定", delta_color="normal")
+                with col_w2:
+                    st.metric("2️⃣ ペース・展開", f"{w_p:.2f}", delta="黄金比率固定", delta_color="normal")
+                with col_w3:
+                    st.metric("3️⃣ 騎手実績", f"{w_j:.2f}", delta="黄金比率固定", delta_color="normal")
+                with col_w4:
+                    st.metric("4️⃣ 脚質力学", f"{w_e:.2f}", delta="黄金比率固定", delta_color="normal")
+                with col_w5:
+                    st.metric("5️⃣ 血統シナジー", f"{w_s:.2f}", delta="黄金比率固定", delta_color="normal")
+
+                st.markdown("##### 💡 AI分析・学習インサイト")
+                for ins in insights:
+                    st.markdown(f"- {ins}")

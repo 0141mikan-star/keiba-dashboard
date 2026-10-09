@@ -3297,7 +3297,10 @@ if app_mode == "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)":
         select_recommended_func=select_recommended_horses,
         generate_comment_func=generate_horse_recommendation_comment,
         diagnose_volatility_func=diagnose_race_volatility,
-        track_options=track_options
+        track_options=track_options,
+        save_ai_model_func=save_ai_model,
+        generate_race_sig_func=generate_race_signature,
+        default_weights=DEFAULT_WEIGHTS
     )
     st.stop()
 
