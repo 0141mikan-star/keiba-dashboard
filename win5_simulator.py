@@ -196,6 +196,10 @@ def render_win5_simulator(
             base_points = 36
             st.info("💡 **カスタム配分**\nAI診断後、各レースの選択頭数や対象馬を自由に微調整できます。")
 
+    # データ更新バージョンカウンタ（外部取得・サンプルロード時にキーを一新して確実にUI反映させる）
+    if "win5_data_version" not in st.session_state:
+        st.session_state["win5_data_version"] = 0
+
     # ==========================================
     # 🌐 出馬表＆レースデータ入力エリア
     # ==========================================
@@ -212,9 +216,11 @@ def render_win5_simulator(
         for i in range(5):
             curr_r = st.session_state["win5_races_data"][i]
             with url_cols[i]:
+                # セッションステートにある入力値を優先保持
+                default_u = st.session_state.get(f"win5_batch_url_{i}", curr_r.get("url", ""))
                 u_val = st.text_input(
                     f"WIN{i+1} URL",
-                    value=curr_r.get("url", ""),
+                    value=default_u,
                     placeholder="...race_id=...",
                     key=f"win5_batch_url_{i}"
                 )
@@ -230,53 +236,70 @@ def render_win5_simulator(
             st.session_state["win5_races_data"] = get_default_win5_races(track_options)
             st.session_state["win5_has_run"] = False
             st.session_state["win5_custom_selections"] = {}
+            st.session_state["win5_data_version"] += 1
             st.success("🎉 サンプル5レース（中山/中京/東京）を正常にセットしました！")
             st.rerun()
 
-        if btn_fetch_all and fetch_netkeiba_func:
-            valid_urls = [u.strip() for u in batch_urls if u.strip()]
-            if not valid_urls:
-                st.warning("⚠️ 少なくとも1つ以上のnetkeibaレースURLを入力してください。")
+        if btn_fetch_all:
+            if not fetch_netkeiba_func:
+                st.error("⚠️ URL解析機能が接続されていません。")
             else:
-                success_count = 0
-                with st.spinner("🌐 netkeibaから5レースの出走馬・オッズ・本物過去走データを取得中..."):
-                    for idx, u in enumerate(batch_urls):
-                        if not u.strip():
-                            continue
-                        res_data, err = fetch_netkeiba_func(u.strip())
-                        if err:
-                            st.error(f"WIN{idx+1}の取得エラー: {err}")
-                        else:
-                            success_count += 1
-                            # 競馬場のマッチング
-                            detected_t = res_data["track_name"]
-                            matched_track = next((t for t in track_options if detected_t in t), track_options[0])
+                # 入力されたURLを取得
+                urls_to_fetch = []
+                for i in range(5):
+                    raw_u = st.session_state.get(f"win5_batch_url_{i}", "") or batch_urls[i]
+                    urls_to_fetch.append(raw_u.strip())
 
-                            horses_df = pd.DataFrame(res_data["horses"])
-                            # 必須カラムの補完
-                            if "想定単勝オッズ" not in horses_df.columns:
-                                horses_df["想定単勝オッズ"] = 10.0
-                            if "斤量" not in horses_df.columns:
-                                horses_df["斤量"] = 56.0
+                valid_indices = [(i, u) for i, u in enumerate(urls_to_fetch) if u]
+                if not valid_indices:
+                    st.warning("⚠️ 少なくとも1つ以上のnetkeibaレースURLを入力してください。")
+                else:
+                    success_count = 0
+                    fetched_details = []
+                    error_details = []
 
-                            st.session_state["win5_races_data"][idx] = {
-                                "id": idx + 1,
-                                "name": f"WIN{idx+1}: {res_data['race_name']} ({res_data['course_type']}{res_data['distance']}m)",
-                                "track": matched_track,
-                                "distance": res_data["distance"],
-                                "course_type": res_data["course_type"],
-                                "pace": st.session_state["win5_races_data"][idx].get("pace", "ミドルペース"),
-                                "condition": st.session_state["win5_races_data"][idx].get("condition", condition_options[0]),
-                                "url": u.strip(),
-                                "past_records": res_data.get("past_records", {}),
-                                "horses": horses_df,
-                                "actual_winner": 0
-                            }
-                if success_count > 0:
-                    st.session_state["win5_has_run"] = False
-                    st.session_state["win5_custom_selections"] = {}
-                    st.success(f"🎉 {success_count}レース分の出走馬・オッズ・過去走データを正常に取得・反映しました！")
-                    st.rerun()
+                    with st.spinner("🌐 netkeibaから5レースの出走馬・オッズ・本物過去走データを取得中..."):
+                        for idx, u in valid_indices:
+                            res_data, err = fetch_netkeiba_func(u)
+                            if err:
+                                error_details.append(f"WIN{idx+1}: {err}")
+                            else:
+                                success_count += 1
+                                detected_t = res_data["track_name"]
+                                matched_track = next((t for t in track_options if detected_t in t), track_options[0])
+
+                                horses_df = pd.DataFrame(res_data["horses"])
+                                if "想定単勝オッズ" not in horses_df.columns:
+                                    horses_df["想定単勝オッズ"] = 10.0
+                                if "斤量" not in horses_df.columns:
+                                    horses_df["斤量"] = 56.0
+
+                                r_name_formatted = f"WIN{idx+1}: {res_data['race_name']} ({res_data['course_type']}{res_data['distance']}m)"
+                                st.session_state["win5_races_data"][idx] = {
+                                    "id": idx + 1,
+                                    "name": r_name_formatted,
+                                    "track": matched_track,
+                                    "distance": res_data["distance"],
+                                    "course_type": res_data["course_type"],
+                                    "pace": st.session_state["win5_races_data"][idx].get("pace", "ミドルペース"),
+                                    "condition": st.session_state["win5_races_data"][idx].get("condition", condition_options[0]),
+                                    "url": u,
+                                    "past_records": res_data.get("past_records", {}),
+                                    "horses": horses_df,
+                                    "actual_winner": 0
+                                }
+                                fetched_details.append(f"**WIN{idx+1}**: {res_data['race_name']} ({len(horses_df)}頭)")
+
+                    if error_details:
+                        for ed in error_details:
+                            st.error(f"⚠️ {ed}")
+
+                    if success_count > 0:
+                        st.session_state["win5_has_run"] = False
+                        st.session_state["win5_custom_selections"] = {}
+                        st.session_state["win5_data_version"] += 1
+                        st.success(f"🎉 **{success_count}レース分の出走馬データを取得し、下の出馬表に反映しました！**\n\n" + " ｜ ".join(fetched_details))
+                        st.rerun()
 
     # ==========================================
     # 📋 各レース（WIN1〜WIN5）の条件設定 ＆ 出走馬エディタ
@@ -284,7 +307,14 @@ def render_win5_simulator(
     st.subheader("📋 WIN5 対象5レースの条件設定 ＆ 出馬表")
     st.caption("各レースの競馬場、距離、馬場状態、ペース、出走馬（馬番・人気・オッズ・騎手・脚質）を編集できます。個別のURL取得も可能です。")
 
-    race_tabs = st.tabs([f"第{i}戦: WIN{i}" for i in range(1, 6)])
+    current_ver = st.session_state.get("win5_data_version", 0)
+    race_tab_titles = []
+    for i in range(5):
+        r_d = st.session_state["win5_races_data"][i]
+        h_cnt = len(r_d.get("horses", []))
+        race_tab_titles.append(f"第{i+1}戦: WIN{i+1} ({h_cnt}頭)")
+
+    race_tabs = st.tabs(race_tab_titles)
     edited_races = []
 
     for idx, r_tab in enumerate(race_tabs):
@@ -296,11 +326,11 @@ def render_win5_simulator(
                 single_url = st.text_input(
                     f"WIN{idx+1} netkeiba URL (個別取得・更新用)",
                     value=r_info.get("url", ""),
-                    key=f"win5_single_url_{idx}",
+                    key=f"win5_single_url_{idx}_{current_ver}",
                     placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=..."
                 )
             with c_u2:
-                btn_single_fetch = st.button(f"📥 WIN{idx+1}のみ取得", key=f"btn_single_{idx}", use_container_width=True)
+                btn_single_fetch = st.button(f"📥 WIN{idx+1}のみ取得", key=f"btn_single_{idx}_{current_ver}", use_container_width=True)
 
             if btn_single_fetch and single_url.strip() and fetch_netkeiba_func:
                 with st.spinner(f"🌐 WIN{idx+1}のレースデータを取得中..."):
@@ -329,19 +359,22 @@ def render_win5_simulator(
                             "horses": horses_df,
                             "actual_winner": 0
                         }
+                        # バッチURL欄にも反映
+                        st.session_state[f"win5_batch_url_{idx}"] = single_url.strip()
                         st.session_state["win5_has_run"] = False
-                        st.success(f"🎉 WIN{idx+1} ({res_data['race_name']}) を取得しました！")
+                        st.session_state["win5_data_version"] += 1
+                        st.success(f"🎉 WIN{idx+1} ({res_data['race_name']} / {len(horses_df)}頭) を取得し、表に反映しました！")
                         st.rerun()
 
             # レース条件設定
             c_r1, c_r2, c_r3 = st.columns([2, 1, 1])
             with c_r1:
-                r_name = st.text_input(f"レース名 (WIN{idx+1})", value=r_info["name"], key=f"win5_name_{idx}")
+                r_name = st.text_input(f"レース名 (WIN{idx+1})", value=r_info["name"], key=f"win5_name_{idx}_{current_ver}")
             with c_r2:
-                r_dist = st.number_input(f"距離 (m)", value=int(r_info["distance"]), step=100, key=f"win5_dist_{idx}")
+                r_dist = st.number_input(f"距離 (m)", value=int(r_info["distance"]), step=100, key=f"win5_dist_{idx}_{current_ver}")
             with c_r3:
                 c_idx = 0 if r_info["course_type"] == "芝" else (1 if r_info["course_type"] == "ダート" else 2)
-                r_ctype = st.selectbox(f"コース種別", ["芝", "ダート", "ばんえい"], index=c_idx, key=f"win5_ctype_{idx}")
+                r_ctype = st.selectbox(f"コース種別", ["芝", "ダート", "ばんえい"], index=c_idx, key=f"win5_ctype_{idx}_{current_ver}")
 
             c_r4, c_r5, c_r6 = st.columns([1.5, 1, 1])
             with c_r4:
@@ -351,7 +384,7 @@ def render_win5_simulator(
                     if curr_t in opt_val or any(k in opt_val for k in curr_t.split()[:1]):
                         t_idx = opt_i
                         break
-                r_track = st.selectbox("🏟️ 競馬場", track_options, index=t_idx, key=f"win5_track_{idx}")
+                r_track = st.selectbox("🏟️ 競馬場", track_options, index=t_idx, key=f"win5_track_{idx}_{current_ver}")
             with c_r5:
                 curr_c = r_info.get("condition", condition_options[0])
                 c_cond_idx = 0
@@ -359,12 +392,12 @@ def render_win5_simulator(
                     if curr_c.split()[0] in cv:
                         c_cond_idx = ci
                         break
-                r_cond = st.selectbox("🌦️ 馬場状態", condition_options, index=c_cond_idx, key=f"win5_cond_{idx}")
+                r_cond = st.selectbox("🌦️ 馬場状態", condition_options, index=c_cond_idx, key=f"win5_cond_{idx}_{current_ver}")
             with c_r6:
                 pace_opts = ["スローペース", "ミドルペース", "ハイペース"]
                 curr_p = r_info.get("pace", "ミドルペース")
                 p_idx = 1 if curr_p == "ミドルペース" else (0 if curr_p == "スローペース" else 2)
-                r_pace = st.selectbox("⏱️ 想定ペース", pace_opts, index=p_idx, key=f"win5_pace_{idx}")
+                r_pace = st.selectbox("⏱️ 想定ペース", pace_opts, index=p_idx, key=f"win5_pace_{idx}_{current_ver}")
 
             st.caption("出走馬データ (馬番・馬名・人気・オッズ・騎手名・脚質・斤量):")
             
@@ -377,7 +410,7 @@ def render_win5_simulator(
                 if col not in h_df_current.columns:
                     h_df_current[col] = default_val
 
-            # 出走馬データエディタ
+            # 出走馬データエディタ（キーにcurrent_verを組み込むことで、外部取得時に強制リフレッシュ）
             h_df_edited = st.data_editor(
                 h_df_current,
                 column_config={
@@ -391,7 +424,7 @@ def render_win5_simulator(
                 },
                 num_rows="dynamic",
                 use_container_width=True,
-                key=f"win5_editor_{idx}"
+                key=f"win5_editor_{idx}_{current_ver}"
             )
 
             # 過去走カルテ表示（netkeibaから取得されたデータがある場合）
