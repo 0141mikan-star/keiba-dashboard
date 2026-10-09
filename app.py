@@ -1520,6 +1520,18 @@ def estimate_trio_odds(o1: float, o2: float, o3: float) -> float:
     val = ((max(1.1, o1) * max(1.1, o2) * max(1.1, o3)) ** 0.60) * 0.85
     return round(max(2.0, val), 1)
 
+def estimate_trifecta_odds(o1: float, o2: float, o3: float) -> float:
+    """3頭の単勝オッズから3連単想定オッズ（1着→2着→3着）を推定（ハーヴィル・モデル）"""
+    p1 = 0.80 / max(1.05, float(o1))
+    p2 = 0.80 / max(1.05, float(o2))
+    p3 = 0.80 / max(1.05, float(o3))
+    denom1 = max(0.05, 1.0 - p1)
+    denom2 = max(0.05, 1.0 - p1 - p2)
+    prob = p1 * (p2 / denom1) * (p3 / denom2)
+    prob = max(0.00002, min(0.60, prob))
+    odds = 0.725 / prob
+    return round(max(2.5, min(odds, 99999.0)), 1)
+
 def calculate_expected_value(prob_pct: float, odds: float) -> float:
     """AI勝率(%)と想定オッズから期待値（EV = Expected Value）を算出"""
     ev = (float(prob_pct) / 100.0) * float(odds)
@@ -1739,6 +1751,272 @@ def generate_sanrenpuku_strategies(results_df: pd.DataFrame) -> dict:
             "sub": f"軸2頭: {h1['馬番']}番 - {h2['馬番']}番 ＝ 相手: {len(axis2_targets)}頭 （計{len(axis2_bets)}点）",
             "bets": axis2_bets,
             "desc": "上位2頭（◎と○）の実力が抜けている時に絶大な威力を発揮！点数がわずか3〜4点なので、1点に厚く張ってドカンと勝ち切る勝負師の買い方！"
+        }
+    }
+
+def check_sanrentan_eligibility(results_df: pd.DataFrame, meta: dict = None) -> dict:
+    """
+    3連単の勝負適性・的中期待確率をAIが多角的に精密判定。
+    【的中確率が高いと判定される条件】:
+    1. 過去確定レース完全再現モード発動中（的中率100%）
+    2. 本命馬◎の勝率が35%以上（1強鉄板レース）
+    3. レース波乱度診断が「低波乱・鉄板」
+    4. 上位2頭（◎○）の合計勝率が50%以上（ワンツー濃厚）
+    5. 少頭数（11頭以下）で組み合わせ数が絞られるレース
+    """
+    if len(results_df) < 3:
+        return {"is_high_prob": False, "score": 0, "level": "出走頭数不足", "badge_color": "#6c757d", "reasons": [], "recommendation": ""}
+
+    meta = meta or {}
+    h1 = results_df.iloc[0]
+    h2 = results_df.iloc[1]
+    h3 = results_df.iloc[2]
+    
+    w1 = float(h1.get("勝率(%)", 15.0))
+    w2 = float(h2.get("勝率(%)", 12.0))
+    w3 = float(h3.get("勝率(%)", 10.0))
+    pop1 = int(h1.get("単勝人気", 1))
+    
+    past_matched = meta.get("past_race_matched", False)
+    vol = meta.get("volatility", {})
+    vol_level = vol.get("level", "")
+    
+    score = 0
+    reasons = []
+    
+    if past_matched:
+        score = 100
+        reasons.append("過去レース着順完全記憶モード発動中（着順確定済み・的中確率100%）")
+    else:
+        if w1 >= 45.0:
+            score += 45
+            reasons.append(f"本命◎ {h1['馬名']} のAI勝率が {w1:.1f}% と圧倒的1強")
+        elif w1 >= 35.0:
+            score += 35
+            reasons.append(f"本命◎ {h1['馬名']} のAI勝率が {w1:.1f}% と堅軸")
+        elif w1 >= 28.0:
+            score += 20
+            reasons.append(f"本命◎ {h1['馬名']} のAI勝率 {w1:.1f}%")
+        
+        if pop1 == 1:
+            score += 15
+            reasons.append("本命馬が単勝1番人気（世間の支持とAI評価が完全一致）")
+        elif pop1 == 2:
+            score += 10
+            
+        if "低波乱" in vol_level or "鉄板" in vol_level:
+            score += 25
+            reasons.append("レース波乱度診断が【低波乱・鉄板勝負】判定")
+        elif "中波乱" in vol_level:
+            score += 10
+        elif "特大波乱" in vol_level:
+            score -= 20
+            
+        top2_win = w1 + w2
+        if top2_win >= 55.0:
+            score += 15
+            reasons.append(f"上位2頭（◎○）の合計勝率が {top2_win:.1f}% に達しワンツー濃厚")
+        elif top2_win >= 45.0:
+            score += 10
+            
+        total_h = len(results_df)
+        if total_h <= 8:
+            score += 15
+            reasons.append(f"少頭数（{total_h}頭立て）のため組み合わせ数が少なく的中確率が跳ね上がる")
+        elif total_h <= 11:
+            score += 8
+            
+    is_high = score >= 55
+    if score >= 75:
+        level_str = "🔥 超高確率 (特Aランク勝負レース)"
+        badge_color = "#dc3545"
+        recommendation = "【3連単 大推奨】本命の信頼度が極めて高く、少点数フォーメーションで確実に仕留められる絶好のチャンスです！"
+    elif score >= 55:
+        level_str = "✨ 高確率 (Aランク・狙い目)"
+        badge_color = "#198754"
+        recommendation = "【3連単 推奨】上位馬の実力が抜けており、1着固定または折り返しフォーメーションで高回収が期待できます。"
+    else:
+        level_str = "⚖️ 標準〜波乱警戒 (Bランク)"
+        badge_color = "#6c757d"
+        recommendation = "【3連複・馬連推奨】混戦または波乱含みのため、まずは3連複や馬連で手堅く攻めるのがセオリーです。"
+        
+    return {
+        "is_high_prob": is_high,
+        "score": min(100, max(0, score)),
+        "level": level_str,
+        "badge_color": badge_color,
+        "reasons": reasons,
+        "recommendation": recommendation
+    }
+
+def generate_sanrentan_strategies(results_df: pd.DataFrame) -> dict:
+    """
+    3連単（三連単）のプロ仕様3大戦略を自動生成:
+    1. 【戦略①: 1着固定フォーメーション (点数絞り 4〜6点・高回収)】
+       - 1着: ◎ (本命固定)
+       - 2着: ○, ▲ (有力2頭)
+       - 3着: ○, ▲, ☆ (特注穴馬), △ (4〜5位)
+    2. 【戦略②: 1・2着マルチ裏表フォーメーション (ワンツー6〜8点・本命逆転カバー)】
+       - 1着: ◎, ○
+       - 2着: ◎, ○
+       - 3着: ▲, ☆, △
+    3. 【戦略③: 上位厳選3頭BOX (計6点・着順不問)】
+       - 上位3頭 (◎, ○, ▲)
+    """
+    if len(results_df) < 3:
+        return {}
+
+    from itertools import permutations
+
+    h1 = results_df.iloc[0]  # ◎
+    h2 = results_df.iloc[1]  # ○
+    h3 = results_df.iloc[2]  # ▲
+    h4 = results_df.iloc[3] if len(results_df) >= 4 else None
+    h5 = results_df.iloc[4] if len(results_df) >= 5 else None
+
+    # 特注穴馬
+    upset_rows = results_df[results_df["特注穴馬"] == True]
+    up_horse = None
+    if len(upset_rows) > 0:
+        for _, u_cand in upset_rows.iterrows():
+            if u_cand["馬番"] != h1["馬番"]:
+                up_horse = u_cand
+                break
+
+    # ------------------------------------------
+    # 戦略①: 1着固定フォーメーション (4〜6点)
+    # ------------------------------------------
+    second_cands_1 = [h2, h3]
+    third_cands_1 = [h2, h3]
+    if up_horse is not None and up_horse["馬番"] not in [h2["馬番"], h3["馬番"]]:
+        third_cands_1.append(up_horse)
+    if h4 is not None and (up_horse is None or h4["馬番"] != up_horse["馬番"]):
+        third_cands_1.append(h4)
+    if len(third_cands_1) < 4 and h5 is not None and (up_horse is None or h5["馬番"] != up_horse["馬番"]):
+        third_cands_1.append(h5)
+
+    strat1_bets = []
+    strat1_seen = set()
+    for s2 in second_cands_1:
+        for s3 in third_cands_1:
+            if s2["馬番"] == s3["馬番"]:
+                continue
+            trip = (int(h1["馬番"]), int(s2["馬番"]), int(s3["馬番"]))
+            if trip not in strat1_seen:
+                strat1_seen.add(trip)
+                names_str = f"{h1['馬名']} → {s2['馬名']} → {s3['馬名']}"
+                o1 = float(h1.get("想定単勝オッズ", 2.2))
+                o2 = float(s2.get("想定単勝オッズ", 3.8))
+                o3 = float(s3.get("想定単勝オッズ", 5.6))
+                odds_val = estimate_trifecta_odds(o1, o2, o3)
+                
+                is_main = (s2["馬番"] == h2["馬番"] and s3["馬番"] == h3["馬番"])
+                is_upset = (up_horse is not None and int(up_horse["馬番"]) == int(s3["馬番"]))
+                if is_main:
+                    badge = "🥇 本線鉄板"
+                elif is_upset:
+                    badge = "🔥 穴馬直撃・特大万馬券"
+                else:
+                    badge = "🛡️ 抑え・好配当"
+
+                strat1_bets.append({
+                    "nums": trip,
+                    "nums_str": f"{trip[0]} → {trip[1]} → {trip[2]}",
+                    "names_str": names_str,
+                    "odds": odds_val,
+                    "badge": badge,
+                    "is_upset": is_upset
+                })
+    strat1_bets.sort(key=lambda x: (0 if "本線" in x["badge"] else (1 if "穴馬" in x["badge"] else 2), x["odds"]))
+
+    # ------------------------------------------
+    # 戦略②: 1・2着マルチ裏表フォーメーション (6〜8点)
+    # ------------------------------------------
+    third_cands_2 = [h3]
+    if up_horse is not None and up_horse["馬番"] not in [h1["馬番"], h2["馬番"], h3["馬番"]]:
+        third_cands_2.append(up_horse)
+    if h4 is not None and (up_horse is None or h4["馬番"] != up_horse["馬番"]):
+        third_cands_2.append(h4)
+    if len(third_cands_2) < 3 and h5 is not None and (up_horse is None or h5["馬番"] != up_horse["馬番"]):
+        third_cands_2.append(h5)
+
+    strat2_bets = []
+    strat2_seen = set()
+    for first_h, sec_h in [(h1, h2), (h2, h1)]:
+        for s3 in third_cands_2:
+            trip = (int(first_h["馬番"]), int(sec_h["馬番"]), int(s3["馬番"]))
+            if trip not in strat2_seen:
+                strat2_seen.add(trip)
+                names_str = f"{first_h['馬名']} → {sec_h['馬名']} → {s3['馬名']}"
+                o1 = float(first_h.get("想定単勝オッズ", 2.2))
+                o2 = float(sec_h.get("想定単勝オッズ", 3.8))
+                o3 = float(s3.get("想定単勝オッズ", 5.6))
+                odds_val = estimate_trifecta_odds(o1, o2, o3)
+                
+                is_main = (first_h["馬番"] == h1["馬番"] and s3["馬番"] == h3["馬番"])
+                is_rev = (first_h["馬番"] == h2["馬番"] and s3["馬番"] == h3["馬番"])
+                is_upset = (up_horse is not None and int(up_horse["馬番"]) == int(s3["馬番"]))
+                if is_main:
+                    badge = "🥇 本命→対抗 (本線)"
+                elif is_rev:
+                    badge = "🥈 対抗→本命 (逆転本線)"
+                elif is_upset:
+                    badge = "🔥 穴絡み高配当"
+                else:
+                    badge = "🛡️ 抑え"
+
+                strat2_bets.append({
+                    "nums": trip,
+                    "nums_str": f"{trip[0]} → {trip[1]} → {trip[2]}",
+                    "names_str": names_str,
+                    "odds": odds_val,
+                    "badge": badge,
+                    "is_upset": is_upset
+                })
+    strat2_bets.sort(key=lambda x: (0 if "本線" in x["badge"] else (1 if "穴" in x["badge"] else 2), x["odds"]))
+
+    # ------------------------------------------
+    # 戦略③: 上位厳選3頭BOX (計6点)
+    # ------------------------------------------
+    strat3_horses = [h1, h2, h3]
+    strat3_bets = []
+    for p in permutations(strat3_horses, 3):
+        trip = (int(p[0]["馬番"]), int(p[1]["馬番"]), int(p[2]["馬番"]))
+        names_str = f"{p[0]['馬名']} → {p[1]['馬名']} → {p[2]['馬名']}"
+        o1 = float(p[0].get("想定単勝オッズ", 2.2))
+        o2 = float(p[1].get("想定単勝オッズ", 3.8))
+        o3 = float(p[2].get("想定単勝オッズ", 5.6))
+        odds_val = estimate_trifecta_odds(o1, o2, o3)
+        is_exact123 = (p[0]["馬番"] == h1["馬番"] and p[1]["馬番"] == h2["馬番"])
+        badge = "🥇 1→2→3 (最有力)" if is_exact123 else "🎲 BOX抑え"
+        strat3_bets.append({
+            "nums": trip,
+            "nums_str": f"{trip[0]} → {trip[1]} → {trip[2]}",
+            "names_str": names_str,
+            "odds": odds_val,
+            "badge": badge,
+            "is_upset": False
+        })
+    strat3_bets.sort(key=lambda x: (0 if "最有力" in x["badge"] else 1, x["odds"]))
+
+    return {
+        "formation": {
+            "name": "🎯 【戦略①】 1着固定フォーメーション (極少4〜6点・回収率極大)",
+            "sub": f"1着: {h1['馬番']}番 ｜ 2着: {h2['馬番']},{h3['馬番']}番 ｜ 3着: {len(third_cands_1)}頭 （計{len(strat1_bets)}点）",
+            "bets": strat1_bets,
+            "desc": "本命◎が頭（1着）固定！2着・3着に有力馬と穴馬を絞り込み、極少点数（4〜6点）で万馬券〜十万馬券級の超高回収を叩き出す王道プロスタイル！"
+        },
+        "mult": {
+            "name": "🚀 【戦略②】 1・2着マルチ裏表 (ワンツー6点・本命逆転カバー)",
+            "sub": f"1・2着: {h1['馬番']}番 ⇄ {h2['馬番']}番 ｜ 3着: {len(third_cands_2)}頭 （計{len(strat2_bets)}点）",
+            "bets": strat2_bets,
+            "desc": "「本命と対抗が激しい叩き合いの末、ハナ差で逆転…」という悲劇を完全回避！◎と○のどちらが勝ってもワンツーなら確実に的中するセーフティ戦略！"
+        },
+        "box": {
+            "name": "🎲 【戦略③】 上位厳選3頭BOX (計6点・3強総取り)",
+            "sub": f"対象3頭: {h1['馬番']}番({h1['馬名']}), {h2['馬番']}番({h2['馬名']}), {h3['馬番']}番({h3['馬名']}) （計6点）",
+            "bets": strat3_bets,
+            "desc": "上位3頭の実力が抜きん出ているレースで、着順の入れ替わりを一切恐れずに6点で仕留めるBOX買い！"
         }
     }
 
@@ -2962,6 +3240,9 @@ if st.session_state["predicted_results"] is not None:
         h3 = results.iloc[2] if len(results) >= 3 else None
         h4 = results.iloc[3] if len(results) >= 4 else None
 
+        rentan_elig = check_sanrentan_eligibility(results, meta)
+        rentan_strat = generate_sanrentan_strategies(results)
+
         col_bet1, col_bet2, col_bet3 = st.columns(3)
 
         # プラン1: 【最優先・本命】 馬連BOX (3点) ＆ 馬連流し
@@ -3025,9 +3306,27 @@ if st.session_state["predicted_results"] is not None:
                     """
                 )
 
-        # プラン3: 【オッズ跳ね狙い・馬連穴流し / 3連複】
+        # プラン3: 【オッズ跳ね狙い・馬連穴流し / 3連複 / 3連単】
         with col_bet3:
-            st.markdown("#### 🚀 ③【高配当・一撃狙い】")
+            if rentan_elig["is_high_prob"] and rentan_strat:
+                st.markdown("#### 🔥 ③【一撃万馬券・3連単勝負】")
+                best_rentan = rentan_strat["formation"]["bets"][:3]
+                best_rentan_lines = "\n".join([f"  - **3連単 {b['nums_str']}** (想定{b['odds']:.1f}倍) [{b['badge'].split(' ')[-1]}]" for b in best_rentan])
+                st.markdown(
+                    f"""
+                    **推奨馬券: 3連単 1着固定 (極少4〜6点)**
+                    * 🎯 **本命頭固定**: **{h1['馬番']}番** ({h1['馬名']})
+                    * 🚀 **高確率買い目例**:
+                    {best_rentan_lines}
+                    
+                    ---
+                    * **推奨度**: ⭐⭐⭐⭐⭐ (的中期待度特大！)
+                    * **狙い**: 本命◎の軸信頼度が突出！少点数3連単で高回収・万馬券を一撃で仕留める絶好のチャンスレース。
+                    * **資金配分**: 下の「3連単ナビゲーター」および「最適資金配分シミュレータ」で自動計算可能！
+                    """
+                )
+            else:
+                st.markdown("#### 🚀 ③【高配当・一撃狙い】")
             upset_rows = results[results["特注穴馬"] == True]
             # 穴馬が存在し、かつ本命(h1)とは異なる馬番の穴馬を取得
             up_horse = None
@@ -3168,6 +3467,121 @@ if st.session_state["predicted_results"] is not None:
         st.caption("※ 上記の買い目は、下の「💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ」でワンクリックでそのままダッチング計算（均等払戻）できます。")
 
     # ==========================================
+    # 🔥 3連単（三連単）勝負ナビゲーター (的中確率高スコア時発動)
+    # ==========================================
+    st.markdown("---")
+    st.subheader("🔥 3連単（三連単）勝負ナビゲーター")
+    st.caption("AIが「本命軸の信頼度・レース波乱度・頭数」から3連単の的中期待値を精密診断。当たる確率が高い勝負レースを自動検知してプロの厳選買い目（4〜6点）を展開します！")
+
+    if rentan_elig["is_high_prob"]:
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #800020 0%, #b31217 50%, #e52d27 100%); padding: 16px 22px; border-radius: 8px; color: white; margin-bottom: 14px; border-left: 6px solid #ffeb3b; box-shadow: 0 4px 10px rgba(0,0,0,0.25);">
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+                    <span style="font-size: 17px; font-weight: bold; color: #ffffff;">
+                        🎯 【3連単・高確率チャンス警報発令！】 {rentan_elig['level']} ｜ 的中期待スコア: <span style="color: #ffeb3b;">{rentan_elig['score']}点/100点</span>
+                    </span>
+                </div>
+                <div style="margin-top: 8px; font-size: 14px; opacity: 0.95;">
+                    {rentan_elig['recommendation']}
+                </div>
+                <div style="margin-top: 6px; font-size: 13px; color: #ffeb3b; font-weight: bold;">
+                    ⚡ 判定根拠: {' ｜ '.join(rentan_elig['reasons'])}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        tab_r1, tab_r2, tab_r3 = st.tabs([
+            "🎯 【戦略①】 1着固定フォーメーション (極少4〜6点・回収率極大)",
+            "🚀 【戦略②】 1・2着マルチ裏表 (ワンツー6点・本命逆転カバー)",
+            "🎲 【戦略③】 上位厳選3頭BOX (計6点・3強総取り)"
+        ])
+
+        with tab_r1:
+            r1 = rentan_strat["formation"]
+            st.markdown(f"#### {r1['name']}")
+            st.info(f"📋 **構成**: {r1['sub']}\n\n💡 **プロの戦略解説**: {r1['desc']}")
+            r1_rows = []
+            for b in r1["bets"]:
+                r1_rows.append({
+                    "買い目": f"3連単 {b['nums_str']}",
+                    "組み合わせ馬名": b["names_str"],
+                    "想定オッズ": f"{b['odds']:.1f}倍",
+                    "狙い目・位置づけ": b["badge"]
+                })
+            st.dataframe(pd.DataFrame(r1_rows), use_container_width=True, hide_index=True)
+
+        with tab_r2:
+            r2 = rentan_strat["mult"]
+            st.markdown(f"#### {r2['name']}")
+            st.info(f"📋 **構成**: {r2['sub']}\n\n💡 **プロの戦略解説**: {r2['desc']}")
+            r2_rows = []
+            for b in r2["bets"]:
+                r2_rows.append({
+                    "買い目": f"3連単 {b['nums_str']}",
+                    "組み合わせ馬名": b["names_str"],
+                    "想定オッズ": f"{b['odds']:.1f}倍",
+                    "狙い目・位置づけ": b["badge"]
+                })
+            st.dataframe(pd.DataFrame(r2_rows), use_container_width=True, hide_index=True)
+
+        with tab_r3:
+            r3 = rentan_strat["box"]
+            st.markdown(f"#### {r3['name']}")
+            st.info(f"📋 **構成**: {r3['sub']}\n\n💡 **プロの戦略解説**: {r3['desc']}")
+            r3_rows = []
+            for b in r3["bets"]:
+                r3_rows.append({
+                    "買い目": f"3連単 {b['nums_str']}",
+                    "組み合わせ馬名": b["names_str"],
+                    "想定オッズ": f"{b['odds']:.1f}倍",
+                    "狙い目・位置づけ": b["badge"]
+                })
+            st.dataframe(pd.DataFrame(r3_rows), use_container_width=True, hide_index=True)
+
+        st.caption("※ 上記の買い目は、下の「💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ」でワンクリックでそのままダッチング計算（均等払戻）できます。")
+
+    else:
+        st.markdown(
+            f"""
+            <div style="background: #2b3035; padding: 12px 18px; border-radius: 8px; color: #dee2e6; margin-bottom: 12px; border-left: 6px solid {rentan_elig['badge_color']};">
+                <span style="font-size: 15px; font-weight: bold;">
+                    ⚠️ 【3連単リスク診断】 {rentan_elig['level']} ｜ 的中期待スコア: {rentan_elig['score']}点/100点
+                </span>
+                <div style="margin-top: 5px; font-size: 13px;">
+                    {rentan_elig['recommendation']}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        with st.expander("🔍 **それでも3連単の買い目を確認する（参考情報として展開）**", expanded=False):
+            st.caption("※ 本レースは混戦のため無理な3連単勝負はおすすめしませんが、もし買う場合の厳選フォーメーションです：")
+            tab_r1, tab_r2, tab_r3 = st.tabs([
+                "🎯 【戦略①】 1着固定フォーメーション",
+                "🚀 【戦略②】 1・2着マルチ裏表",
+                "🎲 【戦略③】 上位厳選3頭BOX"
+            ])
+            with tab_r1:
+                r1 = rentan_strat["formation"]
+                st.markdown(f"#### {r1['name']}")
+                r1_rows = [{"買い目": f"3連単 {b['nums_str']}", "組み合わせ馬名": b["names_str"], "想定オッズ": f"{b['odds']:.1f}倍", "狙い目": b["badge"]} for b in r1["bets"]]
+                st.dataframe(pd.DataFrame(r1_rows), use_container_width=True, hide_index=True)
+            with tab_r2:
+                r2 = rentan_strat["mult"]
+                st.markdown(f"#### {r2['name']}")
+                r2_rows = [{"買い目": f"3連単 {b['nums_str']}", "組み合わせ馬名": b["names_str"], "想定オッズ": f"{b['odds']:.1f}倍", "狙い目": b["badge"]} for b in r2["bets"]]
+                st.dataframe(pd.DataFrame(r2_rows), use_container_width=True, hide_index=True)
+            with tab_r3:
+                r3 = rentan_strat["box"]
+                st.markdown(f"#### {r3['name']}")
+                r3_rows = [{"買い目": f"3連単 {b['nums_str']}", "組み合わせ馬名": b["names_str"], "想定オッズ": f"{b['odds']:.1f}倍", "狙い目": b["badge"]} for b in r3["bets"]]
+                st.dataframe(pd.DataFrame(r3_rows), use_container_width=True, hide_index=True)
+
+    # ==========================================
     # 💰 トリガミ完全防止！最適資金配分＆払戻シミュレータ
     # ==========================================
     st.markdown("---")
@@ -3177,17 +3591,30 @@ if st.session_state["predicted_results"] is not None:
     # 1. プラン・配分モードの選択
     col_dutch_p, col_dutch_m = st.columns([1.2, 1.2])
     with col_dutch_p:
+        rentan_plan_opts = [
+            "🔥 3連単 戦略①: 1着固定フォーメーション (極少4〜6点・高回収)",
+            "🚀 3連単 戦略②: 1・2着マルチ裏表 (ワンツー6点・逆転カバー)",
+            "🎲 3連単 戦略③: 上位厳選3頭BOX (計6点・3強決着)",
+        ]
+        trio_plan_opts = [
+            "🎯 3連複 戦略①: 軸1頭フォーメーション (点数絞り・5〜7点)",
+            "🎲 3連複 戦略②: 上位厳選4頭BOX (計4点・軸崩れゼロ)",
+            "🚀 3連複 戦略③: 軸2頭ながし (極小3〜4点・厚張り勝負)",
+        ]
+        other_plan_opts = [
+            "⚖️ プラン1: 馬連 3頭BOX (本線3点)",
+            "🛡️ プラン2: ワイド 3頭BOX (手堅く3点)",
+            "🚀 プラン3: 一撃高配当 (馬連穴流し & 3連複)",
+            "🏆 上位厳選 4点集中買い (馬連1-2, 1-3, 1-4, 2-3)"
+        ]
+        if rentan_elig["is_high_prob"]:
+            all_plan_opts = rentan_plan_opts + trio_plan_opts + other_plan_opts
+        else:
+            all_plan_opts = trio_plan_opts + rentan_plan_opts + other_plan_opts
+
         plan_sel = st.selectbox(
             "🎯 シミュレーション対象の買い目プラン",
-            options=[
-                "🎯 3連複 戦略①: 軸1頭フォーメーション (点数絞り・5〜7点)",
-                "🎲 3連複 戦略②: 上位厳選4頭BOX (計4点・軸崩れゼロ)",
-                "🚀 3連複 戦略③: 軸2頭ながし (極小3〜4点・厚張り勝負)",
-                "⚖️ プラン1: 馬連 3頭BOX (本線3点)",
-                "🛡️ プラン2: ワイド 3頭BOX (手堅く3点)",
-                "🚀 プラン3: 一撃高配当 (馬連穴流し & 3連複)",
-                "🏆 上位厳選 4点集中買い (馬連1-2, 1-3, 1-4, 2-3)"
-            ],
+            options=all_plan_opts,
             index=0
         )
     with col_dutch_m:
@@ -3252,7 +3679,31 @@ if st.session_state["predicted_results"] is not None:
 
         trio_data = generate_sanrenpuku_strategies(results)
 
-        if "3連複 戦略①" in plan_sel and trio_data:
+        if "3連単 戦略①" in plan_sel and rentan_strat:
+            for idx, b in enumerate(rentan_strat["formation"]["bets"]):
+                badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
+                active_bets.append({
+                    "name": f"3連単 {b['nums_str']} ({b['names_str']}) [{badge_lbl}]",
+                    "odds": b["odds"],
+                    "key_id": f"rentan_f_{idx}"
+                })
+        elif "3連単 戦略②" in plan_sel and rentan_strat:
+            for idx, b in enumerate(rentan_strat["mult"]["bets"]):
+                badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
+                active_bets.append({
+                    "name": f"3連単 {b['nums_str']} ({b['names_str']}) [{badge_lbl}]",
+                    "odds": b["odds"],
+                    "key_id": f"rentan_m_{idx}"
+                })
+        elif "3連単 戦略③" in plan_sel and rentan_strat:
+            for idx, b in enumerate(rentan_strat["box"]["bets"]):
+                badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
+                active_bets.append({
+                    "name": f"3連単 {b['nums_str']} ({b['names_str']}) [{badge_lbl}]",
+                    "odds": b["odds"],
+                    "key_id": f"rentan_b_{idx}"
+                })
+        elif "3連複 戦略①" in plan_sel and trio_data:
             for idx, b in enumerate(trio_data["formation"]["bets"]):
                 badge_lbl = b["badge"].split(" ")[-1] if " " in b["badge"] else b["badge"]
                 active_bets.append({
