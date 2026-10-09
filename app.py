@@ -2672,32 +2672,6 @@ def calculate_predictions(
     return result_df, meta
 
 
-# ==========================================
-# 3. メインエリア (タイトル & 画像アップロード)
-# ==========================================
-if app_mode == "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)":
-    render_win5_simulator(calculate_predictions, st.session_state["learned_weights"])
-    st.stop()
-
-st.title("🏇 競馬着順予測AIシミュレータ")
-st.caption(f"📱 **スマホでもそのまま使えます！** 同じWi-Fiに繋いだスマホで `{mobile_url}` を開くか、左上メニュー（>）内のQRコードをカメラで読み取ってください。")
-st.markdown(
-    """
-    出馬表の**「人気」「騎手名」**を入力（または**出馬表スクショをアップロード**）して着順を予想！
-    レース後は**「実際の結果」を入力することでAIがレース結果を自己学習**し、最適な予想アルゴリズムへと自動進化します。
-    """
-)
-
-# セッション状態の出走馬データ初期化 (新聞を見て選べる5項目のみ)
-if "horses_data" not in st.session_state or "適性距離" in st.session_state["horses_data"].columns:
-    st.session_state["horses_data"] = pd.DataFrame([
-        {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
-        {"馬番": 2, "馬名": "コントレイル", "単勝人気": 2, "騎手名": "川田将雅", "脚質": "差し"},
-        {"馬番": 3, "馬名": "キセキ", "単勝人気": 4, "騎手名": "武豊", "脚質": "逃げ"},
-        {"馬番": 4, "馬名": "クロノジェネシス", "単勝人気": 3, "騎手名": "坂井瑠星", "脚質": "先行"},
-        {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "騎手名": "池添謙一", "脚質": "追込"},
-    ])
-
 def parse_payout_tables(soup: BeautifulSoup) -> dict:
     """
     netkeibaの確定レース結果ページ（result.html）から
@@ -3254,6 +3228,42 @@ def parse_horses_from_text(raw_text: str) -> list[dict]:
         raise ValueError("出走馬データを抽出できませんでした。JSON形式または出馬表テキストをご確認ください。")
 
     return parsed_list
+
+
+# ==========================================
+# 3. メインエリア (タイトル & 画像アップロード)
+# ==========================================
+if app_mode == "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)":
+    render_win5_simulator(
+        calculate_predictions_func=calculate_predictions,
+        learned_weights=st.session_state["learned_weights"],
+        fetch_netkeiba_func=fetch_netkeiba_race,
+        select_recommended_func=select_recommended_horses,
+        generate_comment_func=generate_horse_recommendation_comment,
+        diagnose_volatility_func=diagnose_race_volatility,
+        track_options=track_options
+    )
+    st.stop()
+
+st.title("🏇 競馬着順予測AIシミュレータ")
+st.caption(f"📱 **スマホでもそのまま使えます！** 同じWi-Fiに繋いだスマホで `{mobile_url}` を開くか、左上メニュー（>）内のQRコードをカメラで読み取ってください。")
+st.markdown(
+    """
+    出馬表の**「人気」「騎手名」**を入力（または**出馬表スクショをアップロード**）して着順を予想！
+    レース後は**「実際の結果」を入力することでAIがレース結果を自己学習**し、最適な予想アルゴリズムへと自動進化します。
+    """
+)
+
+# セッション状態の出走馬データ初期化 (新聞を見て選べる5項目のみ)
+if "horses_data" not in st.session_state or "適性距離" in st.session_state["horses_data"].columns:
+    st.session_state["horses_data"] = pd.DataFrame([
+        {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+        {"馬番": 2, "馬名": "コントレイル", "単勝人気": 2, "騎手名": "川田将雅", "脚質": "差し"},
+        {"馬番": 3, "馬名": "キセキ", "単勝人気": 4, "騎手名": "武豊", "脚質": "逃げ"},
+        {"馬番": 4, "馬名": "クロノジェネシス", "単勝人気": 3, "騎手名": "坂井瑠星", "脚質": "先行"},
+        {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "騎手名": "池添謙一", "脚質": "追込"},
+    ])
+
 
 with st.expander("🌐 **【Web・画像から出走馬を一括自動入力】netkeiba URL取得 (おすすめ！過去走・オッズ完全取得) / スクショ解析**", expanded=True):
     tab_url, tab_img_api, tab_paste_text = st.tabs([
