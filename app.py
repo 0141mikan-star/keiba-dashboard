@@ -569,878 +569,6 @@ with st.sidebar.expander("🔑 AI画像認識 API設定 (Gemini)"):
     )
 
 # ==========================================
-# 3. メインエリア (タイトル & 画像アップロード)
-# ==========================================
-if app_mode == "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)":
-    render_win5_simulator(calculate_predictions, st.session_state["learned_weights"])
-    st.stop()
-
-st.title("🏇 競馬着順予測AIシミュレータ")
-st.caption(f"📱 **スマホでもそのまま使えます！** 同じWi-Fiに繋いだスマホで `{mobile_url}` を開くか、左上メニュー（>）内のQRコードをカメラで読み取ってください。")
-st.markdown(
-    """
-    出馬表の**「人気」「騎手名」**を入力（または**出馬表スクショをアップロード**）して着順を予想！
-    レース後は**「実際の結果」を入力することでAIがレース結果を自己学習**し、最適な予想アルゴリズムへと自動進化します。
-    """
-)
-
-# セッション状態の出走馬データ初期化 (新聞を見て選べる5項目のみ)
-if "horses_data" not in st.session_state or "適性距離" in st.session_state["horses_data"].columns:
-    st.session_state["horses_data"] = pd.DataFrame([
-        {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
-        {"馬番": 2, "馬名": "コントレイル", "単勝人気": 2, "騎手名": "川田将雅", "脚質": "差し"},
-        {"馬番": 3, "馬名": "キセキ", "単勝人気": 4, "騎手名": "武豊", "脚質": "逃げ"},
-        {"馬番": 4, "馬名": "クロノジェネシス", "単勝人気": 3, "騎手名": "坂井瑠星", "脚質": "先行"},
-        {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "騎手名": "池添謙一", "脚質": "追込"},
-    ])
-
-def parse_payout_tables(soup: BeautifulSoup) -> dict:
-    """
-    netkeibaの確定レース結果ページ（result.html）から
-    公式確定払戻金（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）を高精度に抽出・構造化。
-    """
-    payouts = {}
-    p_tables = soup.find_all("table", class_="Payout_Detail_Table")
-    if not p_tables:
-        p_tables = soup.find_all("table", class_="PayBack_Table")
-
-    for t in p_tables:
-        for tr in t.find_all("tr"):
-            th = tr.find("th")
-            if not th:
-                continue
-            label = th.text.strip()
-            tds = tr.find_all("td")
-            if len(tds) < 2:
-                continue
-
-            combos_lines = [l.strip() for l in tds[0].get_text(separator="\n").splitlines() if l.strip()]
-            pays_raw = tds[1].get_text(separator="\n")
-            pays_nums = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)円", pays_raw)]
-            if not pays_nums:
-                pays_nums = [int(p.replace(",", "")) for p in re.findall(r"\b(\d{1,3}(?:,\d{3})+|\d+)\b", pays_raw) if int(p.replace(",", "")) >= 100]
-
-            if label == "単勝" and pays_nums:
-                h_no = int(re.search(r"\d+", combos_lines[0]).group(0)) if combos_lines else None
-                if h_no:
-                    payouts["単勝"] = {h_no: pays_nums[0]}
-            elif label == "複勝" and pays_nums:
-                fuk_map = {}
-                for idx_f, c_line in enumerate(combos_lines[:len(pays_nums)]):
-                    m = re.search(r"\d+", c_line)
-                    if m:
-                        fuk_map[int(m.group(0))] = pays_nums[idx_f]
-                payouts["複勝"] = fuk_map
-            elif label == "馬連" and pays_nums:
-                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
-                if len(nums) >= 2:
-                    payouts["馬連"] = {frozenset([nums[0], nums[1]]): pays_nums[0]}
-            elif label == "ワイド" and pays_nums:
-                wide_map = {}
-                pair_idx = 0
-                for c_line in combos_lines:
-                    nums = [int(x) for x in re.findall(r"\d+", c_line)]
-                    if len(nums) == 2 and pair_idx < len(pays_nums):
-                        wide_map[frozenset(nums)] = pays_nums[pair_idx]
-                        pair_idx += 1
-                if not wide_map and len(combos_lines) >= len(pays_nums) * 2:
-                    nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
-                    for i in range(min(len(pays_nums), len(nums) // 2)):
-                        wide_map[frozenset([nums[i*2], nums[i*2+1]])] = pays_nums[i]
-                payouts["ワイド"] = wide_map
-            elif label == "馬単" and pays_nums:
-                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
-                if len(nums) >= 2:
-                    payouts["馬単"] = {(nums[0], nums[1]): pays_nums[0]}
-            elif label == "3連複" and pays_nums:
-                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
-                if len(nums) >= 3:
-                    payouts["3連複"] = {frozenset(nums[:3]): pays_nums[0]}
-            elif label == "3連単" and pays_nums:
-                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
-                if len(nums) >= 3:
-                    payouts["3連単"] = {(nums[0], nums[1], nums[2]): pays_nums[0]}
-
-    return payouts
-
-def fetch_netkeiba_race(url: str):
-    """
-    【Web公式競馬データ連動エンジン（ハイブリッド高精度解析）】
-    netkeibaの出走表URL（または結果URL）から、基本出馬表（shutuba.html）、馬柱5走（shutuba_past.html）、
-    レース結果（result.html）を自動統合・ハイブリッド解析。
-    - 単勝人気・オッズ: 公式出馬表および結果テーブルから本物の単勝人気・確定オッズを正確に抽出（馬番フォールバック完全解消）
-    - 騎手名: JRA短縮表記や地方競馬表記を「安藤洋一」「津村明秀」「西村淳也」などの完全フルネームに正規化
-    - 過去走・脚質: 馬柱5走ページから過去戦績・走破タイム・上がり3F・通過順・脚質を完全マージ
-    - 中央競馬 (race.netkeiba.com) / 地方競馬 (nar.netkeiba.com) の両方に完全対応。
-    """
-    clean_url = url.strip()
-    if not clean_url:
-        return None, "URLが入力されていません"
-
-    is_nar = "nar.netkeiba.com" in clean_url
-    domain = "nar.netkeiba.com" if is_nar else "race.netkeiba.com"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    r_id_m = re.search(r"race_id=([a-zA-Z0-9]+)", clean_url)
-    if not r_id_m:
-        return None, "URLにrace_idが含まれていません。netkeibaのレースURLを確認してください。"
-    race_id = r_id_m.group(1)
-
-    url_shutuba = f"https://{domain}/race/shutuba.html?race_id={race_id}"
-    url_past = f"https://{domain}/race/shutuba_past.html?race_id={race_id}"
-    url_result = f"https://{domain}/race/result.html?race_id={race_id}"
-
-    # 1. 出馬表 (shutuba.html) を取得（基本枠番・馬番・馬名・騎手フルネーム・斤量・公式オッズ・公式人気）
-    html_base = ""
-    try:
-        resp_base = requests.get(url_shutuba, headers=headers, timeout=12)
-        if resp_base.status_code == 200:
-            for enc in ["utf-8", "euc-jp", "cp932"]:
-                try:
-                    cand = resp_base.content.decode(enc)
-                    if "レース" in cand or "競馬" in cand or "出馬表" in cand:
-                        html_base = cand
-                        break
-                except Exception:
-                    pass
-            if not html_base:
-                html_base = resp_base.content.decode("utf-8", errors="ignore")
-    except Exception as e:
-        return None, f"出馬表の取得に失敗しました: {e}"
-
-    if not html_base:
-        return None, "出馬表HTMLを取得できませんでした。"
-
-    soup_base = BeautifulSoup(html_base, "html.parser")
-
-    # レース名・コース条件の抽出
-    race_name = ""
-    race_name_el = soup_base.find("h1", class_="RaceName") or soup_base.find("div", class_="RaceName")
-    if race_name_el:
-        race_name = race_name_el.text.strip()
-
-    race_data_el = soup_base.find("div", class_="RaceData01") or soup_base.find("div", class_="RaceData02")
-    race_meta = race_data_el.text.strip() if race_data_el else ""
-    page_title = soup_base.title.text.strip() if soup_base.title else ""
-    full_text = f"{race_name} {race_meta} {page_title}"
-
-    track_name = "東京"
-    course_type = "芝"
-    distance = 1600
-
-    tracks = ["東京", "中山", "京都", "阪神", "新潟", "福島", "中京", "小倉", "札幌", "函館",
-              "大井", "川崎", "船橋", "浦和", "門別", "盛岡", "水沢", "金沢", "笠松", "名古屋", "園田", "高知", "佐賀", "帯広"]
-    for t in tracks:
-        if t in full_text:
-            track_name = t
-            break
-
-    dist_m = re.search(r"(\d{3,4})m", full_text)
-    if dist_m:
-        distance = int(dist_m.group(1))
-
-    if "ダ" in full_text or "ダート" in full_text:
-        course_type = "ダート"
-    elif "芝" in full_text:
-        course_type = "芝"
-    elif "障" in full_text or "障害" in full_text:
-        course_type = "障害"
-
-    horses_map = {}
-    rows_base = soup_base.find_all("tr", class_="HorseList")
-    if not rows_base:
-        rows_base = [tr for tr in soup_base.find_all("tr") if tr.find("a", href=lambda h: h and "/horse/" in h)]
-
-    for r_idx, row in enumerate(rows_base):
-        tds = row.find_all("td")
-        if len(tds) < 6:
-            # フッターや投票カート行などの補助行をスキップ
-            continue
-
-        h_a = row.find("a", href=lambda h: h and "/horse/" in h)
-        if not h_a or not h_a.text.strip():
-            continue
-        h_name = h_a.text.strip()
-
-        # 重複行防止（先頭の正規行のみを保持）
-        if h_name in horses_map:
-            continue
-
-        # 馬番
-        umaban_str = ""
-        umaban_el = row.find("td", class_=re.compile(r"Umaban\d*"))
-        if umaban_el and umaban_el.text.strip().isdigit():
-            umaban_str = umaban_el.text.strip()
-        elif len(tds) >= 2 and tds[1].text.strip().isdigit():
-            umaban_str = tds[1].text.strip()
-        elif len(tds) >= 1 and tds[0].text.strip().isdigit():
-            umaban_str = tds[0].text.strip()
-
-        try:
-            umaban = int(umaban_str) if umaban_str else (len(horses_map) + 1)
-        except Exception:
-            umaban = len(horses_map) + 1
-
-        # 枠番
-        waku = str(((umaban - 1) // 2) + 1)
-        waku_el = row.find("td", class_=re.compile(r"Waku\d*"))
-        if waku_el and waku_el.text.strip():
-            waku = waku_el.text.strip()
-
-        # 騎手名（フルネーム正規化）
-        jockey_raw = "騎手未定"
-        j_a = row.find("a", href=lambda h: h and "/jockey/" in h)
-        if j_a:
-            jockey_raw = j_a.get("title") or j_a.text.strip()
-        else:
-            j_td = row.find("td", class_="Jockey")
-            if j_td:
-                lines = [l.strip() for l in j_td.text.split() if l.strip()]
-                for l in lines:
-                    if not re.search(r"(\d|牝|牡|セ|栗|鹿|芦|黒)", l) and 2 <= len(l) <= 8:
-                        jockey_raw = l
-                        break
-        jockey_full = normalize_jockey_name(jockey_raw)
-
-        # 斤量
-        weight_val = 55.0
-        j_td = row.find("td", class_="Jockey")
-        if j_td:
-            w_m = re.search(r"(\d{2}\.\d)", j_td.text)
-            if w_m:
-                weight_val = float(w_m.group(1))
-        if weight_val == 55.0:
-            for td in tds:
-                txt = td.text.strip()
-                if re.match(r"^\d{2}\.\d$", txt):
-                    try:
-                        weight_val = float(txt)
-                        break
-                    except Exception:
-                        pass
-
-        # 単勝オッズ & 単勝人気
-        odds_val = 10.0
-        pop_val = None
-
-        # 1. 専用ID・クラスから探索
-        odds_el = row.find("span", id=re.compile(r"odds-")) or row.find("td", class_=re.compile(r"Odds"))
-        if odds_el and re.match(r"^\d+\.?\d*$", odds_el.text.strip()):
-            try:
-                odds_val = float(odds_el.text.strip())
-            except Exception:
-                pass
-
-        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_=re.compile(r"Popular_Ninki|Ninki"))
-        if pop_el and pop_el.text.strip().isdigit():
-            pop_val = int(pop_el.text.strip())
-
-        # 2. セル内容からの直接探索 (shutuba.html のオッズ・人気セル)
-        # ※ idx_t < 8 は馬番・馬名・性齢・斤量・騎手等のためスキップ（55.0等の斤量誤認を防止）
-        all_td_texts = [td.text.strip() for td in tds]
-        for idx_t, txt_t in enumerate(all_td_texts):
-            if idx_t < 8:
-                continue
-            # オッズパターン (例: 82.4, 6.0, 105.2)
-            if re.match(r"^\d{1,4}\.\d$", txt_t):
-                try:
-                    cand_odds = float(txt_t)
-                    if cand_odds > 0:
-                        odds_val = cand_odds
-                        if idx_t + 1 < len(all_td_texts) and all_td_texts[idx_t + 1].isdigit():
-                            pop_val = int(all_td_texts[idx_t + 1])
-                except Exception:
-                    pass
-            # 人気パターン (例: "(13人気)" や "13人気")
-            pop_match = re.search(r"\(?(\d{1,2})人気\)?", txt_t)
-            if pop_match:
-                pop_val = int(pop_match.group(1))
-
-        horses_map[h_name] = {
-            "枠番": waku,
-            "馬番": umaban,
-            "馬名": h_name,
-            "騎手名": jockey_full,
-            "斤量": weight_val,
-            "脚質": "先行",
-            "単勝オッズ": odds_val,
-            "単勝人気": pop_val,
-            "能力指数": 75
-        }
-
-    # 過去レースやオッズ確定後のレース（result.html）が存在する場合、結果テーブルから確定オッズ・確定人気・騎手名・着順・払戻金を補完
-    scraped_actual_ranks = {}
-    scraped_official_payouts = {}
-    need_result_check = any(h["単勝人気"] is None for h in horses_map.values()) or "result.html" in clean_url
-    if need_result_check:
-        try:
-            resp_res = requests.get(url_result, headers=headers, timeout=8)
-            if resp_res.status_code == 200:
-                html_res = ""
-                for enc in ["utf-8", "euc-jp", "cp932"]:
-                    try:
-                        cand = resp_res.content.decode(enc)
-                        if "レース" in cand or "競馬" in cand or "払戻" in cand:
-                            html_res = cand
-                            break
-                    except Exception:
-                        pass
-                if not html_res:
-                    html_res = resp_res.content.decode("utf-8", errors="ignore")
-                soup_res = BeautifulSoup(html_res, "html.parser")
-                main_table = soup_res.find("table", id="All_Result_Table") or soup_res.find("table", class_="RaceTable01")
-                if main_table:
-                    for tr in main_table.find_all("tr"):
-                        h_a = tr.find("a", href=lambda h: h and "/horse/" in h)
-                        if not h_a:
-                            continue
-                        h_name = h_a.text.strip()
-                        tds = [td.text.strip() for td in tr.find_all("td")]
-                        if tds and tds[0].isdigit():
-                            scraped_actual_ranks[h_name] = int(tds[0])
-                        if h_name in horses_map:
-                            if len(tds) >= 11:
-                                # 人気
-                                if tds[9].isdigit():
-                                    horses_map[h_name]["単勝人気"] = int(tds[9])
-                                # オッズ
-                                if re.match(r"^\d+\.?\d*$", tds[10]):
-                                    try:
-                                        horses_map[h_name]["単勝オッズ"] = float(tds[10])
-                                    except Exception:
-                                        pass
-                                # 騎手フルネームも補強
-                                j_a_res = tr.find("a", href=lambda h: h and "/jockey/" in h)
-                                if j_a_res and j_a_res.text.strip():
-                                    horses_map[h_name]["騎手名"] = normalize_jockey_name(j_a_res.text.strip())
-
-                # 公式確定払戻金テーブルを解析
-                parsed_pay = parse_payout_tables(soup_res)
-                if parsed_pay:
-                    scraped_official_payouts = parsed_pay
-        except Exception:
-            pass
-
-    # 最終的な人気の確定（未設定の場合は馬番）
-    for h in horses_map.values():
-        if h["単勝人気"] is None:
-            h["単勝人気"] = min(18, h["馬番"])
-
-    # 2. 馬柱ページ (shutuba_past.html) を取得して過去5走・上がり3F・脚質をマージ
-    past_records_map = {}
-    try:
-        resp_past = requests.get(url_past, headers=headers, timeout=12)
-        if resp_past.status_code == 200:
-            html_past = ""
-            for enc in ["utf-8", "euc-jp", "cp932"]:
-                try:
-                    cand = resp_past.content.decode(enc)
-                    if "レース" in cand or "競馬" in cand:
-                        html_past = cand
-                        break
-                except Exception:
-                    pass
-            if not html_past:
-                html_past = resp_past.content.decode("utf-8", errors="ignore")
-            soup_past = BeautifulSoup(html_past, "html.parser")
-            rows_past = soup_past.find_all("tr", class_="HorseList")
-            if not rows_past:
-                rows_past = [tr for tr in soup_past.find_all("tr") if tr.find("a", href=lambda h: h and "/horse/" in h)]
-
-            for row in rows_past:
-                h_a = row.find("a", href=lambda h: h and "/horse/" in h)
-                if not h_a or not h_a.text.strip():
-                    continue
-                h_name = h_a.text.strip()
-
-                past_tds = row.find_all("td", class_="Past")
-                past_parsed = []
-                for ptd in past_tds[:3]:
-                    rank_num = None
-                    rk_m = re.search(r"(\d{1,2})着", ptd.text)
-                    if rk_m:
-                        rank_num = int(rk_m.group(1))
-                    else:
-                        for cls in ptd.get("class", []):
-                            if "Ranking_" in cls:
-                                try:
-                                    rank_num = int(cls.replace("Ranking_", ""))
-                                except Exception:
-                                    pass
-                    summary_text = " ".join(ptd.text.split())
-                    if not rank_num:
-                        rank_fall = re.search(r"\b(\d{1,2})\b", summary_text)
-                        if rank_fall and int(rank_fall.group(1)) <= 18:
-                            rank_num = int(rank_fall.group(1))
-
-                    d02 = ptd.find("div", class_="Data02")
-                    d05 = ptd.find("div", class_="Data05")
-                    d06 = ptd.find("div", class_="Data06")
-                    r_name_str = " ".join(d02.text.split()) if d02 else ""
-                    dist_time_str = " ".join(d05.text.split()) if d05 else ""
-
-                    if not r_name_str and not dist_time_str:
-                        dist_sub = re.search(r"(ダ|芝)?(\d{4})m?", summary_text)
-                        r_name_str = dist_sub.group(0) if dist_sub else ""
-
-                    agari_m = re.search(r"\(([34]\d\.\d)\)", summary_text)
-                    agari = f"上り{agari_m.group(1)}s" if agari_m else ""
-                    pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", summary_text)
-                    pass_order = pass_m.group(1) if pass_m else ""
-
-                    past_parsed.append({
-                        "rank_num": rank_num,
-                        "rank_str": f"{rank_num}着" if rank_num else "出走",
-                        "summary": f"{r_name_str} {dist_time_str}".strip() or summary_text[:25],
-                        "agari": agari,
-                        "pass_order": pass_order
-                    })
-
-                # 脚質判定
-                style = "先行"
-                if past_parsed and past_parsed[0]["pass_order"]:
-                    po = past_parsed[0]["pass_order"]
-                    try:
-                        first_pos = int(po.split("-")[0])
-                        if first_pos == 1:
-                            style = "逃げ"
-                        elif first_pos <= 4:
-                            style = "先行"
-                        elif first_pos <= 9:
-                            style = "差し"
-                        else:
-                            style = "追込"
-                    except Exception:
-                        pass
-                if h_name in horses_map:
-                    horses_map[h_name]["脚質"] = style
-
-                # 前走・前々走サマリー
-                last_str = "前走: データなし"
-                second_str = "前々走: データなし"
-                boost = 0.0
-                trend = "✨ 安定堅実"
-                suit = "○ 標準適性"
-
-                if past_parsed:
-                    p0 = past_parsed[0]
-                    components = [p0['summary'], p0['rank_str'], p0['agari']]
-                    last_str = "前走: " + " ".join([c for c in components if c])
-                    if p0["rank_num"] == 1:
-                        boost += 2.5
-                        trend = "🔥 前走1着 (連勝の勢い)"
-                        suit = "◎ コース適性抜群"
-                    elif p0["rank_num"] in [2, 3]:
-                        boost += 1.8
-                        trend = "✨ 前走好走 (安定充実)"
-                        suit = "◎ 舞台好相性"
-                    elif p0["rank_num"] in [4, 5]:
-                        boost += 0.8
-                        trend = "⚖️ 掲示板確保 (巻き返し十分)"
-                        suit = "○ 距離適性あり"
-                    elif p0["rank_num"] and p0["rank_num"] >= 10:
-                        boost -= 1.5
-                        trend = "⚠️ 前走大敗 (巻き返し課題)"
-                        suit = "▲ 展開の助け要"
-
-                    if len(past_parsed) > 1:
-                        p1 = past_parsed[1]
-                        second_str = "前々走: " + " ".join([c for c in [p1['summary'], p1['rank_str']] if c])
-                        if p1["rank_num"] and p1["rank_num"] <= 3 and p0["rank_num"] and p0["rank_num"] <= 3:
-                            boost += 1.0
-                            trend = "🔥 2走連続好走 (充実一途)"
-
-                source_label = "🌐 地方競馬公式実戦データ" if is_nar else "🌐 netkeiba公式実戦データ"
-                past_records_map[h_name] = {
-                    "last_race": last_str,
-                    "second_last": second_str,
-                    "course_suitability": suit,
-                    "form_trend": trend,
-                    "key_point": f"{last_str}。実戦データに基づくWeb公式戦績精査済。",
-                    "ability_boost": round(float(boost), 1),
-                    "source": source_label
-                }
-    except Exception:
-        pass
-
-    sorted_horses = sorted(list(horses_map.values()), key=lambda x: x["馬番"])
-    if not sorted_horses:
-        return None, "出走馬データを抽出できませんでした。URLをご確認ください。"
-
-    return {
-        "race_name": race_name or "レース",
-        "track_name": track_name,
-        "course_type": course_type,
-        "distance": distance,
-        "horses": sorted_horses,
-        "past_records": past_records_map,
-        "actual_ranks": scraped_actual_ranks if scraped_actual_ranks else None,
-        "official_payouts": scraped_official_payouts if scraped_official_payouts else None
-    }, None
-
-def parse_horses_from_text(raw_text: str) -> list[dict]:
-
-    """Gemini/ChatGPT等のJSONまたはテキスト出力から出走馬データを柔軟に抽出"""
-    raw = raw_text.strip()
-    if not raw:
-        raise ValueError("入力テキストが空です。")
-
-    # ```json ... ``` などのコードブロック抽出
-    if "```" in raw:
-        parts = raw.split("```")
-        for p in parts:
-            p_strip = p.strip()
-            if p_strip.startswith("json"):
-                p_strip = p_strip[4:].strip()
-            if p_strip.startswith("[") and p_strip.endswith("]"):
-                raw = p_strip
-                break
-
-    # [ から ] までのJSON配列を探索
-    start_idx = raw.find("[")
-    end_idx = raw.rfind("]")
-    extracted_data = []
-
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        json_candidate = raw[start_idx:end_idx + 1]
-        try:
-            extracted_data = json.loads(json_candidate)
-        except Exception:
-            extracted_data = []
-
-    parsed_list = []
-
-    if isinstance(extracted_data, list) and len(extracted_data) > 0:
-        for item in extracted_data:
-            if not isinstance(item, dict):
-                continue
-            parsed_list.append({
-                "馬番": int(item.get("馬番", len(parsed_list) + 1)),
-                "馬名": str(item.get("馬名", f"馬{len(parsed_list) + 1}")),
-                "単勝人気": int(item.get("単勝人気", len(parsed_list) + 1)),
-                "騎手名": str(item.get("騎手名", "騎手")),
-                "脚質": item.get("脚質", "先行") if item.get("脚質") in ["逃げ", "先行", "差し", "追込"] else "先行",
-            })
-
-    # JSONパースに失敗した場合の行ベースフォールバック（netkeibaテキスト等）
-    if not parsed_list:
-        lines = [ln.strip() for ln in raw_text.strip().splitlines() if ln.strip()]
-        for ln in lines:
-            if "馬番" in ln and "馬名" in ln:
-                continue
-            tokens = [tk.strip() for tk in ln.replace("\t", " ").replace(",", " ").replace("|", " ").split(" ") if tk.strip()]
-            if len(tokens) >= 2:
-                try:
-                    h_no = int(tokens[0])
-                    h_name = tokens[1]
-                    h_pop = int(tokens[2]) if len(tokens) >= 3 and tokens[2].isdigit() else (len(parsed_list) + 1)
-                    parsed_list.append({
-                        "馬番": h_no,
-                        "馬名": h_name,
-                        "単勝人気": h_pop,
-                        "騎手名": tokens[3] if len(tokens) >= 4 else "騎手",
-                        "脚質": "先行",
-                    })
-                except Exception:
-                    continue
-
-    if not parsed_list:
-        raise ValueError("出走馬データを抽出できませんでした。JSON形式または出馬表テキストをご確認ください。")
-
-    return parsed_list
-
-with st.expander("🌐 **【Web・画像から出走馬を一括自動入力】netkeiba URL取得 (おすすめ！過去走・オッズ完全取得) / スクショ解析**", expanded=True):
-    tab_url, tab_img_api, tab_paste_text = st.tabs([
-        "🌐 netkeiba URLから全自動取得 (★超おすすめ！本物の過去走・オッズ一括取得)",
-        "📷 出馬表スクショをアップロード (API自動抽出)",
-        "📋 Web版Gemini/ChatGPTの出力を貼り付け (無料無制限・レートリミット回避！)"
-    ])
-
-    with tab_url:
-        st.markdown(
-            """
-            ##### 🚀 netkeibaの出馬表URLを1行貼るだけで、全頭の「本物の過去走・前走着順・上りタイム・斤量」を1秒で全自動取得！
-            中央競馬 (`race.netkeiba.com`) および 地方競馬 (`nar.netkeiba.com`) に完全対応。  
-            手入力や画像アップロードの手間ゼロで、**公式実戦データに基づいた本物の過去走精査** が可能になります。
-            """
-        )
-        url_input = st.text_input(
-            "netkeibaの出走表URL (例: https://race.netkeiba.com/race/shutuba.html?race_id=...)",
-            placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605040411",
-            key="netkeiba_url_input"
-        )
-        col_u1, col_u2 = st.columns([1.5, 1.0])
-        with col_u1:
-            btn_fetch_url = st.button("📥 レース情報＆全頭の本物過去走を一括取得", type="primary", use_container_width=True)
-        with col_u2:
-            btn_sample_url = st.button("💡 サンプルURL（アイルランドT）で試す", use_container_width=True, key="btn_sample_url")
-
-        if btn_sample_url:
-            st.session_state["netkeiba_url_input"] = "https://race.netkeiba.com/race/shutuba.html?race_id=202605040411"
-            st.rerun()
-
-        if btn_fetch_url:
-            if not url_input.strip():
-                st.warning("⚠️ netkeibaのレースURLを入力してください。")
-            else:
-                with st.spinner("🌐 netkeibaからレース情報・全出走馬・本物の過去走データを取得・精査中..."):
-                    res_data, err = fetch_netkeiba_race(url_input.strip())
-                    if err:
-                        st.error(f"⚠️ {err}")
-                    else:
-                        horses_df = pd.DataFrame(res_data["horses"])
-                        st.session_state["horses_data"] = horses_df
-                        st.session_state["netkeiba_past_records"] = res_data["past_records"]
-                        st.session_state["detected_track"] = res_data["track_name"]
-                        st.session_state["detected_course_type"] = res_data["course_type"]
-                        st.session_state["current_distance"] = res_data["distance"]
-                        st.session_state["predicted_results"] = None
-                        st.session_state["has_run_prediction"] = False
-                        st.session_state["scraped_actual_ranks"] = res_data.get("actual_ranks")
-                        st.session_state["scraped_official_payouts"] = res_data.get("official_payouts")
-                        
-                        extra_msg = ""
-                        if res_data.get("actual_ranks"):
-                            extra_msg += f" ｜ 🎯 確定着順（{len(res_data['actual_ranks'])}頭分）も自動検知済"
-                        if res_data.get("official_payouts"):
-                            extra_msg += " ｜ 💵 公式確定払戻金も自動同期済"
-                        st.success(f"🎉 **{res_data['race_name']}**（{res_data['track_name']} {res_data['course_type']}{res_data['distance']}m）の出走馬 {len(horses_df)}頭分と本物の過去走データを完璧に取得しました！{extra_msg}")
-                        st.rerun()
-
-
-    with tab_img_api:
-        col_upload, col_preview = st.columns([1.2, 1.0])
-
-        with col_upload:
-            uploaded_file = st.file_uploader(
-                "競馬新聞やnetkeiba・JRA公式サイトの出馬表スクショをアップロード",
-                type=["png", "jpg", "jpeg", "webp"]
-            )
-            col_btn1, col_btn2 = st.columns(2)
-            with col_btn1:
-                btn_analyze = st.button("✨ 画像から出走馬を自動抽出", type="secondary", disabled=(uploaded_file is None))
-            with col_btn2:
-                btn_demo = st.button("💡 サンプル出馬表で試す", help="G1有力馬6頭のデモデータをセット", key="btn_demo_api")
-
-        with col_preview:
-            if uploaded_file is not None:
-                image = Image.open(uploaded_file)
-                st.image(image, caption="アップロードされた出馬表", use_container_width=True)
-
-        if btn_demo:
-            st.session_state["horses_data"] = pd.DataFrame([
-                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "騎手名": "武豊", "脚質": "差し"},
-                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
-                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "騎手名": "川田将雅", "脚質": "差し"},
-                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "騎手名": "坂井瑠星", "脚質": "追込"},
-                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "騎手名": "横山和生", "脚質": "逃げ"},
-                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "騎手名": "モレイラ", "脚質": "先行"},
-            ])
-            st.session_state["predicted_results"] = None
-            st.session_state["has_run_prediction"] = False
-            st.success("🎉 デモ出馬表（G1有力馬6頭）を読み込みました！")
-            st.rerun()
-
-        if btn_analyze and uploaded_file is not None:
-            if not gemini_api_key:
-                st.warning("⚠️ 画像から直接自動解析するには、サイドバーの「Gemini API Key」が必要です。キーがない・API制限時は「📋 Web版Geminiの出力を貼り付け」タブをご利用ください。")
-            else:
-                with st.spinner("🔍 AIが出馬表画像を解析中...（混雑時は自動で別モデルに切り替えて再試行します）"):
-                    try:
-                        from google import genai
-                        from google.genai import types
-
-                        client = genai.Client(api_key=gemini_api_key)
-                        uploaded_file.seek(0)
-                        img_bytes = uploaded_file.read()
-
-                        prompt = """
-                        この画像は競馬の出馬表です。
-                        画像から各出走馬の情報を読み取り、以下のJSON形式のみ（純粋なJSON配列）で出力してください。
-
-                        [
-                          {
-                            "馬番": 1,
-                            "馬名": "馬名",
-                            "単勝人気": 1 (単勝人気。不明ならオッズや実績から1〜18の整数),
-                            "騎手名": "騎手名 (例: ルメール、川田、武豊)",
-                            "脚質": "逃げ" または "先行" または "差し" または "追込" (推定)
-                          }
-                        ]
-                        注意: 最大18頭まで抽出してください。マークダウンタグはつけず、純粋なJSON文字列のみ出力してください。
-                        """
-
-                        if "2.0" in gemini_model_choice:
-                            models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
-                        elif "1.5" in gemini_model_choice:
-                            models_to_try = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
-                        elif "2.5" in gemini_model_choice:
-                            models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-                        else:
-                            models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
-
-                        response = None
-                        last_error = None
-                        used_model = None
-
-                        for m_name in models_to_try:
-                            for attempt in range(2):
-                                try:
-                                    response = client.models.generate_content(
-                                        model=m_name,
-                                        contents=[
-                                            types.Part.from_bytes(data=img_bytes, mime_type=uploaded_file.type or "image/png"),
-                                            prompt
-                                        ]
-                                    )
-                                    if response and response.text:
-                                        used_model = m_name
-                                        break
-                                except Exception as ex:
-                                    last_error = ex
-                                    err_str = str(ex)
-                                    if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                                        time.sleep(1.5)
-                                        continue
-                                    else:
-                                        break
-                            if response and response.text:
-                                break
-
-                        if response is None or not response.text:
-                            if last_error:
-                                raise last_error
-                            else:
-                                raise RuntimeError("AIモデルからの応答を取得できませんでした。")
-
-                        parsed_list = parse_horses_from_text(response.text)
-                        st.session_state["horses_data"] = pd.DataFrame(parsed_list)
-                        st.session_state["predicted_results"] = None
-                        st.session_state["has_run_prediction"] = False
-                        st.success(f"🎉 出馬表から {len(parsed_list)} 頭の出走馬データを抽出しました！（モデル: {used_model}）")
-                        st.rerun()
-                    except Exception as e:
-                        err_msg = str(e)
-                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                            st.error(
-                                "⚠️ **API利用枠（レートリミット）に達しました。**\n\n"
-                                "💡 **解決策**: 隣のタブ **「📋 Web版Gemini/ChatGPTの出力を貼り付け」** をご利用ください！\n"
-                                "ブラウザの [Google Gemini (無料)](https://gemini.google.com/) に出馬表画像を貼り付けて出力されたテキストをコピペするだけで、**API制限なし・完全無料・無制限**で一瞬で取り込めます。"
-                            )
-                        elif "503" in err_msg or "UNAVAILABLE" in err_msg:
-                            st.error("⚠️ **Google Geminiサーバーが混雑中です（503）。** 隣の「📋 Web版Geminiの出力を貼り付け」タブのご利用もおすすめです。")
-                        elif "API_KEY_INVALID" in err_msg or "400" in err_msg:
-                            st.error(f"⚠️ **APIキーの確認が必要です**: {err_msg}")
-                        else:
-                            st.error(f"解析中にエラーが発生しました: {err_msg}")
-
-    # ------------------------------------------
-    # タブ2: Web版Gemini/ChatGPTの貼り付け入力
-    # ------------------------------------------
-    with tab_paste_text:
-        st.markdown(
-            """
-            #### 🌟 完全無料・無制限！Web版AIからコピペで一発入力
-            APIキーの利用制限（429エラー）を完全に回避できます。  
-            ブラウザで **[Google Gemini (無料)](https://gemini.google.com/)** または **ChatGPT** に出馬表スクショを送り、出力されたテキストをここに貼り付けてください。
-            """
-        )
-
-        with st.expander("📋 **【手順 1】ブラウザ版AIに送る指示文 (プロンプトをコピー)**", expanded=False):
-            st.caption("以下の指示文をコピーして、ブラウザ版Geminiに出馬表画像と一緒に送信してください：")
-            prompt_for_web = """この画像は競馬の出馬表です。
-画像から全出走馬の情報を読み取り、以下のJSON形式のみ（純粋なJSON配列）で出力してください。
-
-[
-  {
-    "馬番": 1,
-    "馬名": "馬名",
-    "単勝人気": 1,
-    "騎手名": "騎手名",
-    "脚質": "逃げ/先行/差し/追込のいずれか"
-  }
-]
-解説文やマークダウンタグはつけず、純粋なJSON配列のみを出力してください。"""
-            st.code(prompt_for_web, language="text")
-
-        st.caption("【手順 2】ブラウザ版AIから返ってきた出力結果をここに貼り付けてください：")
-        pasted_content = st.text_area(
-            "貼り付けエリア",
-            height=160,
-            placeholder='ここに [ {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"} ] を貼り付けます',
-            key="text_area_pasted_horses"
-        )
-
-        col_p1, col_p2 = st.columns([1.5, 1.0])
-        with col_p1:
-            btn_apply_paste = st.button("📥 貼り付けたデータを出走馬一覧に反映する", type="primary", use_container_width=True)
-        with col_p2:
-            btn_demo_paste = st.button("💡 デモ出馬表をセット", key="btn_demo_paste", use_container_width=True)
-
-        if btn_demo_paste:
-            st.session_state["horses_data"] = pd.DataFrame([
-                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "騎手名": "武豊", "脚質": "差し"},
-                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
-                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "騎手名": "川田将雅", "脚質": "差し"},
-                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "騎手名": "坂井瑠星", "脚質": "追込"},
-                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "騎手名": "横山和生", "脚質": "逃げ"},
-                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "騎手名": "モレイラ", "脚質": "先行"},
-            ])
-            st.session_state["predicted_results"] = None
-            st.session_state["has_run_prediction"] = False
-            st.success("🎉 デモ出馬表を読み込みました！")
-            st.rerun()
-
-        if btn_apply_paste:
-            if not pasted_content.strip():
-                st.warning("⚠️ 貼り付けエリアにテキストを入力してください。")
-            else:
-                try:
-                    parsed_list = parse_horses_from_text(pasted_content)
-                    st.session_state["horses_data"] = pd.DataFrame(parsed_list)
-                    st.session_state["predicted_results"] = None
-                    st.session_state["has_run_prediction"] = False
-                    st.success(f"🎉 貼り付けたテキストから {len(parsed_list)} 頭の出走馬データを一括反映しました！")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"データの読み込みに失敗しました: {ex}")
-
-# ==========================================
-# 4. 出走馬データ入力テーブル
-# ==========================================
-st.subheader("📋 出走馬データ")
-st.caption("💡 **脚質（逃げ・先行・差し・追込）は、新聞やnetkeibaの通過順（1-1-1なら逃げ、10-10-8なら差し/追込等）を見て自分で選ぶと的中率が大幅に向上します！**")
-
-if st.session_state.get("netkeiba_past_records"):
-    count_p = len(st.session_state["netkeiba_past_records"])
-    st.info(f"🌐 **netkeiba公式データ連携稼働中**: 全{count_p}頭分の【本物の過去走・前走着順・上り3Fタイム】を保持しています。予想実行時に全自動で精査・能力指数へダイレクト反映されます。")
-
-
-current_data = st.session_state["horses_data"].copy()
-current_data = current_data.loc[:, ~current_data.columns.duplicated()]
-required_cols = ["馬番", "馬名", "単勝人気", "騎手名", "脚質"]
-existing_cols = [c for c in required_cols if c in current_data.columns]
-current_data = current_data[existing_cols]
-
-column_config = {
-    "馬番": st.column_config.NumberColumn("馬番", min_value=1, max_value=18, step=1, format="%d", required=True),
-    "馬名": st.column_config.TextColumn("馬名", required=True),
-    "単勝人気": st.column_config.NumberColumn("単勝人気 (1〜18)", min_value=1, max_value=18, step=1, format="%d位", required=True),
-    "騎手名": st.column_config.TextColumn("騎手名", required=True),
-    "脚質": st.column_config.SelectboxColumn("脚質 (自分で選択)", options=["逃げ", "先行", "差し", "追込"], required=True, help="競馬新聞の脚質や通過順を見て選んでください"),
-}
-
-edited_df = st.data_editor(
-    current_data,
-    column_config=column_config,
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True
-)
-
-# ==========================================
 # 5. スコアリング＆予測関数
 # ==========================================
 PACE_MATRIX = {
@@ -3543,6 +2671,878 @@ def calculate_predictions(
     }
     return result_df, meta
 
+
+# ==========================================
+# 3. メインエリア (タイトル & 画像アップロード)
+# ==========================================
+if app_mode == "🏆 WIN5 攻略シミュレーター (予算3,000〜5,000円)":
+    render_win5_simulator(calculate_predictions, st.session_state["learned_weights"])
+    st.stop()
+
+st.title("🏇 競馬着順予測AIシミュレータ")
+st.caption(f"📱 **スマホでもそのまま使えます！** 同じWi-Fiに繋いだスマホで `{mobile_url}` を開くか、左上メニュー（>）内のQRコードをカメラで読み取ってください。")
+st.markdown(
+    """
+    出馬表の**「人気」「騎手名」**を入力（または**出馬表スクショをアップロード**）して着順を予想！
+    レース後は**「実際の結果」を入力することでAIがレース結果を自己学習**し、最適な予想アルゴリズムへと自動進化します。
+    """
+)
+
+# セッション状態の出走馬データ初期化 (新聞を見て選べる5項目のみ)
+if "horses_data" not in st.session_state or "適性距離" in st.session_state["horses_data"].columns:
+    st.session_state["horses_data"] = pd.DataFrame([
+        {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+        {"馬番": 2, "馬名": "コントレイル", "単勝人気": 2, "騎手名": "川田将雅", "脚質": "差し"},
+        {"馬番": 3, "馬名": "キセキ", "単勝人気": 4, "騎手名": "武豊", "脚質": "逃げ"},
+        {"馬番": 4, "馬名": "クロノジェネシス", "単勝人気": 3, "騎手名": "坂井瑠星", "脚質": "先行"},
+        {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "騎手名": "池添謙一", "脚質": "追込"},
+    ])
+
+def parse_payout_tables(soup: BeautifulSoup) -> dict:
+    """
+    netkeibaの確定レース結果ページ（result.html）から
+    公式確定払戻金（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）を高精度に抽出・構造化。
+    """
+    payouts = {}
+    p_tables = soup.find_all("table", class_="Payout_Detail_Table")
+    if not p_tables:
+        p_tables = soup.find_all("table", class_="PayBack_Table")
+
+    for t in p_tables:
+        for tr in t.find_all("tr"):
+            th = tr.find("th")
+            if not th:
+                continue
+            label = th.text.strip()
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+
+            combos_lines = [l.strip() for l in tds[0].get_text(separator="\n").splitlines() if l.strip()]
+            pays_raw = tds[1].get_text(separator="\n")
+            pays_nums = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)円", pays_raw)]
+            if not pays_nums:
+                pays_nums = [int(p.replace(",", "")) for p in re.findall(r"\b(\d{1,3}(?:,\d{3})+|\d+)\b", pays_raw) if int(p.replace(",", "")) >= 100]
+
+            if label == "単勝" and pays_nums:
+                h_no = int(re.search(r"\d+", combos_lines[0]).group(0)) if combos_lines else None
+                if h_no:
+                    payouts["単勝"] = {h_no: pays_nums[0]}
+            elif label == "複勝" and pays_nums:
+                fuk_map = {}
+                for idx_f, c_line in enumerate(combos_lines[:len(pays_nums)]):
+                    m = re.search(r"\d+", c_line)
+                    if m:
+                        fuk_map[int(m.group(0))] = pays_nums[idx_f]
+                payouts["複勝"] = fuk_map
+            elif label == "馬連" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 2:
+                    payouts["馬連"] = {frozenset([nums[0], nums[1]]): pays_nums[0]}
+            elif label == "ワイド" and pays_nums:
+                wide_map = {}
+                pair_idx = 0
+                for c_line in combos_lines:
+                    nums = [int(x) for x in re.findall(r"\d+", c_line)]
+                    if len(nums) == 2 and pair_idx < len(pays_nums):
+                        wide_map[frozenset(nums)] = pays_nums[pair_idx]
+                        pair_idx += 1
+                if not wide_map and len(combos_lines) >= len(pays_nums) * 2:
+                    nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                    for i in range(min(len(pays_nums), len(nums) // 2)):
+                        wide_map[frozenset([nums[i*2], nums[i*2+1]])] = pays_nums[i]
+                payouts["ワイド"] = wide_map
+            elif label == "馬単" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 2:
+                    payouts["馬単"] = {(nums[0], nums[1]): pays_nums[0]}
+            elif label == "3連複" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 3:
+                    payouts["3連複"] = {frozenset(nums[:3]): pays_nums[0]}
+            elif label == "3連単" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 3:
+                    payouts["3連単"] = {(nums[0], nums[1], nums[2]): pays_nums[0]}
+
+    return payouts
+
+def fetch_netkeiba_race(url: str):
+    """
+    【Web公式競馬データ連動エンジン（ハイブリッド高精度解析）】
+    netkeibaの出走表URL（または結果URL）から、基本出馬表（shutuba.html）、馬柱5走（shutuba_past.html）、
+    レース結果（result.html）を自動統合・ハイブリッド解析。
+    - 単勝人気・オッズ: 公式出馬表および結果テーブルから本物の単勝人気・確定オッズを正確に抽出（馬番フォールバック完全解消）
+    - 騎手名: JRA短縮表記や地方競馬表記を「安藤洋一」「津村明秀」「西村淳也」などの完全フルネームに正規化
+    - 過去走・脚質: 馬柱5走ページから過去戦績・走破タイム・上がり3F・通過順・脚質を完全マージ
+    - 中央競馬 (race.netkeiba.com) / 地方競馬 (nar.netkeiba.com) の両方に完全対応。
+    """
+    clean_url = url.strip()
+    if not clean_url:
+        return None, "URLが入力されていません"
+
+    is_nar = "nar.netkeiba.com" in clean_url
+    domain = "nar.netkeiba.com" if is_nar else "race.netkeiba.com"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    r_id_m = re.search(r"race_id=([a-zA-Z0-9]+)", clean_url)
+    if not r_id_m:
+        return None, "URLにrace_idが含まれていません。netkeibaのレースURLを確認してください。"
+    race_id = r_id_m.group(1)
+
+    url_shutuba = f"https://{domain}/race/shutuba.html?race_id={race_id}"
+    url_past = f"https://{domain}/race/shutuba_past.html?race_id={race_id}"
+    url_result = f"https://{domain}/race/result.html?race_id={race_id}"
+
+    # 1. 出馬表 (shutuba.html) を取得（基本枠番・馬番・馬名・騎手フルネーム・斤量・公式オッズ・公式人気）
+    html_base = ""
+    try:
+        resp_base = requests.get(url_shutuba, headers=headers, timeout=12)
+        if resp_base.status_code == 200:
+            for enc in ["utf-8", "euc-jp", "cp932"]:
+                try:
+                    cand = resp_base.content.decode(enc)
+                    if "レース" in cand or "競馬" in cand or "出馬表" in cand:
+                        html_base = cand
+                        break
+                except Exception:
+                    pass
+            if not html_base:
+                html_base = resp_base.content.decode("utf-8", errors="ignore")
+    except Exception as e:
+        return None, f"出馬表の取得に失敗しました: {e}"
+
+    if not html_base:
+        return None, "出馬表HTMLを取得できませんでした。"
+
+    soup_base = BeautifulSoup(html_base, "html.parser")
+
+    # レース名・コース条件の抽出
+    race_name = ""
+    race_name_el = soup_base.find("h1", class_="RaceName") or soup_base.find("div", class_="RaceName")
+    if race_name_el:
+        race_name = race_name_el.text.strip()
+
+    race_data_el = soup_base.find("div", class_="RaceData01") or soup_base.find("div", class_="RaceData02")
+    race_meta = race_data_el.text.strip() if race_data_el else ""
+    page_title = soup_base.title.text.strip() if soup_base.title else ""
+    full_text = f"{race_name} {race_meta} {page_title}"
+
+    track_name = "東京"
+    course_type = "芝"
+    distance = 1600
+
+    tracks = ["東京", "中山", "京都", "阪神", "新潟", "福島", "中京", "小倉", "札幌", "函館",
+              "大井", "川崎", "船橋", "浦和", "門別", "盛岡", "水沢", "金沢", "笠松", "名古屋", "園田", "高知", "佐賀", "帯広"]
+    for t in tracks:
+        if t in full_text:
+            track_name = t
+            break
+
+    dist_m = re.search(r"(\d{3,4})m", full_text)
+    if dist_m:
+        distance = int(dist_m.group(1))
+
+    if "ダ" in full_text or "ダート" in full_text:
+        course_type = "ダート"
+    elif "芝" in full_text:
+        course_type = "芝"
+    elif "障" in full_text or "障害" in full_text:
+        course_type = "障害"
+
+    horses_map = {}
+    rows_base = soup_base.find_all("tr", class_="HorseList")
+    if not rows_base:
+        rows_base = [tr for tr in soup_base.find_all("tr") if tr.find("a", href=lambda h: h and "/horse/" in h)]
+
+    for r_idx, row in enumerate(rows_base):
+        tds = row.find_all("td")
+        if len(tds) < 6:
+            # フッターや投票カート行などの補助行をスキップ
+            continue
+
+        h_a = row.find("a", href=lambda h: h and "/horse/" in h)
+        if not h_a or not h_a.text.strip():
+            continue
+        h_name = h_a.text.strip()
+
+        # 重複行防止（先頭の正規行のみを保持）
+        if h_name in horses_map:
+            continue
+
+        # 馬番
+        umaban_str = ""
+        umaban_el = row.find("td", class_=re.compile(r"Umaban\d*"))
+        if umaban_el and umaban_el.text.strip().isdigit():
+            umaban_str = umaban_el.text.strip()
+        elif len(tds) >= 2 and tds[1].text.strip().isdigit():
+            umaban_str = tds[1].text.strip()
+        elif len(tds) >= 1 and tds[0].text.strip().isdigit():
+            umaban_str = tds[0].text.strip()
+
+        try:
+            umaban = int(umaban_str) if umaban_str else (len(horses_map) + 1)
+        except Exception:
+            umaban = len(horses_map) + 1
+
+        # 枠番
+        waku = str(((umaban - 1) // 2) + 1)
+        waku_el = row.find("td", class_=re.compile(r"Waku\d*"))
+        if waku_el and waku_el.text.strip():
+            waku = waku_el.text.strip()
+
+        # 騎手名（フルネーム正規化）
+        jockey_raw = "騎手未定"
+        j_a = row.find("a", href=lambda h: h and "/jockey/" in h)
+        if j_a:
+            jockey_raw = j_a.get("title") or j_a.text.strip()
+        else:
+            j_td = row.find("td", class_="Jockey")
+            if j_td:
+                lines = [l.strip() for l in j_td.text.split() if l.strip()]
+                for l in lines:
+                    if not re.search(r"(\d|牝|牡|セ|栗|鹿|芦|黒)", l) and 2 <= len(l) <= 8:
+                        jockey_raw = l
+                        break
+        jockey_full = normalize_jockey_name(jockey_raw)
+
+        # 斤量
+        weight_val = 55.0
+        j_td = row.find("td", class_="Jockey")
+        if j_td:
+            w_m = re.search(r"(\d{2}\.\d)", j_td.text)
+            if w_m:
+                weight_val = float(w_m.group(1))
+        if weight_val == 55.0:
+            for td in tds:
+                txt = td.text.strip()
+                if re.match(r"^\d{2}\.\d$", txt):
+                    try:
+                        weight_val = float(txt)
+                        break
+                    except Exception:
+                        pass
+
+        # 単勝オッズ & 単勝人気
+        odds_val = 10.0
+        pop_val = None
+
+        # 1. 専用ID・クラスから探索
+        odds_el = row.find("span", id=re.compile(r"odds-")) or row.find("td", class_=re.compile(r"Odds"))
+        if odds_el and re.match(r"^\d+\.?\d*$", odds_el.text.strip()):
+            try:
+                odds_val = float(odds_el.text.strip())
+            except Exception:
+                pass
+
+        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_=re.compile(r"Popular_Ninki|Ninki"))
+        if pop_el and pop_el.text.strip().isdigit():
+            pop_val = int(pop_el.text.strip())
+
+        # 2. セル内容からの直接探索 (shutuba.html のオッズ・人気セル)
+        # ※ idx_t < 8 は馬番・馬名・性齢・斤量・騎手等のためスキップ（55.0等の斤量誤認を防止）
+        all_td_texts = [td.text.strip() for td in tds]
+        for idx_t, txt_t in enumerate(all_td_texts):
+            if idx_t < 8:
+                continue
+            # オッズパターン (例: 82.4, 6.0, 105.2)
+            if re.match(r"^\d{1,4}\.\d$", txt_t):
+                try:
+                    cand_odds = float(txt_t)
+                    if cand_odds > 0:
+                        odds_val = cand_odds
+                        if idx_t + 1 < len(all_td_texts) and all_td_texts[idx_t + 1].isdigit():
+                            pop_val = int(all_td_texts[idx_t + 1])
+                except Exception:
+                    pass
+            # 人気パターン (例: "(13人気)" や "13人気")
+            pop_match = re.search(r"\(?(\d{1,2})人気\)?", txt_t)
+            if pop_match:
+                pop_val = int(pop_match.group(1))
+
+        horses_map[h_name] = {
+            "枠番": waku,
+            "馬番": umaban,
+            "馬名": h_name,
+            "騎手名": jockey_full,
+            "斤量": weight_val,
+            "脚質": "先行",
+            "単勝オッズ": odds_val,
+            "単勝人気": pop_val,
+            "能力指数": 75
+        }
+
+    # 過去レースやオッズ確定後のレース（result.html）が存在する場合、結果テーブルから確定オッズ・確定人気・騎手名・着順・払戻金を補完
+    scraped_actual_ranks = {}
+    scraped_official_payouts = {}
+    need_result_check = any(h["単勝人気"] is None for h in horses_map.values()) or "result.html" in clean_url
+    if need_result_check:
+        try:
+            resp_res = requests.get(url_result, headers=headers, timeout=8)
+            if resp_res.status_code == 200:
+                html_res = ""
+                for enc in ["utf-8", "euc-jp", "cp932"]:
+                    try:
+                        cand = resp_res.content.decode(enc)
+                        if "レース" in cand or "競馬" in cand or "払戻" in cand:
+                            html_res = cand
+                            break
+                    except Exception:
+                        pass
+                if not html_res:
+                    html_res = resp_res.content.decode("utf-8", errors="ignore")
+                soup_res = BeautifulSoup(html_res, "html.parser")
+                main_table = soup_res.find("table", id="All_Result_Table") or soup_res.find("table", class_="RaceTable01")
+                if main_table:
+                    for tr in main_table.find_all("tr"):
+                        h_a = tr.find("a", href=lambda h: h and "/horse/" in h)
+                        if not h_a:
+                            continue
+                        h_name = h_a.text.strip()
+                        tds = [td.text.strip() for td in tr.find_all("td")]
+                        if tds and tds[0].isdigit():
+                            scraped_actual_ranks[h_name] = int(tds[0])
+                        if h_name in horses_map:
+                            if len(tds) >= 11:
+                                # 人気
+                                if tds[9].isdigit():
+                                    horses_map[h_name]["単勝人気"] = int(tds[9])
+                                # オッズ
+                                if re.match(r"^\d+\.?\d*$", tds[10]):
+                                    try:
+                                        horses_map[h_name]["単勝オッズ"] = float(tds[10])
+                                    except Exception:
+                                        pass
+                                # 騎手フルネームも補強
+                                j_a_res = tr.find("a", href=lambda h: h and "/jockey/" in h)
+                                if j_a_res and j_a_res.text.strip():
+                                    horses_map[h_name]["騎手名"] = normalize_jockey_name(j_a_res.text.strip())
+
+                # 公式確定払戻金テーブルを解析
+                parsed_pay = parse_payout_tables(soup_res)
+                if parsed_pay:
+                    scraped_official_payouts = parsed_pay
+        except Exception:
+            pass
+
+    # 最終的な人気の確定（未設定の場合は馬番）
+    for h in horses_map.values():
+        if h["単勝人気"] is None:
+            h["単勝人気"] = min(18, h["馬番"])
+
+    # 2. 馬柱ページ (shutuba_past.html) を取得して過去5走・上がり3F・脚質をマージ
+    past_records_map = {}
+    try:
+        resp_past = requests.get(url_past, headers=headers, timeout=12)
+        if resp_past.status_code == 200:
+            html_past = ""
+            for enc in ["utf-8", "euc-jp", "cp932"]:
+                try:
+                    cand = resp_past.content.decode(enc)
+                    if "レース" in cand or "競馬" in cand:
+                        html_past = cand
+                        break
+                except Exception:
+                    pass
+            if not html_past:
+                html_past = resp_past.content.decode("utf-8", errors="ignore")
+            soup_past = BeautifulSoup(html_past, "html.parser")
+            rows_past = soup_past.find_all("tr", class_="HorseList")
+            if not rows_past:
+                rows_past = [tr for tr in soup_past.find_all("tr") if tr.find("a", href=lambda h: h and "/horse/" in h)]
+
+            for row in rows_past:
+                h_a = row.find("a", href=lambda h: h and "/horse/" in h)
+                if not h_a or not h_a.text.strip():
+                    continue
+                h_name = h_a.text.strip()
+
+                past_tds = row.find_all("td", class_="Past")
+                past_parsed = []
+                for ptd in past_tds[:3]:
+                    rank_num = None
+                    rk_m = re.search(r"(\d{1,2})着", ptd.text)
+                    if rk_m:
+                        rank_num = int(rk_m.group(1))
+                    else:
+                        for cls in ptd.get("class", []):
+                            if "Ranking_" in cls:
+                                try:
+                                    rank_num = int(cls.replace("Ranking_", ""))
+                                except Exception:
+                                    pass
+                    summary_text = " ".join(ptd.text.split())
+                    if not rank_num:
+                        rank_fall = re.search(r"\b(\d{1,2})\b", summary_text)
+                        if rank_fall and int(rank_fall.group(1)) <= 18:
+                            rank_num = int(rank_fall.group(1))
+
+                    d02 = ptd.find("div", class_="Data02")
+                    d05 = ptd.find("div", class_="Data05")
+                    d06 = ptd.find("div", class_="Data06")
+                    r_name_str = " ".join(d02.text.split()) if d02 else ""
+                    dist_time_str = " ".join(d05.text.split()) if d05 else ""
+
+                    if not r_name_str and not dist_time_str:
+                        dist_sub = re.search(r"(ダ|芝)?(\d{4})m?", summary_text)
+                        r_name_str = dist_sub.group(0) if dist_sub else ""
+
+                    agari_m = re.search(r"\(([34]\d\.\d)\)", summary_text)
+                    agari = f"上り{agari_m.group(1)}s" if agari_m else ""
+                    pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", summary_text)
+                    pass_order = pass_m.group(1) if pass_m else ""
+
+                    past_parsed.append({
+                        "rank_num": rank_num,
+                        "rank_str": f"{rank_num}着" if rank_num else "出走",
+                        "summary": f"{r_name_str} {dist_time_str}".strip() or summary_text[:25],
+                        "agari": agari,
+                        "pass_order": pass_order
+                    })
+
+                # 脚質判定
+                style = "先行"
+                if past_parsed and past_parsed[0]["pass_order"]:
+                    po = past_parsed[0]["pass_order"]
+                    try:
+                        first_pos = int(po.split("-")[0])
+                        if first_pos == 1:
+                            style = "逃げ"
+                        elif first_pos <= 4:
+                            style = "先行"
+                        elif first_pos <= 9:
+                            style = "差し"
+                        else:
+                            style = "追込"
+                    except Exception:
+                        pass
+                if h_name in horses_map:
+                    horses_map[h_name]["脚質"] = style
+
+                # 前走・前々走サマリー
+                last_str = "前走: データなし"
+                second_str = "前々走: データなし"
+                boost = 0.0
+                trend = "✨ 安定堅実"
+                suit = "○ 標準適性"
+
+                if past_parsed:
+                    p0 = past_parsed[0]
+                    components = [p0['summary'], p0['rank_str'], p0['agari']]
+                    last_str = "前走: " + " ".join([c for c in components if c])
+                    if p0["rank_num"] == 1:
+                        boost += 2.5
+                        trend = "🔥 前走1着 (連勝の勢い)"
+                        suit = "◎ コース適性抜群"
+                    elif p0["rank_num"] in [2, 3]:
+                        boost += 1.8
+                        trend = "✨ 前走好走 (安定充実)"
+                        suit = "◎ 舞台好相性"
+                    elif p0["rank_num"] in [4, 5]:
+                        boost += 0.8
+                        trend = "⚖️ 掲示板確保 (巻き返し十分)"
+                        suit = "○ 距離適性あり"
+                    elif p0["rank_num"] and p0["rank_num"] >= 10:
+                        boost -= 1.5
+                        trend = "⚠️ 前走大敗 (巻き返し課題)"
+                        suit = "▲ 展開の助け要"
+
+                    if len(past_parsed) > 1:
+                        p1 = past_parsed[1]
+                        second_str = "前々走: " + " ".join([c for c in [p1['summary'], p1['rank_str']] if c])
+                        if p1["rank_num"] and p1["rank_num"] <= 3 and p0["rank_num"] and p0["rank_num"] <= 3:
+                            boost += 1.0
+                            trend = "🔥 2走連続好走 (充実一途)"
+
+                source_label = "🌐 地方競馬公式実戦データ" if is_nar else "🌐 netkeiba公式実戦データ"
+                past_records_map[h_name] = {
+                    "last_race": last_str,
+                    "second_last": second_str,
+                    "course_suitability": suit,
+                    "form_trend": trend,
+                    "key_point": f"{last_str}。実戦データに基づくWeb公式戦績精査済。",
+                    "ability_boost": round(float(boost), 1),
+                    "source": source_label
+                }
+    except Exception:
+        pass
+
+    sorted_horses = sorted(list(horses_map.values()), key=lambda x: x["馬番"])
+    if not sorted_horses:
+        return None, "出走馬データを抽出できませんでした。URLをご確認ください。"
+
+    return {
+        "race_name": race_name or "レース",
+        "track_name": track_name,
+        "course_type": course_type,
+        "distance": distance,
+        "horses": sorted_horses,
+        "past_records": past_records_map,
+        "actual_ranks": scraped_actual_ranks if scraped_actual_ranks else None,
+        "official_payouts": scraped_official_payouts if scraped_official_payouts else None
+    }, None
+
+def parse_horses_from_text(raw_text: str) -> list[dict]:
+
+    """Gemini/ChatGPT等のJSONまたはテキスト出力から出走馬データを柔軟に抽出"""
+    raw = raw_text.strip()
+    if not raw:
+        raise ValueError("入力テキストが空です。")
+
+    # ```json ... ``` などのコードブロック抽出
+    if "```" in raw:
+        parts = raw.split("```")
+        for p in parts:
+            p_strip = p.strip()
+            if p_strip.startswith("json"):
+                p_strip = p_strip[4:].strip()
+            if p_strip.startswith("[") and p_strip.endswith("]"):
+                raw = p_strip
+                break
+
+    # [ から ] までのJSON配列を探索
+    start_idx = raw.find("[")
+    end_idx = raw.rfind("]")
+    extracted_data = []
+
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        json_candidate = raw[start_idx:end_idx + 1]
+        try:
+            extracted_data = json.loads(json_candidate)
+        except Exception:
+            extracted_data = []
+
+    parsed_list = []
+
+    if isinstance(extracted_data, list) and len(extracted_data) > 0:
+        for item in extracted_data:
+            if not isinstance(item, dict):
+                continue
+            parsed_list.append({
+                "馬番": int(item.get("馬番", len(parsed_list) + 1)),
+                "馬名": str(item.get("馬名", f"馬{len(parsed_list) + 1}")),
+                "単勝人気": int(item.get("単勝人気", len(parsed_list) + 1)),
+                "騎手名": str(item.get("騎手名", "騎手")),
+                "脚質": item.get("脚質", "先行") if item.get("脚質") in ["逃げ", "先行", "差し", "追込"] else "先行",
+            })
+
+    # JSONパースに失敗した場合の行ベースフォールバック（netkeibaテキスト等）
+    if not parsed_list:
+        lines = [ln.strip() for ln in raw_text.strip().splitlines() if ln.strip()]
+        for ln in lines:
+            if "馬番" in ln and "馬名" in ln:
+                continue
+            tokens = [tk.strip() for tk in ln.replace("\t", " ").replace(",", " ").replace("|", " ").split(" ") if tk.strip()]
+            if len(tokens) >= 2:
+                try:
+                    h_no = int(tokens[0])
+                    h_name = tokens[1]
+                    h_pop = int(tokens[2]) if len(tokens) >= 3 and tokens[2].isdigit() else (len(parsed_list) + 1)
+                    parsed_list.append({
+                        "馬番": h_no,
+                        "馬名": h_name,
+                        "単勝人気": h_pop,
+                        "騎手名": tokens[3] if len(tokens) >= 4 else "騎手",
+                        "脚質": "先行",
+                    })
+                except Exception:
+                    continue
+
+    if not parsed_list:
+        raise ValueError("出走馬データを抽出できませんでした。JSON形式または出馬表テキストをご確認ください。")
+
+    return parsed_list
+
+with st.expander("🌐 **【Web・画像から出走馬を一括自動入力】netkeiba URL取得 (おすすめ！過去走・オッズ完全取得) / スクショ解析**", expanded=True):
+    tab_url, tab_img_api, tab_paste_text = st.tabs([
+        "🌐 netkeiba URLから全自動取得 (★超おすすめ！本物の過去走・オッズ一括取得)",
+        "📷 出馬表スクショをアップロード (API自動抽出)",
+        "📋 Web版Gemini/ChatGPTの出力を貼り付け (無料無制限・レートリミット回避！)"
+    ])
+
+    with tab_url:
+        st.markdown(
+            """
+            ##### 🚀 netkeibaの出馬表URLを1行貼るだけで、全頭の「本物の過去走・前走着順・上りタイム・斤量」を1秒で全自動取得！
+            中央競馬 (`race.netkeiba.com`) および 地方競馬 (`nar.netkeiba.com`) に完全対応。  
+            手入力や画像アップロードの手間ゼロで、**公式実戦データに基づいた本物の過去走精査** が可能になります。
+            """
+        )
+        url_input = st.text_input(
+            "netkeibaの出走表URL (例: https://race.netkeiba.com/race/shutuba.html?race_id=...)",
+            placeholder="https://race.netkeiba.com/race/shutuba.html?race_id=202605040411",
+            key="netkeiba_url_input"
+        )
+        col_u1, col_u2 = st.columns([1.5, 1.0])
+        with col_u1:
+            btn_fetch_url = st.button("📥 レース情報＆全頭の本物過去走を一括取得", type="primary", use_container_width=True)
+        with col_u2:
+            btn_sample_url = st.button("💡 サンプルURL（アイルランドT）で試す", use_container_width=True, key="btn_sample_url")
+
+        if btn_sample_url:
+            st.session_state["netkeiba_url_input"] = "https://race.netkeiba.com/race/shutuba.html?race_id=202605040411"
+            st.rerun()
+
+        if btn_fetch_url:
+            if not url_input.strip():
+                st.warning("⚠️ netkeibaのレースURLを入力してください。")
+            else:
+                with st.spinner("🌐 netkeibaからレース情報・全出走馬・本物の過去走データを取得・精査中..."):
+                    res_data, err = fetch_netkeiba_race(url_input.strip())
+                    if err:
+                        st.error(f"⚠️ {err}")
+                    else:
+                        horses_df = pd.DataFrame(res_data["horses"])
+                        st.session_state["horses_data"] = horses_df
+                        st.session_state["netkeiba_past_records"] = res_data["past_records"]
+                        st.session_state["detected_track"] = res_data["track_name"]
+                        st.session_state["detected_course_type"] = res_data["course_type"]
+                        st.session_state["current_distance"] = res_data["distance"]
+                        st.session_state["predicted_results"] = None
+                        st.session_state["has_run_prediction"] = False
+                        st.session_state["scraped_actual_ranks"] = res_data.get("actual_ranks")
+                        st.session_state["scraped_official_payouts"] = res_data.get("official_payouts")
+                        
+                        extra_msg = ""
+                        if res_data.get("actual_ranks"):
+                            extra_msg += f" ｜ 🎯 確定着順（{len(res_data['actual_ranks'])}頭分）も自動検知済"
+                        if res_data.get("official_payouts"):
+                            extra_msg += " ｜ 💵 公式確定払戻金も自動同期済"
+                        st.success(f"🎉 **{res_data['race_name']}**（{res_data['track_name']} {res_data['course_type']}{res_data['distance']}m）の出走馬 {len(horses_df)}頭分と本物の過去走データを完璧に取得しました！{extra_msg}")
+                        st.rerun()
+
+
+    with tab_img_api:
+        col_upload, col_preview = st.columns([1.2, 1.0])
+
+        with col_upload:
+            uploaded_file = st.file_uploader(
+                "競馬新聞やnetkeiba・JRA公式サイトの出馬表スクショをアップロード",
+                type=["png", "jpg", "jpeg", "webp"]
+            )
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                btn_analyze = st.button("✨ 画像から出走馬を自動抽出", type="secondary", disabled=(uploaded_file is None))
+            with col_btn2:
+                btn_demo = st.button("💡 サンプル出馬表で試す", help="G1有力馬6頭のデモデータをセット", key="btn_demo_api")
+
+        with col_preview:
+            if uploaded_file is not None:
+                image = Image.open(uploaded_file)
+                st.image(image, caption="アップロードされた出馬表", use_container_width=True)
+
+        if btn_demo:
+            st.session_state["horses_data"] = pd.DataFrame([
+                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "騎手名": "武豊", "脚質": "差し"},
+                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "騎手名": "川田将雅", "脚質": "差し"},
+                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "騎手名": "坂井瑠星", "脚質": "追込"},
+                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "騎手名": "横山和生", "脚質": "逃げ"},
+                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "騎手名": "モレイラ", "脚質": "先行"},
+            ])
+            st.session_state["predicted_results"] = None
+            st.session_state["has_run_prediction"] = False
+            st.success("🎉 デモ出馬表（G1有力馬6頭）を読み込みました！")
+            st.rerun()
+
+        if btn_analyze and uploaded_file is not None:
+            if not gemini_api_key:
+                st.warning("⚠️ 画像から直接自動解析するには、サイドバーの「Gemini API Key」が必要です。キーがない・API制限時は「📋 Web版Geminiの出力を貼り付け」タブをご利用ください。")
+            else:
+                with st.spinner("🔍 AIが出馬表画像を解析中...（混雑時は自動で別モデルに切り替えて再試行します）"):
+                    try:
+                        from google import genai
+                        from google.genai import types
+
+                        client = genai.Client(api_key=gemini_api_key)
+                        uploaded_file.seek(0)
+                        img_bytes = uploaded_file.read()
+
+                        prompt = """
+                        この画像は競馬の出馬表です。
+                        画像から各出走馬の情報を読み取り、以下のJSON形式のみ（純粋なJSON配列）で出力してください。
+
+                        [
+                          {
+                            "馬番": 1,
+                            "馬名": "馬名",
+                            "単勝人気": 1 (単勝人気。不明ならオッズや実績から1〜18の整数),
+                            "騎手名": "騎手名 (例: ルメール、川田、武豊)",
+                            "脚質": "逃げ" または "先行" または "差し" または "追込" (推定)
+                          }
+                        ]
+                        注意: 最大18頭まで抽出してください。マークダウンタグはつけず、純粋なJSON文字列のみ出力してください。
+                        """
+
+                        if "2.0" in gemini_model_choice:
+                            models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+                        elif "1.5" in gemini_model_choice:
+                            models_to_try = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
+                        elif "2.5" in gemini_model_choice:
+                            models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+                        else:
+                            models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+
+                        response = None
+                        last_error = None
+                        used_model = None
+
+                        for m_name in models_to_try:
+                            for attempt in range(2):
+                                try:
+                                    response = client.models.generate_content(
+                                        model=m_name,
+                                        contents=[
+                                            types.Part.from_bytes(data=img_bytes, mime_type=uploaded_file.type or "image/png"),
+                                            prompt
+                                        ]
+                                    )
+                                    if response and response.text:
+                                        used_model = m_name
+                                        break
+                                except Exception as ex:
+                                    last_error = ex
+                                    err_str = str(ex)
+                                    if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                                        time.sleep(1.5)
+                                        continue
+                                    else:
+                                        break
+                            if response and response.text:
+                                break
+
+                        if response is None or not response.text:
+                            if last_error:
+                                raise last_error
+                            else:
+                                raise RuntimeError("AIモデルからの応答を取得できませんでした。")
+
+                        parsed_list = parse_horses_from_text(response.text)
+                        st.session_state["horses_data"] = pd.DataFrame(parsed_list)
+                        st.session_state["predicted_results"] = None
+                        st.session_state["has_run_prediction"] = False
+                        st.success(f"🎉 出馬表から {len(parsed_list)} 頭の出走馬データを抽出しました！（モデル: {used_model}）")
+                        st.rerun()
+                    except Exception as e:
+                        err_msg = str(e)
+                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                            st.error(
+                                "⚠️ **API利用枠（レートリミット）に達しました。**\n\n"
+                                "💡 **解決策**: 隣のタブ **「📋 Web版Gemini/ChatGPTの出力を貼り付け」** をご利用ください！\n"
+                                "ブラウザの [Google Gemini (無料)](https://gemini.google.com/) に出馬表画像を貼り付けて出力されたテキストをコピペするだけで、**API制限なし・完全無料・無制限**で一瞬で取り込めます。"
+                            )
+                        elif "503" in err_msg or "UNAVAILABLE" in err_msg:
+                            st.error("⚠️ **Google Geminiサーバーが混雑中です（503）。** 隣の「📋 Web版Geminiの出力を貼り付け」タブのご利用もおすすめです。")
+                        elif "API_KEY_INVALID" in err_msg or "400" in err_msg:
+                            st.error(f"⚠️ **APIキーの確認が必要です**: {err_msg}")
+                        else:
+                            st.error(f"解析中にエラーが発生しました: {err_msg}")
+
+    # ------------------------------------------
+    # タブ2: Web版Gemini/ChatGPTの貼り付け入力
+    # ------------------------------------------
+    with tab_paste_text:
+        st.markdown(
+            """
+            #### 🌟 完全無料・無制限！Web版AIからコピペで一発入力
+            APIキーの利用制限（429エラー）を完全に回避できます。  
+            ブラウザで **[Google Gemini (無料)](https://gemini.google.com/)** または **ChatGPT** に出馬表スクショを送り、出力されたテキストをここに貼り付けてください。
+            """
+        )
+
+        with st.expander("📋 **【手順 1】ブラウザ版AIに送る指示文 (プロンプトをコピー)**", expanded=False):
+            st.caption("以下の指示文をコピーして、ブラウザ版Geminiに出馬表画像と一緒に送信してください：")
+            prompt_for_web = """この画像は競馬の出馬表です。
+画像から全出走馬の情報を読み取り、以下のJSON形式のみ（純粋なJSON配列）で出力してください。
+
+[
+  {
+    "馬番": 1,
+    "馬名": "馬名",
+    "単勝人気": 1,
+    "騎手名": "騎手名",
+    "脚質": "逃げ/先行/差し/追込のいずれか"
+  }
+]
+解説文やマークダウンタグはつけず、純粋なJSON配列のみを出力してください。"""
+            st.code(prompt_for_web, language="text")
+
+        st.caption("【手順 2】ブラウザ版AIから返ってきた出力結果をここに貼り付けてください：")
+        pasted_content = st.text_area(
+            "貼り付けエリア",
+            height=160,
+            placeholder='ここに [ {"馬番": 1, "馬名": "グランアレグリア", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"} ] を貼り付けます',
+            key="text_area_pasted_horses"
+        )
+
+        col_p1, col_p2 = st.columns([1.5, 1.0])
+        with col_p1:
+            btn_apply_paste = st.button("📥 貼り付けたデータを出走馬一覧に反映する", type="primary", use_container_width=True)
+        with col_p2:
+            btn_demo_paste = st.button("💡 デモ出馬表をセット", key="btn_demo_paste", use_container_width=True)
+
+        if btn_demo_paste:
+            st.session_state["horses_data"] = pd.DataFrame([
+                {"馬番": 1, "馬名": "ドウデュース", "単勝人気": 2, "騎手名": "武豊", "脚質": "差し"},
+                {"馬番": 2, "馬名": "イクイノックス", "単勝人気": 1, "騎手名": "ルメール", "脚質": "先行"},
+                {"馬番": 3, "馬名": "リバティアイランド", "単勝人気": 3, "騎手名": "川田将雅", "脚質": "差し"},
+                {"馬番": 4, "馬名": "ジャスティンパレス", "単勝人気": 5, "騎手名": "坂井瑠星", "脚質": "追込"},
+                {"馬番": 5, "馬名": "タイトルホルダー", "単勝人気": 4, "騎手名": "横山和生", "脚質": "逃げ"},
+                {"馬番": 6, "馬名": "スターズオンアース", "単勝人気": 6, "騎手名": "モレイラ", "脚質": "先行"},
+            ])
+            st.session_state["predicted_results"] = None
+            st.session_state["has_run_prediction"] = False
+            st.success("🎉 デモ出馬表を読み込みました！")
+            st.rerun()
+
+        if btn_apply_paste:
+            if not pasted_content.strip():
+                st.warning("⚠️ 貼り付けエリアにテキストを入力してください。")
+            else:
+                try:
+                    parsed_list = parse_horses_from_text(pasted_content)
+                    st.session_state["horses_data"] = pd.DataFrame(parsed_list)
+                    st.session_state["predicted_results"] = None
+                    st.session_state["has_run_prediction"] = False
+                    st.success(f"🎉 貼り付けたテキストから {len(parsed_list)} 頭の出走馬データを一括反映しました！")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"データの読み込みに失敗しました: {ex}")
+
+# ==========================================
+# 4. 出走馬データ入力テーブル
+# ==========================================
+st.subheader("📋 出走馬データ")
+st.caption("💡 **脚質（逃げ・先行・差し・追込）は、新聞やnetkeibaの通過順（1-1-1なら逃げ、10-10-8なら差し/追込等）を見て自分で選ぶと的中率が大幅に向上します！**")
+
+if st.session_state.get("netkeiba_past_records"):
+    count_p = len(st.session_state["netkeiba_past_records"])
+    st.info(f"🌐 **netkeiba公式データ連携稼働中**: 全{count_p}頭分の【本物の過去走・前走着順・上り3Fタイム】を保持しています。予想実行時に全自動で精査・能力指数へダイレクト反映されます。")
+
+
+current_data = st.session_state["horses_data"].copy()
+current_data = current_data.loc[:, ~current_data.columns.duplicated()]
+required_cols = ["馬番", "馬名", "単勝人気", "騎手名", "脚質"]
+existing_cols = [c for c in required_cols if c in current_data.columns]
+current_data = current_data[existing_cols]
+
+column_config = {
+    "馬番": st.column_config.NumberColumn("馬番", min_value=1, max_value=18, step=1, format="%d", required=True),
+    "馬名": st.column_config.TextColumn("馬名", required=True),
+    "単勝人気": st.column_config.NumberColumn("単勝人気 (1〜18)", min_value=1, max_value=18, step=1, format="%d位", required=True),
+    "騎手名": st.column_config.TextColumn("騎手名", required=True),
+    "脚質": st.column_config.SelectboxColumn("脚質 (自分で選択)", options=["逃げ", "先行", "差し", "追込"], required=True, help="競馬新聞の脚質や通過順を見て選んでください"),
+}
+
+edited_df = st.data_editor(
+    current_data,
+    column_config=column_config,
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True
+)
 
 # ==========================================
 # 6. 予測実行
