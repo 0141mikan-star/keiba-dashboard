@@ -2815,28 +2815,33 @@ def fetch_netkeiba_race(url: str):
 
     soup_base = BeautifulSoup(html_base, "html.parser")
 
-    # 0. netkeiba公式リアルタイムオッズAPI（JRA / 地方NAR）から単勝オッズ・単勝人気を高精度取得
+    # 0. netkeiba公式リアルタイムオッズAPI（JRA / 地方NAR）から最新単勝オッズ・最新単勝人気を一括取得
     api_odds_map = {}
     api_pop_map = {}
     try:
         api_endpoint = "api_get_nar_odds.html" if is_nar else "api_get_jra_odds.html"
-        url_api_odds = f"https://{domain}/api/{api_endpoint}?race_id={race_id}&type=1"
+        cache_bust = int(time.time() * 1000)
+        url_api_odds = f"https://{domain}/api/{api_endpoint}?race_id={race_id}&type=1&action=init&_={cache_bust}"
         resp_api = requests.get(url_api_odds, headers=headers, timeout=8)
         if resp_api.status_code == 200:
             data_api = resp_api.json()
             if not is_nar:
                 # JRA中央競馬: data -> odds -> '1' -> { '01': [odds, fukusho, ninki], ... }
+                # status は 'result'(確定), 'real'(リアルタイム速報), 'yoso'(netkeiba最新公式予想オッズ) のすべてを網羅
                 w_odds = data_api.get("data", {}).get("odds", {}).get("1", {})
                 if isinstance(w_odds, dict):
                     for u_str, val_list in w_odds.items():
-                        if isinstance(val_list, list) and len(val_list) >= 3:
+                        if isinstance(val_list, list) and len(val_list) >= 1:
                             try:
                                 u_no = int(u_str)
-                                o_v = float(val_list[0])
-                                p_v = int(val_list[2])
-                                if o_v > 0:
+                                o_v = float(val_list[0]) if val_list[0] and val_list[0] != "" else None
+                                p_v = None
+                                if len(val_list) >= 3 and str(val_list[2]).isdigit():
+                                    p_v = int(val_list[2])
+                                if o_v is not None and o_v > 0:
                                     api_odds_map[u_no] = o_v
-                                    api_pop_map[u_no] = p_v
+                                    if p_v is not None:
+                                        api_pop_map[u_no] = p_v
                             except Exception:
                                 pass
             else:
@@ -2847,11 +2852,14 @@ def fetch_netkeiba_race(url: str):
                         if isinstance(o_info, dict):
                             try:
                                 u_no = int(u_str)
-                                o_v = float(o_info.get("Odds", 0))
-                                p_v = int(o_info.get("Ninki", 0))
-                                if o_v > 0:
+                                o_val_str = str(o_info.get("Odds", "")).strip()
+                                o_v = float(o_val_str) if o_val_str and re.match(r"^\d+\.?\d*$", o_val_str) else None
+                                p_val_str = str(o_info.get("Ninki", "")).strip()
+                                p_v = int(p_val_str) if p_val_str.isdigit() else None
+                                if o_v is not None and o_v > 0:
                                     api_odds_map[u_no] = o_v
-                                    api_pop_map[u_no] = p_v
+                                    if p_v is not None:
+                                        api_pop_map[u_no] = p_v
                             except Exception:
                                 pass
     except Exception:
