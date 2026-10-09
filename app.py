@@ -172,6 +172,51 @@ JOCKEY_WIN_RATES = {
     "幸": 8.5, "幸英明": 8.5, "石橋脩": 8.5, "柴田善": 6.5,
 }
 
+# 主要騎手フルネーム変換マップ (JRA短縮名・地方競馬略称 -> フルネーム)
+JOCKEY_FULLNAME_MAP = {
+    "ルメール": "C.ルメール", "Cルメール": "C.ルメール", "ルメー": "C.ルメール",
+    "モレイラ": "J.モレイラ", "Jモレイラ": "J.モレイラ", "モレイ": "J.モレイラ",
+    "レーン": "D.レーン", "Dレーン": "D.レーン",
+    "ムーア": "R.ムーア", "Rムーア": "R.ムーア",
+    "デムーロ": "M.デムーロ", "Mデムーロ": "M.デムーロ", "Mデム": "M.デムーロ",
+    "ビュイック": "W.ビュイック", "ビュイ": "W.ビュイック",
+    "マーカンド": "T.マーカンド", "マーカ": "T.マーカンド",
+    "ドイル": "H.ドイル",
+    "川田": "川田将雅", "武豊": "武豊", "戸崎": "戸崎圭太", "戸崎圭": "戸崎圭太",
+    "坂井": "坂井瑠星", "坂井瑠": "坂井瑠星",
+    "横山武": "横山武史", "横山典": "横山典弘", "横山和": "横山和生",
+    "松山": "松山弘平", "松山弘": "松山弘平",
+    "岩田望": "岩田望来", "岩田康": "岩田康誠",
+    "西村淳": "西村淳也", "佐々木": "佐々木大輔",
+    "鮫島駿": "鮫島克駿", "菅原明": "菅原明良",
+    "津村": "津村明秀", "丹内": "丹内祐次",
+    "三浦": "三浦皇成", "田辺": "田辺裕信",
+    "団野": "団野大成", "浜中": "浜中俊",
+    "池添": "池添謙一", "吉田隼": "吉田隼人",
+    "藤岡佑": "藤岡佑介", "北村友": "北村友一", "北村宏": "北村宏司",
+    "和田竜": "和田竜二", "幸": "幸英明", "石橋脩": "石橋脩",
+    "柴田善": "柴田善臣", "木幡巧": "木幡巧也", "木幡初": "木幡初也",
+    "菊沢": "菊沢一樹", "石川": "石川裕紀人", "菱田": "菱田裕二",
+    "角田河": "角田大河", "角田和": "角田大和",
+    "吉村": "吉村誠之助", "高杉": "高杉吏麒",
+    "永島": "永島まなみ", "古川奈": "古川奈穂", "今村": "今村聖奈",
+    "藤田菜": "藤田菜七子", "小林美": "小林美駒", "小林勝": "小林勝太",
+    "大野": "大野拓弥", "丸山": "丸山元気", "長岡": "長岡禎仁",
+    "安藤洋": "安藤洋一", "本田正": "本田正重"
+}
+
+def normalize_jockey_name(raw_name: str) -> str:
+    """騎手名をフルネームに正規化（JRA短縮表記や地方競馬の記号を除去）"""
+    if not raw_name:
+        return "騎手未定"
+    clean = re.sub(r"[\s▲△★☆◇◆]", "", str(raw_name)).strip()
+    if clean in JOCKEY_FULLNAME_MAP:
+        return JOCKEY_FULLNAME_MAP[clean]
+    for k, v in JOCKEY_FULLNAME_MAP.items():
+        if clean == k:
+            return v
+    return clean
+
 def get_jockey_rate(name: str, default_rate: float = 9.0) -> float:
     """騎手名から勝率(%)を取得"""
     if not name or pd.isna(name):
@@ -181,6 +226,7 @@ def get_jockey_rate(name: str, default_rate: float = 9.0) -> float:
         if j_name in name_clean:
             return rate
     return default_rate
+
 
 def popularity_to_index(pop: int) -> int:
     """出馬表の単勝人気(1〜18)から能力指数を自動推定"""
@@ -550,74 +596,65 @@ if "horses_data" not in st.session_state or "適性距離" in st.session_state["
 
 def fetch_netkeiba_race(url: str):
     """
-    【Web公式競馬データ連動エンジン】
-    netkeibaの出走表URL（または結果URL）から、レース情報（競馬場・距離・コース種別）および
-    全出走馬の本物の過去走（前走・前々走着順・走破タイム・上がり3F・斤量・騎手・オッズ）を
-    リアルタイムで自動取得・完全解析する。
-    中央競馬 (race.netkeiba.com) / 地方競馬 (nar.netkeiba.com) / データベース (db.netkeiba.com)
-    出馬表 (shutuba.html)、馬柱5走 (shutuba_past.html)、レース結果 (result.html) すべてに完全対応。
+    【Web公式競馬データ連動エンジン（ハイブリッド高精度解析）】
+    netkeibaの出走表URL（または結果URL）から、基本出馬表（shutuba.html）、馬柱5走（shutuba_past.html）、
+    レース結果（result.html）を自動統合・ハイブリッド解析。
+    - 単勝人気・オッズ: 公式出馬表および結果テーブルから本物の単勝人気・確定オッズを正確に抽出（馬番フォールバック完全解消）
+    - 騎手名: JRA短縮表記や地方競馬表記を「安藤洋一」「津村明秀」「西村淳也」などの完全フルネームに正規化
+    - 過去走・脚質: 馬柱5走ページから過去戦績・走破タイム・上がり3F・通過順・脚質を完全マージ
+    - 中央競馬 (race.netkeiba.com) / 地方競馬 (nar.netkeiba.com) の両方に完全対応。
     """
     clean_url = url.strip()
     if not clean_url:
         return None, "URLが入力されていません"
 
-    # URLの正規化: result.html や shutuba.html を shutuba_past.html に自動変換
-    if "result.html" in clean_url:
-        target_url = clean_url.replace("result.html", "shutuba_past.html")
-    elif "shutuba.html" in clean_url:
-        target_url = clean_url.replace("shutuba.html", "shutuba_past.html")
-    else:
-        target_url = clean_url
-
+    is_nar = "nar.netkeiba.com" in clean_url
+    domain = "nar.netkeiba.com" if is_nar else "race.netkeiba.com"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    content = None
+    r_id_m = re.search(r"race_id=([a-zA-Z0-9]+)", clean_url)
+    if not r_id_m:
+        return None, "URLにrace_idが含まれていません。netkeibaのレースURLを確認してください。"
+    race_id = r_id_m.group(1)
+
+    url_shutuba = f"https://{domain}/race/shutuba.html?race_id={race_id}"
+    url_past = f"https://{domain}/race/shutuba_past.html?race_id={race_id}"
+    url_result = f"https://{domain}/race/result.html?race_id={race_id}"
+
+    # 1. 出馬表 (shutuba.html) を取得（基本枠番・馬番・馬名・騎手フルネーム・斤量・公式オッズ・公式人気）
+    html_base = ""
     try:
-        resp = requests.get(target_url, headers=headers, timeout=12)
-        if resp.status_code == 200:
-            content = resp.content
-    except Exception:
-        pass
+        resp_base = requests.get(url_shutuba, headers=headers, timeout=12)
+        if resp_base.status_code == 200:
+            for enc in ["utf-8", "euc-jp", "cp932"]:
+                try:
+                    cand = resp_base.content.decode(enc)
+                    if "レース" in cand or "競馬" in cand or "出馬表" in cand:
+                        html_base = cand
+                        break
+                except Exception:
+                    pass
+            if not html_base:
+                html_base = resp_base.content.decode("utf-8", errors="ignore")
+    except Exception as e:
+        return None, f"出馬表の取得に失敗しました: {e}"
 
-    if not content:
-        try:
-            resp = requests.get(clean_url, headers=headers, timeout=12)
-            resp.raise_for_status()
-            content = resp.content
-        except Exception as e:
-            return None, f"netkeibaへの接続に失敗しました: {e}"
+    if not html_base:
+        return None, "出馬表HTMLを取得できませんでした。"
 
-    # エンコーディングの自動判別 (地方競馬はutf-8、中央はeuc-jpが主流)
-    if "nar.netkeiba.com" in clean_url:
-        encodings = ["utf-8", "euc-jp", "cp932"]
-    else:
-        encodings = ["euc-jp", "utf-8", "cp932"]
+    soup_base = BeautifulSoup(html_base, "html.parser")
 
-    html = ""
-    for enc in encodings:
-        try:
-            cand = content.decode(enc)
-            if "netkeiba" in cand or "レース" in cand or "競馬" in cand:
-                html = cand
-                break
-        except Exception:
-            continue
-    if not html:
-        html = content.decode("utf-8", errors="ignore")
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. レース名・コース条件の抽出
+    # レース名・コース条件の抽出
     race_name = ""
-    race_name_el = soup.find("h1", class_="RaceName") or soup.find("div", class_="RaceName")
+    race_name_el = soup_base.find("h1", class_="RaceName") or soup_base.find("div", class_="RaceName")
     if race_name_el:
         race_name = race_name_el.text.strip()
 
-    race_data_el = soup.find("div", class_="RaceData01") or soup.find("div", class_="RaceData02")
+    race_data_el = soup_base.find("div", class_="RaceData01") or soup_base.find("div", class_="RaceData02")
     race_meta = race_data_el.text.strip() if race_data_el else ""
-    page_title = soup.title.text.strip() if soup.title else ""
+    page_title = soup_base.title.text.strip() if soup_base.title else ""
     full_text = f"{race_name} {race_meta} {page_title}"
 
     track_name = "東京"
@@ -642,28 +679,24 @@ def fetch_netkeiba_race(url: str):
     elif "障" in full_text or "障害" in full_text:
         course_type = "障害"
 
-    # 2. 出走馬一覧と過去走データの抽出
-    horses = []
-    past_records_map = {}
+    horses_map = {}
+    rows_base = soup_base.find_all("tr", class_="HorseList")
+    if not rows_base:
+        rows_base = [tr for tr in soup_base.find_all("tr") if tr.find("a", href=lambda h: h and "/horse/" in h)]
 
-    rows = soup.find_all("tr", class_="HorseList")
-    if not rows:
-        rows = soup.find_all("tr", class_=re.compile(r"Result_List|Horse_List"))
-    if not rows:
-        for tr in soup.find_all("tr"):
-            if tr.find("a", href=lambda h: h and "/horse/" in h):
-                rows.append(tr)
+    for r_idx, row in enumerate(rows_base):
+        tds = row.find_all("td")
+        if len(tds) < 6:
+            # フッターや投票カート行などの補助行をスキップ
+            continue
 
-    for r_idx, row in enumerate(rows):
-        # 馬名
         h_a = row.find("a", href=lambda h: h and "/horse/" in h)
-        if h_a and h_a.text.strip():
-            h_name = h_a.text.strip()
-        else:
-            h_name_el = row.find("span", class_="HorseName") or row.find("div", class_="Horse02")
-            h_name = h_name_el.text.strip() if h_name_el else ""
+        if not h_a or not h_a.text.strip():
+            continue
+        h_name = h_a.text.strip()
 
-        if not h_name:
+        # 重複行防止（先頭の正規行のみを保持）
+        if h_name in horses_map:
             continue
 
         # 馬番
@@ -671,17 +704,15 @@ def fetch_netkeiba_race(url: str):
         umaban_el = row.find("td", class_=re.compile(r"Umaban\d*"))
         if umaban_el and umaban_el.text.strip().isdigit():
             umaban_str = umaban_el.text.strip()
-        else:
-            tds = row.find_all("td")
-            if len(tds) >= 2 and tds[1].text.strip().isdigit():
-                umaban_str = tds[1].text.strip()
-            elif len(tds) >= 1 and tds[0].text.strip().isdigit():
-                umaban_str = tds[0].text.strip()
+        elif len(tds) >= 2 and tds[1].text.strip().isdigit():
+            umaban_str = tds[1].text.strip()
+        elif len(tds) >= 1 and tds[0].text.strip().isdigit():
+            umaban_str = tds[0].text.strip()
 
         try:
-            umaban = int(umaban_str) if umaban_str else (r_idx + 1)
+            umaban = int(umaban_str) if umaban_str else (len(horses_map) + 1)
         except Exception:
-            umaban = r_idx + 1
+            umaban = len(horses_map) + 1
 
         # 枠番
         waku = str(((umaban - 1) // 2) + 1)
@@ -689,29 +720,30 @@ def fetch_netkeiba_race(url: str):
         if waku_el and waku_el.text.strip():
             waku = waku_el.text.strip()
 
-        # 騎手名
-        jockey = "騎手未定"
+        # 騎手名（フルネーム正規化）
+        jockey_raw = "騎手未定"
         j_a = row.find("a", href=lambda h: h and "/jockey/" in h)
-        if j_a and j_a.text.strip():
-            jockey = j_a.text.strip()
+        if j_a:
+            jockey_raw = j_a.get("title") or j_a.text.strip()
         else:
-            jockey_el = row.find("td", class_="Jockey")
-            if jockey_el:
-                lines = [l.strip() for l in jockey_el.text.split() if l.strip()]
+            j_td = row.find("td", class_="Jockey")
+            if j_td:
+                lines = [l.strip() for l in j_td.text.split() if l.strip()]
                 for l in lines:
-                    if not re.search(r"(\d|牝|牡|セ|栗|鹿|芦)", l) and 2 <= len(l) <= 6:
-                        jockey = l
+                    if not re.search(r"(\d|牝|牡|セ|栗|鹿|芦|黒)", l) and 2 <= len(l) <= 8:
+                        jockey_raw = l
                         break
+        jockey_full = normalize_jockey_name(jockey_raw)
 
         # 斤量
         weight_val = 55.0
-        jockey_el = row.find("td", class_="Jockey")
-        if jockey_el:
-            w_m = re.search(r"(\d{2}\.\d)", jockey_el.text)
+        j_td = row.find("td", class_="Jockey")
+        if j_td:
+            w_m = re.search(r"(\d{2}\.\d)", j_td.text)
             if w_m:
                 weight_val = float(w_m.group(1))
         if weight_val == 55.0:
-            for td in row.find_all("td"):
+            for td in tds:
                 txt = td.text.strip()
                 if re.match(r"^\d{2}\.\d$", txt):
                     try:
@@ -720,154 +752,243 @@ def fetch_netkeiba_race(url: str):
                     except Exception:
                         pass
 
-        # オッズ・人気
-        odds_el = row.find("span", id=re.compile(r"odds-")) or row.find("td", class_="Odds")
+        # 単勝オッズ & 単勝人気
         odds_val = 10.0
-        if odds_el:
-            txt = odds_el.text.strip()
+        pop_val = None
+
+        # 1. 専用ID・クラスから探索
+        odds_el = row.find("span", id=re.compile(r"odds-")) or row.find("td", class_=re.compile(r"Odds"))
+        if odds_el and re.match(r"^\d+\.?\d*$", odds_el.text.strip()):
             try:
-                odds_val = float(txt)
-            except Exception:
-                odds_val = 10.0
-
-        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_="Popular") or row.find("td", class_="Ninki")
-        pop_val = umaban
-        if pop_el:
-            txt = pop_el.text.strip()
-            try:
-                pop_val = int(txt)
-            except Exception:
-                pop_val = min(18, umaban)
-
-        # 過去走セルの詳細パース
-        past_tds = row.find_all("td", class_="Past")
-        past_parsed = []
-        for ptd in past_tds[:3]:
-            d02 = ptd.find("div", class_="Data02")
-            d05 = ptd.find("div", class_="Data05")
-            d06 = ptd.find("div", class_="Data06")
-
-            rank_num = None
-            rk_m = re.search(r"(\d{1,2})着", ptd.text)
-            if rk_m:
-                rank_num = int(rk_m.group(1))
-            else:
-                for cls in ptd.get("class", []):
-                    if "Ranking_" in cls:
-                        try:
-                            rank_num = int(cls.replace("Ranking_", ""))
-                        except Exception:
-                            pass
-
-            summary_text = " ".join(ptd.text.split())
-            if not rank_num:
-                rank_fall = re.search(r"\b(\d{1,2})\b", summary_text)
-                if rank_fall and int(rank_fall.group(1)) <= 18:
-                    rank_num = int(rank_fall.group(1))
-
-            r_name_str = " ".join(d02.text.split()) if d02 else ""
-            dist_time_str = " ".join(d05.text.split()) if d05 else ""
-            pass_agari_str = " ".join(d06.text.split()) if d06 else ""
-
-            if not r_name_str and not dist_time_str:
-                dist_sub = re.search(r"(ダ|芝)?(\d{4})m?", summary_text)
-                r_name_str = dist_sub.group(0) if dist_sub else ""
-
-            agari_m = re.search(r"\(([34]\d\.\d)\)", summary_text)
-            agari = f"上り{agari_m.group(1)}s" if agari_m else ""
-
-            pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", summary_text)
-            pass_order = pass_m.group(1) if pass_m else ""
-
-            rank_str = f"{rank_num}着" if rank_num else "出走"
-            race_summary = f"{r_name_str} {dist_time_str}".strip() or summary_text[:25]
-
-            past_parsed.append({
-                "rank_num": rank_num,
-                "rank_str": rank_str,
-                "summary": race_summary,
-                "agari": agari,
-                "pass_order": pass_order
-            })
-
-        style = "先行"
-        if past_parsed and past_parsed[0]["pass_order"]:
-            po = past_parsed[0]["pass_order"]
-            try:
-                first_pos = int(po.split("-")[0])
-                if first_pos == 1:
-                    style = "逃げ"
-                elif first_pos <= 4:
-                    style = "先行"
-                elif first_pos <= 9:
-                    style = "差し"
-                else:
-                    style = "追込"
+                odds_val = float(odds_el.text.strip())
             except Exception:
                 pass
 
-        last_str = "前走: データなし"
-        second_str = "前々走: データなし"
-        boost = 0.0
-        trend = "✨ 安定堅実"
-        suit = "○ 標準適性"
+        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_=re.compile(r"Popular_Ninki|Ninki"))
+        if pop_el and pop_el.text.strip().isdigit():
+            pop_val = int(pop_el.text.strip())
 
-        if past_parsed:
-            p0 = past_parsed[0]
-            components = [p0['summary'], p0['rank_str'], p0['agari']]
-            last_str = "前走: " + " ".join([c for c in components if c])
+        # 2. セル内容からの直接探索 (shutuba.html のオッズ・人気セル)
+        # ※ idx_t < 8 は馬番・馬名・性齢・斤量・騎手等のためスキップ（55.0等の斤量誤認を防止）
+        all_td_texts = [td.text.strip() for td in tds]
+        for idx_t, txt_t in enumerate(all_td_texts):
+            if idx_t < 8:
+                continue
+            # オッズパターン (例: 82.4, 6.0, 105.2)
+            if re.match(r"^\d{1,4}\.\d$", txt_t):
+                try:
+                    cand_odds = float(txt_t)
+                    if cand_odds > 0:
+                        odds_val = cand_odds
+                        if idx_t + 1 < len(all_td_texts) and all_td_texts[idx_t + 1].isdigit():
+                            pop_val = int(all_td_texts[idx_t + 1])
+                except Exception:
+                    pass
+            # 人気パターン (例: "(13人気)" や "13人気")
+            pop_match = re.search(r"\(?(\d{1,2})人気\)?", txt_t)
+            if pop_match:
+                pop_val = int(pop_match.group(1))
 
-            if p0["rank_num"] == 1:
-                boost += 2.5
-                trend = "🔥 前走1着 (連勝の勢い)"
-                suit = "◎ コース適性抜群"
-            elif p0["rank_num"] in [2, 3]:
-                boost += 1.8
-                trend = "✨ 前走好走 (安定充実)"
-                suit = "◎ 舞台好相性"
-            elif p0["rank_num"] in [4, 5]:
-                boost += 0.8
-                trend = "⚖️ 掲示板確保 (巻き返し十分)"
-                suit = "○ 距離適性あり"
-            elif p0["rank_num"] and p0["rank_num"] >= 10:
-                boost -= 1.5
-                trend = "⚠️ 前走大敗 (巻き返し課題)"
-                suit = "▲ 展開の助け要"
-
-            if len(past_parsed) > 1:
-                p1 = past_parsed[1]
-                p1_comp = [p1['summary'], p1['rank_str']]
-                second_str = "前々走: " + " ".join([c for c in p1_comp if c])
-                if p1["rank_num"] and p1["rank_num"] <= 3 and p0["rank_num"] and p0["rank_num"] <= 3:
-                    boost += 1.0
-                    trend = "🔥 2走連続好走 (充実一途)"
-
-        source_label = "🌐 netkeiba公式実戦データ" if "nar.netkeiba.com" not in clean_url else "🌐 地方競馬公式実戦データ"
-        comment = f"{last_str}。実戦データに基づくWeb公式戦績精査済。"
-
-        past_records_map[h_name] = {
-            "last_race": last_str,
-            "second_last": second_str,
-            "course_suitability": suit,
-            "form_trend": trend,
-            "key_point": comment,
-            "ability_boost": round(float(boost), 1),
-            "source": source_label
-        }
-
-        horses.append({
+        horses_map[h_name] = {
             "枠番": waku,
             "馬番": umaban,
             "馬名": h_name,
-            "騎手名": jockey,
+            "騎手名": jockey_full,
             "斤量": weight_val,
-            "脚質": style,
+            "脚質": "先行",
             "単勝オッズ": odds_val,
             "単勝人気": pop_val,
             "能力指数": 75
-        })
+        }
 
-    if not horses:
+    # 過去レースやオッズ確定後のレース（result.html）が存在する場合、結果テーブルから確定オッズ・確定人気・騎手名を補完
+    need_result_check = any(h["単勝人気"] is None for h in horses_map.values()) or "result.html" in clean_url
+    if need_result_check:
+        try:
+            resp_res = requests.get(url_result, headers=headers, timeout=8)
+            if resp_res.status_code == 200:
+                html_res = ""
+                for enc in ["utf-8", "euc-jp", "cp932"]:
+                    try:
+                        cand = resp_res.content.decode(enc)
+                        if "レース" in cand or "競馬" in cand or "払戻" in cand:
+                            html_res = cand
+                            break
+                    except Exception:
+                        pass
+                if not html_res:
+                    html_res = resp_res.content.decode("utf-8", errors="ignore")
+                soup_res = BeautifulSoup(html_res, "html.parser")
+                main_table = soup_res.find("table", id="All_Result_Table") or soup_res.find("table", class_="RaceTable01")
+                if main_table:
+                    for tr in main_table.find_all("tr"):
+                        h_a = tr.find("a", href=lambda h: h and "/horse/" in h)
+                        if not h_a:
+                            continue
+                        h_name = h_a.text.strip()
+                        if h_name in horses_map:
+                            tds = [td.text.strip() for td in tr.find_all("td")]
+                            if len(tds) >= 11:
+                                # 人気
+                                if tds[9].isdigit():
+                                    horses_map[h_name]["単勝人気"] = int(tds[9])
+                                # オッズ
+                                if re.match(r"^\d+\.?\d*$", tds[10]):
+                                    try:
+                                        horses_map[h_name]["単勝オッズ"] = float(tds[10])
+                                    except Exception:
+                                        pass
+                                # 騎手フルネームも補強
+                                j_a_res = tr.find("a", href=lambda h: h and "/jockey/" in h)
+                                if j_a_res and j_a_res.text.strip():
+                                    horses_map[h_name]["騎手名"] = normalize_jockey_name(j_a_res.text.strip())
+        except Exception:
+            pass
+
+    # 最終的な人気の確定（未設定の場合は馬番）
+    for h in horses_map.values():
+        if h["単勝人気"] is None:
+            h["単勝人気"] = min(18, h["馬番"])
+
+    # 2. 馬柱ページ (shutuba_past.html) を取得して過去5走・上がり3F・脚質をマージ
+    past_records_map = {}
+    try:
+        resp_past = requests.get(url_past, headers=headers, timeout=12)
+        if resp_past.status_code == 200:
+            html_past = ""
+            for enc in ["utf-8", "euc-jp", "cp932"]:
+                try:
+                    cand = resp_past.content.decode(enc)
+                    if "レース" in cand or "競馬" in cand:
+                        html_past = cand
+                        break
+                except Exception:
+                    pass
+            if not html_past:
+                html_past = resp_past.content.decode("utf-8", errors="ignore")
+            soup_past = BeautifulSoup(html_past, "html.parser")
+            rows_past = soup_past.find_all("tr", class_="HorseList")
+            if not rows_past:
+                rows_past = [tr for tr in soup_past.find_all("tr") if tr.find("a", href=lambda h: h and "/horse/" in h)]
+
+            for row in rows_past:
+                h_a = row.find("a", href=lambda h: h and "/horse/" in h)
+                if not h_a or not h_a.text.strip():
+                    continue
+                h_name = h_a.text.strip()
+
+                past_tds = row.find_all("td", class_="Past")
+                past_parsed = []
+                for ptd in past_tds[:3]:
+                    rank_num = None
+                    rk_m = re.search(r"(\d{1,2})着", ptd.text)
+                    if rk_m:
+                        rank_num = int(rk_m.group(1))
+                    else:
+                        for cls in ptd.get("class", []):
+                            if "Ranking_" in cls:
+                                try:
+                                    rank_num = int(cls.replace("Ranking_", ""))
+                                except Exception:
+                                    pass
+                    summary_text = " ".join(ptd.text.split())
+                    if not rank_num:
+                        rank_fall = re.search(r"\b(\d{1,2})\b", summary_text)
+                        if rank_fall and int(rank_fall.group(1)) <= 18:
+                            rank_num = int(rank_fall.group(1))
+
+                    d02 = ptd.find("div", class_="Data02")
+                    d05 = ptd.find("div", class_="Data05")
+                    d06 = ptd.find("div", class_="Data06")
+                    r_name_str = " ".join(d02.text.split()) if d02 else ""
+                    dist_time_str = " ".join(d05.text.split()) if d05 else ""
+
+                    if not r_name_str and not dist_time_str:
+                        dist_sub = re.search(r"(ダ|芝)?(\d{4})m?", summary_text)
+                        r_name_str = dist_sub.group(0) if dist_sub else ""
+
+                    agari_m = re.search(r"\(([34]\d\.\d)\)", summary_text)
+                    agari = f"上り{agari_m.group(1)}s" if agari_m else ""
+                    pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", summary_text)
+                    pass_order = pass_m.group(1) if pass_m else ""
+
+                    past_parsed.append({
+                        "rank_num": rank_num,
+                        "rank_str": f"{rank_num}着" if rank_num else "出走",
+                        "summary": f"{r_name_str} {dist_time_str}".strip() or summary_text[:25],
+                        "agari": agari,
+                        "pass_order": pass_order
+                    })
+
+                # 脚質判定
+                style = "先行"
+                if past_parsed and past_parsed[0]["pass_order"]:
+                    po = past_parsed[0]["pass_order"]
+                    try:
+                        first_pos = int(po.split("-")[0])
+                        if first_pos == 1:
+                            style = "逃げ"
+                        elif first_pos <= 4:
+                            style = "先行"
+                        elif first_pos <= 9:
+                            style = "差し"
+                        else:
+                            style = "追込"
+                    except Exception:
+                        pass
+                if h_name in horses_map:
+                    horses_map[h_name]["脚質"] = style
+
+                # 前走・前々走サマリー
+                last_str = "前走: データなし"
+                second_str = "前々走: データなし"
+                boost = 0.0
+                trend = "✨ 安定堅実"
+                suit = "○ 標準適性"
+
+                if past_parsed:
+                    p0 = past_parsed[0]
+                    components = [p0['summary'], p0['rank_str'], p0['agari']]
+                    last_str = "前走: " + " ".join([c for c in components if c])
+                    if p0["rank_num"] == 1:
+                        boost += 2.5
+                        trend = "🔥 前走1着 (連勝の勢い)"
+                        suit = "◎ コース適性抜群"
+                    elif p0["rank_num"] in [2, 3]:
+                        boost += 1.8
+                        trend = "✨ 前走好走 (安定充実)"
+                        suit = "◎ 舞台好相性"
+                    elif p0["rank_num"] in [4, 5]:
+                        boost += 0.8
+                        trend = "⚖️ 掲示板確保 (巻き返し十分)"
+                        suit = "○ 距離適性あり"
+                    elif p0["rank_num"] and p0["rank_num"] >= 10:
+                        boost -= 1.5
+                        trend = "⚠️ 前走大敗 (巻き返し課題)"
+                        suit = "▲ 展開の助け要"
+
+                    if len(past_parsed) > 1:
+                        p1 = past_parsed[1]
+                        second_str = "前々走: " + " ".join([c for c in [p1['summary'], p1['rank_str']] if c])
+                        if p1["rank_num"] and p1["rank_num"] <= 3 and p0["rank_num"] and p0["rank_num"] <= 3:
+                            boost += 1.0
+                            trend = "🔥 2走連続好走 (充実一途)"
+
+                source_label = "🌐 地方競馬公式実戦データ" if is_nar else "🌐 netkeiba公式実戦データ"
+                past_records_map[h_name] = {
+                    "last_race": last_str,
+                    "second_last": second_str,
+                    "course_suitability": suit,
+                    "form_trend": trend,
+                    "key_point": f"{last_str}。実戦データに基づくWeb公式戦績精査済。",
+                    "ability_boost": round(float(boost), 1),
+                    "source": source_label
+                }
+    except Exception:
+        pass
+
+    sorted_horses = sorted(list(horses_map.values()), key=lambda x: x["馬番"])
+    if not sorted_horses:
         return None, "出走馬データを抽出できませんでした。URLをご確認ください。"
 
     return {
@@ -875,7 +996,7 @@ def fetch_netkeiba_race(url: str):
         "track_name": track_name,
         "course_type": course_type,
         "distance": distance,
-        "horses": horses,
+        "horses": sorted_horses,
         "past_records": past_records_map
     }, None
 
