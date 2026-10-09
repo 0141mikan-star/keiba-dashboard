@@ -3054,7 +3054,9 @@ def fetch_netkeiba_race(url: str):
                                 # オッズ
                                 if re.match(r"^\d+\.?\d*$", tds[10]):
                                     try:
-                                        horses_map[h_name]["単勝オッズ"] = float(tds[10])
+                                        o_parsed = float(tds[10])
+                                        horses_map[h_name]["単勝オッズ"] = o_parsed
+                                        horses_map[h_name]["想定単勝オッズ"] = o_parsed
                                     except Exception:
                                         pass
                                 # 騎手フルネームも補強
@@ -3405,10 +3407,18 @@ def parse_horses_from_text(raw_text: str) -> list[dict]:
         for item in extracted_data:
             if not isinstance(item, dict):
                 continue
+            h_pop = int(item.get("単勝人気", len(parsed_list) + 1))
+            cand_odds = item.get("想定単勝オッズ") or item.get("単勝オッズ") or item.get("オッズ")
+            try:
+                final_o = float(cand_odds) if cand_odds is not None and float(cand_odds) > 1.0 else POPULARITY_BASE_ODDS.get(h_pop, 10.0)
+            except Exception:
+                final_o = POPULARITY_BASE_ODDS.get(h_pop, 10.0)
             parsed_list.append({
                 "馬番": int(item.get("馬番", len(parsed_list) + 1)),
                 "馬名": str(item.get("馬名", f"馬{len(parsed_list) + 1}")),
-                "単勝人気": int(item.get("単勝人気", len(parsed_list) + 1)),
+                "単勝人気": h_pop,
+                "想定単勝オッズ": final_o,
+                "単勝オッズ": final_o,
                 "騎手名": str(item.get("騎手名", "騎手")),
                 "脚質": item.get("脚質", "先行") if item.get("脚質") in ["逃げ", "先行", "差し", "追込"] else "先行",
             })
@@ -3425,11 +3435,21 @@ def parse_horses_from_text(raw_text: str) -> list[dict]:
                     h_no = int(tokens[0])
                     h_name = tokens[1]
                     h_pop = int(tokens[2]) if len(tokens) >= 3 and tokens[2].isdigit() else (len(parsed_list) + 1)
+                    # 4番目以降にオッズらしき数値があるか探索
+                    cand_o = None
+                    for tk in tokens[3:]:
+                        if re.match(r"^\d{1,4}\.\d$", tk):
+                            cand_o = float(tk)
+                            break
+                    if cand_o is None:
+                        cand_o = POPULARITY_BASE_ODDS.get(h_pop, 10.0)
                     parsed_list.append({
                         "馬番": h_no,
                         "馬名": h_name,
                         "単勝人気": h_pop,
-                        "騎手名": tokens[3] if len(tokens) >= 4 else "騎手",
+                        "想定単勝オッズ": cand_o,
+                        "単勝オッズ": cand_o,
+                        "騎手名": tokens[3] if len(tokens) >= 4 and not re.match(r"^\d{1,4}\.\d$", tokens[3]) else "騎手",
                         "脚質": "先行",
                     })
                 except Exception:
@@ -3520,6 +3540,7 @@ with st.expander("🌐 **【Web・画像から出走馬を一括自動入力】n
                     else:
                         horses_df = pd.DataFrame(res_data["horses"])
                         st.session_state["horses_data"] = horses_df
+                        st.session_state["last_fetched_url"] = url_input.strip()
                         st.session_state["netkeiba_past_records"] = res_data["past_records"]
                         st.session_state["detected_track"] = res_data["track_name"]
                         st.session_state["detected_course_type"] = res_data["course_type"]
@@ -3738,24 +3759,56 @@ with st.expander("🌐 **【Web・画像から出走馬を一括自動入力】n
 # ==========================================
 # 4. 出走馬データ入力テーブル
 # ==========================================
-st.subheader("📋 出走馬データ")
+col_tbl_h1, col_tbl_h2 = st.columns([2.5, 1.2])
+with col_tbl_h1:
+    st.subheader("📋 出走馬データ")
+with col_tbl_h2:
+    if st.session_state.get("last_fetched_url"):
+        if st.button("🔄 最新リアルタイムオッズ再取得", help="netkeiba公式から最新の確定/変動オッズ・人気を再取得して更新します", use_container_width=True):
+            with st.spinner("最新オッズを取得中..."):
+                res_up, err_up = fetch_netkeiba_race(st.session_state["last_fetched_url"])
+                if res_up and not err_up:
+                    st.session_state["horses_data"] = pd.DataFrame(res_up["horses"])
+                    st.session_state["predicted_results"] = None
+                    st.success("✅ 最新の公式オッズ・人気を再同期しました！")
+                    st.rerun()
+                else:
+                    st.error("オッズの再取得に失敗しました。")
+
 st.caption("💡 **脚質（逃げ・先行・差し・追込）は、新聞やnetkeibaの通過順（1-1-1なら逃げ、10-10-8なら差し/追込等）を見て自分で選ぶと的中率が大幅に向上します！**")
 
 if st.session_state.get("netkeiba_past_records"):
     count_p = len(st.session_state["netkeiba_past_records"])
     st.info(f"🌐 **netkeiba公式データ連携稼働中**: 全{count_p}頭分の【本物の過去走・前走着順・上り3Fタイム】を保持しています。予想実行時に全自動で精査・能力指数へダイレクト反映されます。")
 
-
 current_data = st.session_state["horses_data"].copy()
 current_data = current_data.loc[:, ~current_data.columns.duplicated()]
-required_cols = ["馬番", "馬名", "単勝人気", "騎手名", "脚質"]
+
+# 単勝オッズ・想定単勝オッズを確実に同期して保持
+if "想定単勝オッズ" not in current_data.columns:
+    if "単勝オッズ" in current_data.columns:
+        current_data["想定単勝オッズ"] = current_data["単勝オッズ"]
+    else:
+        current_data["想定単勝オッズ"] = current_data["単勝人気"].map(POPULARITY_BASE_ODDS).fillna(10.0)
+else:
+    if "単勝オッズ" in current_data.columns:
+        current_data["想定単勝オッズ"] = current_data["想定単勝オッズ"].fillna(current_data["単勝オッズ"])
+    current_data["想定単勝オッズ"] = current_data["想定単勝オッズ"].fillna(
+        current_data["単勝人気"].map(POPULARITY_BASE_ODDS).fillna(10.0)
+    )
+
+if "単勝オッズ" not in current_data.columns:
+    current_data["単勝オッズ"] = current_data["想定単勝オッズ"]
+
+required_cols = ["馬番", "馬名", "単勝人気", "想定単勝オッズ", "騎手名", "脚質"]
 existing_cols = [c for c in required_cols if c in current_data.columns]
 current_data = current_data[existing_cols]
 
 column_config = {
     "馬番": st.column_config.NumberColumn("馬番", min_value=1, max_value=18, step=1, format="%d", required=True),
     "馬名": st.column_config.TextColumn("馬名", required=True),
-    "単勝人気": st.column_config.NumberColumn("単勝人気 (1〜18)", min_value=1, max_value=18, step=1, format="%d位", required=True),
+    "単勝人気": st.column_config.NumberColumn("人気", min_value=1, max_value=18, step=1, format="%d位", required=True),
+    "想定単勝オッズ": st.column_config.NumberColumn("単勝オッズ", min_value=1.0, max_value=9999.0, step=0.1, format="%.1f倍", required=True, help="netkeiba公式確定オッズまたは最新オッズ（手動変更可能）"),
     "騎手名": st.column_config.TextColumn("騎手名", required=True),
     "脚質": st.column_config.SelectboxColumn("脚質 (自分で選択)", options=["逃げ", "先行", "差し", "追込"], required=True, help="競馬新聞の脚質や通過順を見て選んでください"),
 }
@@ -3789,6 +3842,17 @@ if st.session_state["has_run_prediction"]:
     if valid_df.empty:
         st.warning("⚠️ 出走馬データを入力してください。")
     else:
+        # オッズの同期・保証
+        if "想定単勝オッズ" in valid_df.columns:
+            valid_df["単勝オッズ"] = valid_df["想定単勝オッズ"]
+        elif "単勝オッズ" in valid_df.columns:
+            valid_df["想定単勝オッズ"] = valid_df["単勝オッズ"]
+
+        # エディタの変更内容を horses_data に同期
+        for col_name in ["単勝人気", "想定単勝オッズ", "単勝オッズ", "騎手名", "脚質"]:
+            if col_name in valid_df.columns and col_name in st.session_state["horses_data"].columns:
+                st.session_state["horses_data"][col_name] = valid_df[col_name]
+
         results, meta = calculate_predictions(
             valid_df, weight_ability, weight_pace, weight_jockey,
             weight_escape_dynamic, weight_synergy,
@@ -3997,7 +4061,7 @@ if st.session_state["predicted_results"] is not None:
         filtered_display,
         column_config={
             "AI印": st.column_config.TextColumn("印", help="AI推奨印（◎本命、○対抗、▲単穴、☆特注穴、△連下）"),
-            "想定単勝オッズ": st.column_config.NumberColumn("想定オッズ", format="%.1f倍", help="人気・AI勝率に基づく想定オッズ"),
+            "想定単勝オッズ": st.column_config.NumberColumn("単勝オッズ", format="%.1f倍", help="netkeiba公式確定オッズまたは実戦想定オッズ"),
             "期待値ランク": st.column_config.TextColumn("AI期待値", help="オッズ妙味（S:激熱、A:プラス、B:適正、C:過剰人気、ー:見送り）"),
             "過去走精査": st.column_config.TextColumn("近走勢い", help="AIが過去走から分析した調子・勢いバイオリズム"),
             "前走成績": st.column_config.TextColumn("前走実績"),
