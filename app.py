@@ -576,128 +576,128 @@ with st.sidebar.expander("🔑 AI画像認識 API設定 (Gemini)"):
 # 5. スコアリング＆予測関数
 # ==========================================
 PACE_MATRIX = {
-    "スローペース": {"逃げ": 1.35, "先行": 1.20, "差し": 0.85, "追込": 0.60},
-    "ミドルペース": {"逃げ": 1.05, "先行": 1.10, "差し": 1.05, "追込": 0.90},
-    "ハイペース":   {"逃げ": 0.60, "先行": 0.80, "差し": 1.25, "追込": 1.35},
+    "スローペース": {"逃げ": 1.12, "先行": 1.08, "差し": 0.94, "追込": 0.86},
+    "ミドルペース": {"逃げ": 1.02, "先行": 1.04, "差し": 1.02, "追込": 0.96},
+    "ハイペース":   {"逃げ": 0.88, "先行": 0.94, "差し": 1.08, "追込": 1.12},
 }
 
 def get_distance_modifiers(dist: int):
     """
     レース距離に応じた展開補正・騎手重要度（本格競馬モデル）:
-    - 短距離 (〜1400m): 前残り絶対有利（逃げ・先行が特大ボーナス、差し・追込は届かず減点）
+    - 短距離 (〜1400m): 前残り有利
     - マイル〜中距離 (1500m〜2000m): スピード＆スタミナの総合力勝負
-    - 長距離 (2100m〜): スタミナ温存・末脚重視（逃げスタミナ切れ失速減点、差し・追込特大ボーナス、名手騎手重要度急上昇）
+    - 長距離 (2100m〜): スタミナ温存・末脚重視
     """
     if dist <= 1400:
-        ability_factor = 1.15
-        jockey_factor = 0.85
-        pace_dist_bonus = {"逃げ": 25.0, "先行": 16.0, "差し": -12.0, "追込": -24.0}
-        pace_dist_mult = {"逃げ": 1.20, "先行": 1.15, "差し": 0.85, "追込": 0.70}
+        ability_factor = 1.05
+        jockey_factor = 0.95
+        pace_dist_bonus = {"逃げ": 5.0, "先行": 3.5, "差し": -2.5, "追込": -5.0}
+        pace_dist_mult = {"逃げ": 1.08, "先行": 1.05, "差し": 0.95, "追込": 0.90}
     elif dist <= 2000:
         ability_factor = 1.00
         jockey_factor = 1.00
-        pace_dist_bonus = {"逃げ": 4.0, "先行": 6.0, "差し": 5.0, "追込": 0.0}
+        pace_dist_bonus = {"逃げ": 1.0, "先行": 2.0, "差し": 2.0, "追込": 0.0}
         pace_dist_mult = {"逃げ": 1.00, "先行": 1.00, "差し": 1.00, "追込": 1.00}
     else:
-        ability_factor = 0.90
-        jockey_factor = 1.45
-        pace_dist_bonus = {"逃げ": -24.0, "先行": 4.0, "差し": 20.0, "追込": 16.0}
-        pace_dist_mult = {"逃げ": 0.75, "先行": 0.95, "差し": 1.20, "追込": 1.15}
+        ability_factor = 0.95
+        jockey_factor = 1.15
+        pace_dist_bonus = {"逃げ": -5.0, "先行": 1.0, "差し": 4.5, "追込": 3.5}
+        pace_dist_mult = {"逃げ": 0.92, "先行": 0.98, "差し": 1.06, "追込": 1.04}
     return ability_factor, jockey_factor, pace_dist_bonus, pace_dist_mult
 
 def get_style_distance_eval(style: str, dist: int) -> tuple[float, str]:
     """各馬の脚質とレース距離との展開相性を評価"""
     if dist <= 400:
         if style == "逃げ":
-            return 28.0, "⚡ ばんえい障害先頭 (+28)"
+            return 6.0, "⚡ ばんえい障害先頭 (+6)"
         elif style == "先行":
-            return 24.0, "👑 障害抜け出し主導権 (+24)"
+            return 5.0, "👑 障害抜け出し主導権 (+5)"
         elif style == "差し":
-            return -10.0, "▲ 障害待ち届かず不利 (-10)"
+            return -2.5, "▲ 障害待ち届かず不利 (-2.5)"
         else:
-            return -24.0, "✕ 追込障害絶望的 (-24)"
+            return -5.0, "✕ 追込障害絶望的 (-5)"
     elif dist <= 1400:
         if style == "逃げ":
-            return 25.0, "⚡ 前残り絶対有利 (+25)"
+            return 5.0, "⚡ 前残り有利 (+5)"
         elif style == "先行":
-            return 16.0, "◎ 好位抜け出し (+16)"
+            return 3.5, "◎ 好位抜け出し (+3.5)"
         elif style == "差し":
-            return -12.0, "▲ 届かず不利 (-12)"
+            return -2.5, "▲ 届かず警戒 (-2.5)"
         else:
-            return -24.0, "✕ 直線短く大不利 (-24)"
+            return -4.5, "✕ 直線短く位置取り課題 (-4.5)"
     elif dist <= 2000:
         if style in ["先行", "差し"]:
-            return 6.0, "○ 総合力適合 (+6)"
+            return 2.0, "○ 総合力適合 (+2)"
         elif style == "逃げ":
-            return 4.0, "○ ペース次第 (+4)"
+            return 1.5, "○ ペース次第 (+1.5)"
         else:
             return 0.0, "▲ 展開待ち (±0)"
     else:
         if style == "逃げ":
-            return -24.0, "✕ スタミナ切れ失速 (-24)"
+            return -5.0, "▲ スタミナ消耗警戒 (-5)"
         elif style == "先行":
-            return 4.0, "○ 折り合い要 (+4)"
+            return 1.5, "○ 折り合い要 (+1.5)"
         elif style == "差し":
-            return 20.0, "👑 直線末脚特大有利 (+20)"
+            return 4.5, "👑 直線末脚有利 (+4.5)"
         else:
-            return 16.0, "◎ 後方脚溜め急襲 (+16)"
+            return 3.5, "◎ 後方脚溜め急襲 (+3.5)"
 
 def get_track_modifiers(track_str: str, condition_str: str):
     """競馬場と馬場状態から、脚質ごとの補正とコース診断を算出"""
     if "東京" in track_str:
-        track_style_bonus = {"逃げ": -8.0, "先行": 2.0, "差し": 14.0, "追込": 10.0}
+        track_style_bonus = {"逃げ": -2.5, "先行": 1.0, "差し": 4.0, "追込": 3.0}
         track_desc = "東京 (直線525m・末脚炸裂)"
     elif "中山" in track_str:
-        track_style_bonus = {"逃げ": 14.0, "先行": 12.0, "差し": -8.0, "追込": -16.0}
+        track_style_bonus = {"逃げ": 3.5, "先行": 3.0, "差し": -2.0, "追込": -4.0}
         track_desc = "中山 (直線310m・急坂小回り前残り)"
     elif "新潟" in track_str:
-        track_style_bonus = {"逃げ": -12.0, "先行": 0.0, "差し": 16.0, "追込": 14.0}
+        track_style_bonus = {"逃げ": -3.0, "先行": 0.5, "差し": 4.5, "追込": 3.5}
         track_desc = "新潟 (直線659m・日本最長直線強襲)"
     elif "阪神" in track_str:
-        track_style_bonus = {"逃げ": 2.0, "先行": 8.0, "差し": 8.0, "追込": 4.0}
+        track_style_bonus = {"逃げ": 1.0, "先行": 2.5, "差し": 2.5, "追込": 1.0}
         track_desc = "阪神 (直線474m・急坂タフ)"
     elif "京都" in track_str:
-        track_style_bonus = {"逃げ": 6.0, "先行": 8.0, "差し": 6.0, "追込": 0.0}
+        track_style_bonus = {"逃げ": 2.0, "先行": 2.5, "差し": 2.0, "追込": 0.5}
         track_desc = "京都 (直線404m・平坦高速持続)"
     elif "中京" in track_str:
-        track_style_bonus = {"逃げ": -2.0, "先行": 6.0, "差し": 8.0, "追込": 4.0}
+        track_style_bonus = {"逃げ": -0.5, "先行": 2.0, "差し": 2.5, "追込": 1.0}
         track_desc = "中京 (直線412m・急坂タフ)"
     elif "盛岡" in track_str:
-        track_style_bonus = {"逃げ": 6.0, "先行": 8.0, "差し": 4.0, "追込": -4.0}
+        track_style_bonus = {"逃げ": 2.0, "先行": 2.5, "差し": 1.5, "追込": -1.0}
         track_desc = "盛岡 (左回り / 起伏4.4mタフ・地方唯一芝併設)"
     elif "大井" in track_str:
-        track_style_bonus = {"逃げ": 2.0, "先行": 6.0, "差し": 10.0, "追込": 6.0}
+        track_style_bonus = {"逃げ": 1.0, "先行": 2.0, "差し": 3.0, "追込": 2.0}
         track_desc = "大井 (右回り / 直線386m・南関王道・外差し届く)"
     elif "金沢" in track_str:
-        track_style_bonus = {"逃げ": 18.0, "先行": 14.0, "差し": -12.0, "追込": -20.0}
+        track_style_bonus = {"逃げ": 4.5, "先行": 3.5, "差し": -3.0, "追込": -5.0}
         track_desc = "金沢 (右回り / 直線236m・超小回り前残り鉄則)"
     elif "笠松" in track_str:
-        track_style_bonus = {"逃げ": 20.0, "先行": 15.0, "差し": -12.0, "追込": -22.0}
+        track_style_bonus = {"逃げ": 5.0, "先行": 4.0, "差し": -3.0, "追込": -5.0}
         track_desc = "笠松 (右回り / 直線201m・超小回り前残り・内枠先行鉄則)"
     elif "園田" in track_str:
-        track_style_bonus = {"逃げ": 16.0, "先行": 14.0, "差し": -6.0, "追込": -16.0}
+        track_style_bonus = {"逃げ": 4.0, "先行": 3.5, "差し": -1.5, "追込": -4.0}
         track_desc = "園田 (右回り / 直線213m・小回りスパイラル・先行有利＆捲り警戒)"
     elif "帯広" in track_str or "ば" in track_str:
-        track_style_bonus = {"逃げ": 18.0, "先行": 20.0, "差し": -10.0, "追込": -24.0}
+        track_style_bonus = {"逃げ": 5.0, "先行": 5.5, "差し": -2.5, "追込": -5.0}
         track_desc = "帯広（ば） (直線200m / 世界唯一ばんえい・障害登坂)"
     elif any(k in track_str for k in ["小倉", "福島", "函館", "札幌"]):
-        track_style_bonus = {"逃げ": 16.0, "先行": 12.0, "差し": -10.0, "追込": -18.0}
-        track_desc = "小回り平坦 (前残り絶対有利)"
+        track_style_bonus = {"逃げ": 4.0, "先行": 3.0, "差し": -2.5, "追込": -4.5}
+        track_desc = "小回り平坦 (前残り有利)"
     else:
         track_style_bonus = {"逃げ": 0.0, "先行": 0.0, "差し": 0.0, "追込": 0.0}
         track_desc = "標準コース"
 
     if "重・不良" in condition_str:
-        cond_style_bonus = {"逃げ": 14.0, "先行": 9.0, "差し": -8.0, "追込": -15.0}
+        cond_style_bonus = {"逃げ": 3.5, "先行": 2.5, "差し": -2.0, "追込": -4.0}
         if "帯広" in track_str or "ば" in track_str:
             cond_desc = "☔ 重・不良 (水分高・ソリ軽馬場超スピード前残り)"
         else:
             cond_desc = "☔ 重・不良 (泥濘スタミナ戦・前残り波乱)"
     elif "稍重" in condition_str:
-        cond_style_bonus = {"逃げ": 5.0, "先行": 4.0, "差し": 0.0, "追込": -5.0}
+        cond_style_bonus = {"逃げ": 1.5, "先行": 1.2, "差し": 0.0, "追込": -1.5}
         cond_desc = "☁️ 稍重 (タフな馬場)"
     else:
-        cond_style_bonus = {"逃げ": 0.0, "先行": 2.0, "差し": 2.0, "追込": 0.0}
+        cond_style_bonus = {"逃げ": 0.0, "先行": 0.8, "差し": 0.8, "追込": 0.0}
         if "帯広" in track_str or "ば" in track_str:
             cond_desc = "☀️ 良馬場 (乾燥砂重・超パワー消耗戦)"
         else:
@@ -2455,11 +2455,38 @@ def calculate_predictions(
 
     # 展開力学の自動診断
     if escape_count == 1:
-        pace_diag = "🎯 【単騎逃げ濃厚】 誰も競りかけてこずマイペース楽逃げ！逃げ馬が圧倒的有利（前残り警戒）"
+        pace_diag = "🎯 【単騎逃げ濃厚】 誰も競りかけてこずマイペース楽逃げ！逃げ馬が有利（前残り警戒）"
     elif escape_count >= 2:
-        pace_diag = f"🔥 【ハナ争い激化】 逃げ馬が{escape_count}頭競合！超ハイペース必至で逃げ馬は共倒れ、後方の差し・追込馬が大有利"
+        pace_diag = f"🔥 【ハナ争い激化】 逃げ馬が{escape_count}頭競合！ハイペースで先行激化、好位〜差し馬に展開向く"
     else:
         pace_diag = "🐢 【逃げ馬不在】 押し出された先行馬がスロー単騎！前残り＆位置取り勝負"
+
+    # 🐎 出走表の実オッズから「市場支持率（インプライド勝率）」とベース能力指数を動的算出
+    has_valid_odds = False
+    raw_odds_list = []
+    for _, r in df.iterrows():
+        o = r.get("想定単勝オッズ")
+        if o is None or pd.isna(o) or float(o) <= 1.0:
+            o = r.get("単勝オッズ")
+        if o is not None and not pd.isna(o) and float(o) > 1.0:
+            raw_odds_list.append(float(o))
+        else:
+            raw_odds_list.append(None)
+
+    valid_odds_cnt = sum(1 for o in raw_odds_list if o is not None)
+    market_shares = None
+    if valid_odds_cnt >= max(2, int(len(df) * 0.6)):
+        has_valid_odds = True
+        filled_odds = []
+        for i_o, o in enumerate(raw_odds_list):
+            if o is not None:
+                filled_odds.append(o)
+            else:
+                pop_f = int(df.iloc[i_o].get("単勝人気", 5))
+                filled_odds.append(POPULARITY_BASE_ODDS.get(pop_f, 25.0))
+        inv_sum = sum(1.0 / o for o in filled_odds)
+        if inv_sum > 0:
+            market_shares = [(1.0 / o) / inv_sum for o in filled_odds]
 
     scores = []
     ability_scores = []
@@ -2478,9 +2505,16 @@ def calculate_predictions(
     past_last_list = []
     past_boost_list = []
 
-    for _, row in df.iterrows():
+    for row_idx, (_, row) in enumerate(df.iterrows()):
         pop = row.get("単勝人気", 5)
-        idx_val = popularity_to_index(pop)
+        # オッズ支持率があればオッズから高精度能力指数を算出し、なければ人気順位から算出
+        if market_shares is not None:
+            n_horses = len(df)
+            share = market_shares[row_idx]
+            ratio = max(0.04, share * n_horses)
+            idx_val = int(round(np.clip(75.0 + 13.0 * np.log(ratio), 56.0, 97.0)))
+        else:
+            idx_val = popularity_to_index(pop)
         estimated_indices.append(idx_val)
 
         # 【Tier 2】 個別馬の学習実績メモリーを適用（レースを重ねるごとに精度向上）
@@ -2505,88 +2539,98 @@ def calculate_predictions(
         past_last_list.append(past_last)
         past_boost_list.append(f"{past_boost:+.1f}点")
 
-        # ① 基礎能力 (上位突出馬の非線形格差補正 + 個別馬の学習実績 + 過去走精査ボーナス)
+        # ⚖️ 斤量補正（基準56.0kgからの増減）
+        w_val = 56.0
+        try:
+            w_raw = row.get("斤量")
+            if w_raw is not None and not pd.isna(w_raw):
+                w_val = float(w_raw)
+        except Exception:
+            w_val = 56.0
+        weight_bonus = round((56.0 - w_val) * 1.0, 2)  # 54kgなら+2.0点、58kgなら-2.0点
+
+        # ① 基礎能力 (上位突出馬の格差補正 + 個別馬の学習実績 + 過去走精査ボーナス + 斤量補正)
         extra_ability = 0.0
         if idx_val >= 92:
-            extra_ability = ((idx_val - 90) ** 1.3) * 1.5 * (w_ability / 1.5)
+            extra_ability = ((idx_val - 90) ** 1.2) * 1.2 * (w_ability / 1.5)
         extra_ability += h_adj  # 過去の学習実績を上乗せ
 
-        # 過去レースデータを精査した補正値を能力に合算！
-        ability = (float(idx_val) * w_ability * dist_ab_factor) + extra_ability + past_boost
+        ability = (float(idx_val) * w_ability * dist_ab_factor) + extra_ability + past_boost + weight_bonus
 
-        # ② 展開・脚質ベース
+        # ② 展開・脚質ベース（適正スケーリング: ±4〜6点程度）
         style = str(row.get("脚質", "先行"))
         pace_mult = PACE_MATRIX.get(pace_prediction, {}).get(style, 1.0) * pace_dist_mult.get(style, 1.0)
-        
+
         # ★ ダート短距離 (<=1400m) のハイペース補正: 前残り物理法則を反映
         if course_type == "ダート" and race_distance <= 1400 and pace_prediction == "ハイペース":
             if style == "先行":
-                pace_mult = max(pace_mult, 1.05)  # 好位追走は失速せず抜け出す勝ちパターン
+                pace_mult = max(pace_mult, 1.04)
             elif style == "逃げ":
-                pace_mult = max(pace_mult, 0.85)  # 逃げ粘りの減点を緩和
+                pace_mult = max(pace_mult, 0.92)
             elif style in ["差し", "追込"]:
-                pace_mult = min(pace_mult, 1.05)  # 短距離ダートで後ろから届く過大評価を抑制
+                pace_mult = min(pace_mult, 1.04)
 
-        base_pace = 50.0 * w_pace * pace_mult
+        base_pace = (pace_mult - 1.0) * 35.0 * w_pace
 
-        # ③ 【展開力学】他馬との相互作用（単騎逃げの利 vs 競り合い共倒れ）
+        # ③ 【展開力学】他馬との相互作用（適正スケーリング: ±3〜6点程度）
         dynamic_score = 0.0
         if style == "逃げ":
             if escape_count == 1:
-                dynamic_score += 26.0 * w_escape_dynamic  # 単騎逃げ特大ボーナス
+                dynamic_score += 5.5 * w_escape_dynamic  # 単騎逃げ好走
             elif escape_count >= 2:
-                esc_pen = 15.0 if (course_type == "ダート" and race_distance <= 1400) else 22.0
-                dynamic_score -= esc_pen * w_escape_dynamic  # 競り合い共倒れ減点
+                esc_pen = 3.5 if (course_type == "ダート" and race_distance <= 1400) else 4.5
+                dynamic_score -= esc_pen * w_escape_dynamic  # 競り合い負担
         elif style in ["差し", "追込"]:
             if escape_count >= 2:
-                bon = 10.0 if (course_type == "ダート" and race_distance <= 1400) else 20.0
-                dynamic_score += bon * w_escape_dynamic  # ハイペース前崩れの漁夫の利
+                bon = 2.5 if (course_type == "ダート" and race_distance <= 1400) else 4.5
+                dynamic_score += bon * w_escape_dynamic  # ハイペース前崩れの恩恵
             elif escape_count <= 1:
-                dynamic_score -= 14.0 * w_escape_dynamic  # 前が止まらず届かない減点
+                dynamic_score -= 3.5 * w_escape_dynamic  # スロー前残り届かず
         elif style == "先行":
             if escape_count == 0:
-                dynamic_score += 15.0 * w_escape_dynamic  # 逃げ不在で楽に先手を取れる利
+                dynamic_score += 3.5 * w_escape_dynamic  # 逃げ不在で楽に先手
             elif escape_count >= 2 and course_type == "ダート" and race_distance <= 1400:
-                dynamic_score += 14.0 * w_escape_dynamic  # 逃げ争いを離れた好位で見ながら直線抜け出す黄金パターン！
+                dynamic_score += 3.0 * w_escape_dynamic  # 好位抜け出し黄金パターン
 
-        # ④ 騎手能力ベース
+        # ④ 騎手能力ベース（勝率8%を平均基準として適正スケーリング）
         j_name = str(row.get("騎手名", ""))
         j_rate = get_jockey_rate(j_name)
         jockey_rates.append(j_rate)
-        base_jockey = j_rate * w_jockey * 3.0 * dist_jk_factor
+        base_jockey = (j_rate - 8.0) * 0.7 * w_jockey * dist_jk_factor
 
         # ⑤ 【クロスシナジー】掛け算相互作用
         synergy_score = 0.0
-        # 長距離 × トップ騎手 (14%以上: ルメール、川田、武豊、モレイラ等)
+        # 長距離 × トップ騎手
         if race_distance >= 2100 and j_rate >= 14.0:
-            synergy_score += (j_rate - 11.0) * 2.2 * w_synergy
+            synergy_score += (j_rate - 11.0) * 0.5 * w_synergy
         # 短距離 × 先行逃げ
         if race_distance <= 1400 and style in ["逃げ", "先行"]:
-            synergy_score += 14.0 * w_synergy
-        # 長距離 × 競り合い逃げ（スタミナ切れ必至）
+            synergy_score += 2.5 * w_synergy
+        # 長距離 × 競り合い逃げ
         if race_distance >= 2200 and style == "逃げ" and escape_count >= 2:
-            synergy_score -= 25.0 * w_synergy
+            synergy_score -= 5.0 * w_synergy
 
         # ⑥ 【レース距離 × 脚質】の展開適合ボーナス
         dist_bonus_val, dist_bonus_lbl = get_style_distance_eval(style, race_distance)
 
         # ⑦ 【競馬場 (コース特徴) × 馬場状態 (水分天候)】の脚質補正
         t_val = track_style_bonus.get(style, 0.0) + cond_style_bonus.get(style, 0.0)
-        if t_val > 5:
+        if t_val > 2.0:
             tc_lbl = "◎ コース・馬場追い風"
-        elif t_val < -5:
+        elif t_val < -2.0:
             tc_lbl = "▲ コース・馬場向かず"
         else:
             tc_lbl = "○ コース不問"
         track_cond_labels.append(tc_lbl)
 
-        # ⑧ 【枠番・馬番バイアス】（コース×距離×馬番の物理バイアス）
+        # ⑧ 【枠番・馬番バイアス】
         draw_score = 0.0
         draw_lbl = "○ 枠順フラット"
         try:
             h_num = int(row.get("馬番", 0))
             total_n = len(df)
             draw_score, draw_lbl = get_draw_bias(h_num, total_n, track_name, course_type, race_distance)
+            draw_score = draw_score * 0.5  # スケール適正化
         except Exception:
             pass
         draw_labels.append(draw_lbl)
@@ -2622,7 +2666,7 @@ def calculate_predictions(
     scores_array = np.array(scores, dtype=float)
     if len(scores_array) > 0:
         score_std = np.std(scores_array)
-        temperature = max(score_std, 10.0)
+        temperature = max(score_std, 12.0)
         exp_scores = np.exp((scores_array - np.max(scores_array)) / temperature)
         win_rates = (exp_scores / np.sum(exp_scores)) * 100.0
         result_df["勝率(%)"] = np.round(win_rates, 1)
