@@ -2393,7 +2393,16 @@ def calculate_predictions(
             w_rate = float(row.get("勝率(%)", 10.0))
             pred_rank = int(row.get("予想着順数値", idx + 1))
             is_upset = bool(row.get("特注穴馬", False))
-            o_val = estimate_single_odds(pop_val, w_rate, total_len)
+            
+            # 出走表に実オッズがあれば最優先で採用
+            u_o = row.get("想定単勝オッズ")
+            if u_o is None or pd.isna(u_o) or float(u_o) <= 1.0:
+                u_o = row.get("単勝オッズ")
+            if u_o is not None and not pd.isna(u_o) and float(u_o) > 1.0:
+                o_val = float(u_o)
+            else:
+                o_val = estimate_single_odds(pop_val, w_rate, total_len)
+
             ev_val = calculate_expected_value(w_rate, o_val)
             grade_text, grade_icon = get_ev_grade(
                 ev=ev_val,
@@ -2642,7 +2651,16 @@ def calculate_predictions(
         w_rate = float(row.get("勝率(%)", 10.0))
         pred_rank = int(row.get("予想着順数値", idx + 1))
         is_upset = bool(row.get("特注穴馬", False))
-        o_val = estimate_single_odds(pop_val, w_rate, total_horses)
+        
+        # 出走表に実オッズがあれば最優先で採用
+        u_o = row.get("想定単勝オッズ")
+        if u_o is None or pd.isna(u_o) or float(u_o) <= 1.0:
+            u_o = row.get("単勝オッズ")
+        if u_o is not None and not pd.isna(u_o) and float(u_o) > 1.0:
+            o_val = float(u_o)
+        else:
+            o_val = estimate_single_odds(pop_val, w_rate, total_horses)
+
         ev_val = calculate_expected_value(w_rate, o_val)
         grade_text, grade_icon = get_ev_grade(
             ev=ev_val,
@@ -2797,6 +2815,48 @@ def fetch_netkeiba_race(url: str):
 
     soup_base = BeautifulSoup(html_base, "html.parser")
 
+    # 0. netkeiba公式リアルタイムオッズAPI（JRA / 地方NAR）から単勝オッズ・単勝人気を高精度取得
+    api_odds_map = {}
+    api_pop_map = {}
+    try:
+        api_endpoint = "api_get_nar_odds.html" if is_nar else "api_get_jra_odds.html"
+        url_api_odds = f"https://{domain}/api/{api_endpoint}?race_id={race_id}&type=1"
+        resp_api = requests.get(url_api_odds, headers=headers, timeout=8)
+        if resp_api.status_code == 200:
+            data_api = resp_api.json()
+            if not is_nar:
+                # JRA中央競馬: data -> odds -> '1' -> { '01': [odds, fukusho, ninki], ... }
+                w_odds = data_api.get("data", {}).get("odds", {}).get("1", {})
+                if isinstance(w_odds, dict):
+                    for u_str, val_list in w_odds.items():
+                        if isinstance(val_list, list) and len(val_list) >= 3:
+                            try:
+                                u_no = int(u_str)
+                                o_v = float(val_list[0])
+                                p_v = int(val_list[2])
+                                if o_v > 0:
+                                    api_odds_map[u_no] = o_v
+                                    api_pop_map[u_no] = p_v
+                            except Exception:
+                                pass
+            else:
+                # 地方競馬 NAR: ary_odds -> { '01': {'Odds': '29.6', 'Ninki': 5}, ... }
+                ary_odds = data_api.get("ary_odds", {})
+                if isinstance(ary_odds, dict):
+                    for u_str, o_info in ary_odds.items():
+                        if isinstance(o_info, dict):
+                            try:
+                                u_no = int(u_str)
+                                o_v = float(o_info.get("Odds", 0))
+                                p_v = int(o_info.get("Ninki", 0))
+                                if o_v > 0:
+                                    api_odds_map[u_no] = o_v
+                                    api_pop_map[u_no] = p_v
+                            except Exception:
+                                pass
+    except Exception:
+        pass
+
     # レース名・コース条件の抽出
     race_name = ""
     race_name_el = soup_base.find("h1", class_="RaceName") or soup_base.find("div", class_="RaceName")
@@ -2904,42 +2964,45 @@ def fetch_netkeiba_race(url: str):
                         pass
 
         # 単勝オッズ & 単勝人気
-        odds_val = 10.0
-        pop_val = None
+        odds_val = api_odds_map.get(umaban)
+        pop_val = api_pop_map.get(umaban)
 
-        # 1. 専用ID・クラスから探索
-        odds_el = row.find("span", id=re.compile(r"odds-")) or row.find("td", class_=re.compile(r"Odds"))
-        if odds_el and re.match(r"^\d+\.?\d*$", odds_el.text.strip()):
-            try:
-                odds_val = float(odds_el.text.strip())
-            except Exception:
-                pass
-
-        pop_el = row.find("span", id=re.compile(r"popularity-")) or row.find("td", class_=re.compile(r"Popular_Ninki|Ninki"))
-        if pop_el and pop_el.text.strip().isdigit():
-            pop_val = int(pop_el.text.strip())
-
-        # 2. セル内容からの直接探索 (shutuba.html のオッズ・人気セル)
-        # ※ idx_t < 8 は馬番・馬名・性齢・斤量・騎手等のためスキップ（55.0等の斤量誤認を防止）
-        all_td_texts = [td.text.strip() for td in tds]
-        for idx_t, txt_t in enumerate(all_td_texts):
-            if idx_t < 8:
-                continue
-            # オッズパターン (例: 82.4, 6.0, 105.2)
-            if re.match(r"^\d{1,4}\.\d$", txt_t):
+        # APIで取れなかった場合のHTML内探索
+        if odds_val is None or pop_val is None:
+            # 1. 専用ID・クラスから探索
+            odds_el = row.find("span", id=re.compile(r"odds-")) or row.find("td", class_=re.compile(r"Odds"))
+            if odds_el and re.match(r"^\d+\.?\d*$", odds_el.text.strip()):
                 try:
-                    cand_odds = float(txt_t)
-                    if cand_odds > 0:
-                        odds_val = cand_odds
-                        if idx_t + 1 < len(all_td_texts) and all_td_texts[idx_t + 1].isdigit():
-                            pop_val = int(all_td_texts[idx_t + 1])
+                    if odds_val is None:
+                        odds_val = float(odds_el.text.strip())
                 except Exception:
                     pass
-            # 人気パターン (例: "(13人気)" や "13人気")
-            pop_match = re.search(r"\(?(\d{1,2})人気\)?", txt_t)
-            if pop_match:
-                pop_val = int(pop_match.group(1))
 
+            pop_el = row.find("span", id=re.compile(r"popularity-|ninki-")) or row.find("td", class_=re.compile(r"Popular_Ninki|Ninki"))
+            if pop_el and pop_el.text.strip().isdigit():
+                if pop_val is None:
+                    pop_val = int(pop_el.text.strip())
+
+            # 2. セル内容からの直接探索 (shutuba.html のオッズ・人気セル)
+            all_td_texts = [td.text.strip() for td in tds]
+            for idx_t, txt_t in enumerate(all_td_texts):
+                if idx_t < 8:
+                    continue
+                if re.match(r"^\d{1,4}\.\d$", txt_t):
+                    try:
+                        cand_odds = float(txt_t)
+                        if cand_odds > 0 and odds_val is None:
+                            odds_val = cand_odds
+                            if idx_t + 1 < len(all_td_texts) and all_td_texts[idx_t + 1].isdigit() and pop_val is None:
+                                pop_val = int(all_td_texts[idx_t + 1])
+                    except Exception:
+                        pass
+                pop_match = re.search(r"\(?(\d{1,2})人気\)?", txt_t)
+                if pop_match and pop_val is None:
+                    pop_val = int(pop_match.group(1))
+
+        # 初期値（オッズ未取得の場合はNone）
+        final_odds = float(odds_val) if odds_val is not None else None
         horses_map[h_name] = {
             "枠番": waku,
             "馬番": umaban,
@@ -2947,7 +3010,8 @@ def fetch_netkeiba_race(url: str):
             "騎手名": jockey_full,
             "斤量": weight_val,
             "脚質": "先行",
-            "単勝オッズ": odds_val,
+            "単勝オッズ": final_odds,
+            "想定単勝オッズ": final_odds,
             "単勝人気": pop_val,
             "能力指数": 75
         }
@@ -3005,12 +3069,7 @@ def fetch_netkeiba_race(url: str):
         except Exception:
             pass
 
-    # 最終的な人気の確定（未設定の場合は馬番）
-    for h in horses_map.values():
-        if h["単勝人気"] is None:
-            h["単勝人気"] = min(18, h["馬番"])
-
-    # 2. 馬柱ページ (shutuba_past.html) を取得して過去5走・上がり3F・脚質をマージ
+    # 2. 馬柱ページ (shutuba_past.html) を取得して過去5走・上がり3F・脚質・オッズをマージ
     past_records_map = {}
     try:
         resp_past = requests.get(url_past, headers=headers, timeout=12)
@@ -3036,6 +3095,35 @@ def fetch_netkeiba_race(url: str):
                 if not h_a or not h_a.text.strip():
                     continue
                 h_name = h_a.text.strip()
+
+                # shutuba_past.html の Horse_Info からオッズ・人気を抽出補強
+                h_info_td = row.find("td", class_="Horse_Info") or row.find("td", class_=re.compile(r"HorseInfo"))
+                if h_info_td and h_name in horses_map:
+                    sp_odds = h_info_td.find("span", id=re.compile(r"odds-"))
+                    sp_pop = h_info_td.find("span", id=re.compile(r"ninki-|popularity-"))
+                    if sp_odds and re.match(r"^\d+\.?\d*$", sp_odds.text.strip()):
+                        try:
+                            o_num = float(sp_odds.text.strip())
+                            horses_map[h_name]["単勝オッズ"] = o_num
+                            horses_map[h_name]["想定単勝オッズ"] = o_num
+                        except Exception:
+                            pass
+                    if sp_pop and sp_pop.text.strip().isdigit():
+                        try:
+                            horses_map[h_name]["単勝人気"] = int(sp_pop.text.strip())
+                        except Exception:
+                            pass
+                    # "12.6 (5人気)" パターン
+                    m_txt = re.search(r"(\d{1,4}\.\d)\s*\((\d{1,2})人気\)", h_info_td.text)
+                    if m_txt:
+                        try:
+                            o_num = float(m_txt.group(1))
+                            p_num = int(m_txt.group(2))
+                            horses_map[h_name]["単勝オッズ"] = o_num
+                            horses_map[h_name]["想定単勝オッズ"] = o_num
+                            horses_map[h_name]["単勝人気"] = p_num
+                        except Exception:
+                            pass
 
                 past_tds = row.find_all("td", class_="Past")
                 if not past_tds:
@@ -3202,6 +3290,69 @@ def fetch_netkeiba_race(url: str):
                 }
     except Exception:
         pass
+
+    # 最終的なオッズと人気の整合性確定
+    # 1. 実際に公式から取得できた実オッズの有無を確認
+    valid_odds_horses = [h for h in horses_map.values() if h.get("単勝オッズ") is not None and float(h.get("単勝オッズ", 0)) > 1.0]
+
+    if valid_odds_horses:
+        # 【ケースA: 実オッズが存在する】
+        sorted_by_odds = sorted(valid_odds_horses, key=lambda x: float(x["単勝オッズ"]))
+        for rank_idx, h_item in enumerate(sorted_by_odds, start=1):
+            if h_item.get("単勝人気") is None:
+                h_item["単勝人気"] = rank_idx
+            h_item["想定単勝オッズ"] = float(h_item["単勝オッズ"])
+
+        # 実オッズのない馬が混ざっている場合、人気からオッズを推定
+        for h_item in horses_map.values():
+            if h_item.get("単勝人気") is not None:
+                if h_item.get("単勝オッズ") is None or float(h_item.get("単勝オッズ", 0)) <= 1.0:
+                    est_b_odds = POPULARITY_BASE_ODDS.get(int(h_item["単勝人気"]), 25.0)
+                    h_item["単勝オッズ"] = est_b_odds
+                    h_item["想定単勝オッズ"] = est_b_odds
+
+        # それでも人気が未確定の馬がいる場合のフォールバック
+        unranked_horses = [h for h in horses_map.values() if h.get("単勝人気") is None]
+        if unranked_horses:
+            max_assigned_pop = max([int(h["単勝人気"]) for h in horses_map.values() if h.get("単勝人気") is not None] or [0])
+            for idx_u, h_un in enumerate(unranked_horses, start=max_assigned_pop + 1):
+                h_un["単勝人気"] = min(18, idx_u)
+                base_o = POPULARITY_BASE_ODDS.get(h_un["単勝人気"], 25.0)
+                h_un["単勝オッズ"] = base_o
+                h_un["想定単勝オッズ"] = base_o
+    else:
+        # 【ケースB: 全頭オッズ未発表（開催前日・枠順確定直後など）】
+        has_any_pop = any(h.get("単勝人気") is not None for h in horses_map.values())
+        if not has_any_pop:
+            # 馬番連番ではなく、AI実力スコア（騎手勝率＋過去走実績・能力指数）により実力順に推定人気を自動整定！
+            for h in horses_map.values():
+                h_name = h.get("馬名", "")
+                p_info = past_records_map.get(h_name, {})
+                j_rate = get_jockey_rate(h.get("騎手名", ""))
+                ab_boost = p_info.get("ability_boost", 0.0)
+                # 騎手勝率（約5〜28%）＋過去走ブースト（-5〜+8）による総合スコア
+                h["_ai_eval_score"] = j_rate * 1.5 + ab_boost * 3.0
+
+            ranked_by_ai = sorted(horses_map.values(), key=lambda x: x.get("_ai_eval_score", 0.0), reverse=True)
+            for rank_idx, h_item in enumerate(ranked_by_ai, start=1):
+                h_item["単勝人気"] = rank_idx
+                est_odds = POPULARITY_BASE_ODDS.get(rank_idx, round(10.0 + rank_idx * 15.0, 1))
+                h_item["単勝オッズ"] = est_odds
+                h_item["想定単勝オッズ"] = est_odds
+                h_item.pop("_ai_eval_score", None)
+        else:
+            # 一部人気が判明している場合
+            for h_item in horses_map.values():
+                if h_item.get("単勝人気") is None:
+                    h_item["単勝人気"] = min(18, h_item["馬番"])
+                est_odds = POPULARITY_BASE_ODDS.get(int(h_item["単勝人気"]), 25.0)
+                h_item["単勝オッズ"] = est_odds
+                h_item["想定単勝オッズ"] = est_odds
+
+    # 4. 単勝人気に連動して「能力指数」も最適化（75固定を解消）
+    for h in horses_map.values():
+        if h.get("単勝人気") is not None:
+            h["能力指数"] = popularity_to_index(int(h["単勝人気"]))
 
     sorted_horses = sorted(list(horses_map.values()), key=lambda x: x["馬番"])
     if not sorted_horses:

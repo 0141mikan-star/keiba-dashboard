@@ -298,8 +298,13 @@ def render_win5_simulator(
                                 matched_track = next((t for t in track_options if detected_t in t), track_options[0])
 
                                 horses_df = pd.DataFrame(res_data["horses"])
-                                if "想定単勝オッズ" not in horses_df.columns:
-                                    horses_df["想定単勝オッズ"] = 10.0
+                                if "想定単勝オッズ" not in horses_df.columns or horses_df["想定単勝オッズ"].isna().all():
+                                    if "単勝オッズ" in horses_df.columns:
+                                        horses_df["想定単勝オッズ"] = horses_df["単勝オッズ"]
+                                    else:
+                                        horses_df["想定単勝オッズ"] = 10.0
+                                elif "単勝オッズ" in horses_df.columns:
+                                    horses_df["想定単勝オッズ"] = horses_df["想定単勝オッズ"].fillna(horses_df["単勝オッズ"])
                                 if "斤量" not in horses_df.columns:
                                     horses_df["斤量"] = 56.0
 
@@ -370,8 +375,13 @@ def render_win5_simulator(
                         detected_t = res_data["track_name"]
                         matched_track = next((t for t in track_options if detected_t in t), track_options[0])
                         horses_df = pd.DataFrame(res_data["horses"])
-                        if "想定単勝オッズ" not in horses_df.columns:
-                            horses_df["想定単勝オッズ"] = 10.0
+                        if "想定単勝オッズ" not in horses_df.columns or horses_df["想定単勝オッズ"].isna().all():
+                            if "単勝オッズ" in horses_df.columns:
+                                horses_df["想定単勝オッズ"] = horses_df["単勝オッズ"]
+                            else:
+                                horses_df["想定単勝オッズ"] = 10.0
+                        elif "単勝オッズ" in horses_df.columns:
+                            horses_df["想定単勝オッズ"] = horses_df["想定単勝オッズ"].fillna(horses_df["単勝オッズ"])
                         if "斤量" not in horses_df.columns:
                             horses_df["斤量"] = 56.0
 
@@ -463,6 +473,10 @@ def render_win5_simulator(
                     for h_name, p_val in p_recs.items():
                         st.markdown(f"**{h_name}**: {p_val.get('last_race', '')} ｜ {p_val.get('form_trend', '')} ｜ 適性: {p_val.get('course_suitability', '')}")
 
+            clean_horses = h_df_edited.dropna(subset=["馬名"]).copy()
+            if "想定単勝オッズ" in clean_horses.columns:
+                clean_horses["単勝オッズ"] = clean_horses["想定単勝オッズ"]
+
             edited_races.append({
                 "id": idx + 1,
                 "name": r_name,
@@ -473,7 +487,7 @@ def render_win5_simulator(
                 "condition": r_cond,
                 "url": single_url,
                 "past_records": p_recs,
-                "horses": h_df_edited.dropna(subset=["馬名"])
+                "horses": clean_horses
             })
 
     st.session_state["win5_races_data"] = edited_races
