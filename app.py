@@ -10,7 +10,11 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image
 from scipy.optimize import minimize
+import importlib
+import win5_simulator
+importlib.reload(win5_simulator)
 from win5_simulator import render_win5_simulator
+
 
 
 # ==========================================

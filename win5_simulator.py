@@ -144,7 +144,8 @@ def render_win5_simulator(
     track_options: list = None,
     save_ai_model_func=None,
     generate_race_sig_func=None,
-    default_weights: dict = None
+    default_weights: dict = None,
+    **kwargs
 ):
     """
     WIN5攻略シミュレーターのメインUI
