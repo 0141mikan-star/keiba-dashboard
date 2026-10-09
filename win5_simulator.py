@@ -1143,11 +1143,28 @@ def render_win5_simulator(
                         if not w_match.empty:
                             w_row = w_match.iloc[0]
                             w_name = w_row["馬名"]
-                            w_pop = int(w_row.get("単勝人気", 99))
+                            try:
+                                w_pop = int(w_row.get("単勝人気", 99))
+                            except Exception:
+                                w_pop = 99
                             w_odds = get_horse_effective_odds(w_row)
-                            w_rank = int(w_row.get("予想着順", 99))
+                            raw_rank_val = w_row.get("予想着順数値")
+                            if raw_rank_val is not None and not pd.isna(raw_rank_val):
+                                try:
+                                    w_rank = int(raw_rank_val)
+                                except Exception:
+                                    w_rank = 99
+                            else:
+                                raw_rank_str = str(w_row.get("予想着順", "99")).replace("着", "").strip()
+                                try:
+                                    w_rank = int(raw_rank_str)
+                                except Exception:
+                                    w_rank = 99
                             w_mark = w_row.get("AI印", "-")
-                            w_prob = float(w_row.get("勝率(%)", 0.0))
+                            try:
+                                w_prob = float(w_row.get("勝率(%)", 0.0))
+                            except Exception:
+                                w_prob = 0.0
                         else:
                             w_name = f"{act_w}番"
                             w_pop = "-"
