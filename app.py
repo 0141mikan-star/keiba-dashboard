@@ -4359,7 +4359,7 @@ if st.session_state["predicted_results"] is not None:
     # 5. 資金配分計算
     dutch_res = calculate_dutching_allocation(active_bets, budget=st.session_state["bet_budget"], mode=mode_sel)
     st.session_state["latest_dutching_calc"] = {
-        "plan_name": selected_plan_label,
+        "plan_name": plan_sel,
         "res": dutch_res
     }
 
