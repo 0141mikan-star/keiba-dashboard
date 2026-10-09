@@ -134,6 +134,85 @@ def get_horse_effective_odds(horse_row) -> float:
         pop = 5
     return POP_ESTIMATED_ODDS.get(pop, 25.0)
 
+def select_win5_horses_for_quota(p_df: pd.DataFrame, quota: int) -> pd.DataFrame:
+    """
+    WIN5専用の勝ち切り推奨馬選定アルゴリズム
+    複勝圏狙いの馬を排除し、単勝勝率・逃げ先行力・勝負強さ・オッズ妙味から
+    『真に1着を獲る馬』をquota頭厳選する
+    """
+    if p_df.empty or quota <= 0:
+        return p_df.head(0)
+
+    df_copy = p_df.copy()
+
+    # WIN5勝利スコアの算出
+    scores = []
+    for _, row in df_copy.iterrows():
+        base_win = float(row.get("勝率(%)", 5.0))
+        style = str(row.get("脚質", "先行"))
+        if style == "逃げ":
+            style_mult = 1.25
+        elif style == "先行":
+            style_mult = 1.15
+        elif style == "差し":
+            style_mult = 1.00
+        else:
+            style_mult = 0.85
+
+        j_rate = float(row.get("騎手勝率(%)", 9.0))
+        j_mult = 1.0 + max(-0.1, min(0.3, (j_rate - 9.0) * 0.015))
+
+        odds = float(row.get("想定単勝オッズ", 10.0))
+        odds_bonus = 4.0 if odds <= 2.5 else (2.0 if odds <= 4.5 else 0.0)
+
+        is_upset = bool(row.get("特注穴馬", False))
+        ev_val = float(row.get("期待値(EV)", 1.0))
+        upset_bonus = 3.5 if (is_upset or ev_val >= 1.2) else 0.0
+
+        v_score = (base_win * style_mult * j_mult) + odds_bonus + upset_bonus
+        scores.append(v_score)
+
+    df_copy["_win5_v_score"] = scores
+    df_sorted = df_copy.sort_values(by="_win5_v_score", ascending=False).reset_index(drop=True)
+
+    if quota == 1:
+        # 1頭枠: 勝ち切り信頼度No.1の絶対本命
+        return df_sorted.head(1).drop(columns=["_win5_v_score"], errors="ignore")
+
+    elif quota == 2:
+        # 2頭枠: 勝ち切り1位 + 単勝勝率上位または穴馬
+        picked = [df_sorted.iloc[0], df_sorted.iloc[1]]
+        return pd.DataFrame(picked).drop(columns=["_win5_v_score"], errors="ignore")
+
+    else:
+        # 3頭以上枠: 本命・対抗に加え、特注穴馬☆や先行逃げ馬を必ずブレンド
+        picked = [df_sorted.iloc[0], df_sorted.iloc[1]]
+        picked_nums = {df_sorted.iloc[0]["馬番"], df_sorted.iloc[1]["馬番"]}
+
+        # 3頭目以降の候補: 特注穴馬や逃げ馬、高EV馬を優先
+        remaining = df_sorted.iloc[2:]
+        upset_candidates = remaining[remaining.apply(
+            lambda r: bool(r.get("特注穴馬", False)) or str(r.get("脚質")) == "逃げ" or float(r.get("期待値(EV)", 0)) >= 1.2,
+            axis=1
+        )]
+
+        for _, u_row in upset_candidates.iterrows():
+            if len(picked) >= quota:
+                break
+            if u_row["馬番"] not in picked_nums:
+                picked.append(u_row)
+                picked_nums.add(u_row["馬番"])
+
+        # 足りない分はスコア順で補充
+        for _, rem_row in remaining.iterrows():
+            if len(picked) >= quota:
+                break
+            if rem_row["馬番"] not in picked_nums:
+                picked.append(rem_row)
+                picked_nums.add(rem_row["馬番"])
+
+        return pd.DataFrame(picked).drop(columns=["_win5_v_score"], errors="ignore")
+
 def render_win5_simulator(
     calculate_predictions_func,
     learned_weights: dict,
@@ -196,33 +275,45 @@ def render_win5_simulator(
         plan_choice = st.radio(
             "目的に合った買い目プランを選択してください:",
             [
-                "🎯 【本命・王道】3,600円プラン (36点) : 1頭 × 2頭 × 2頭 × 3頭 × 3頭 (おすすめ！)",
+                "🛡️ 【全レース2頭以上・事故防止】3,200円プラン (32点) : 2頭 × 2頭 × 2頭 × 2頭 × 2頭 (1頭固定の突然死を完全回避・超安定！)",
+                "🎯 【本命・メリハリ】3,600円プラン (36点) : 1頭 × 2頭 × 2頭 × 3頭 × 3頭 (王道バランス)",
                 "🚀 【手広く安心】4,800円プラン (48点) : 1頭 × 2頭 × 2頭 × 3頭 × 4頭",
+                "🏆 【高確率・本気的中】7,200円プラン (72点) : 2頭 × 2頭 × 2頭 × 3頭 × 3頭 (全レース2頭以上＋混戦3頭カバー)",
                 "⚡ 【超エコノミー】2,400円プラン (24点) : 1頭 × 2頭 × 2頭 × 2頭 × 3頭",
                 "🛠️ 【カスタム配分】各レースの頭数を自由指定"
             ],
             index=0
         )
     with plan_col2:
-        if "3,600円" in plan_choice:
+        if "3,200円" in plan_choice:
+            quota_pattern = [2, 2, 2, 2, 2]
+            base_cost = 3200
+            base_points = 32
+            st.info("💡 **おすすめNo.1（最も安定！）**\n全5レースをすべて【2頭以上】でカバー！ 1頭固定による『ハナ差2着での即死』を完全回避する最強の安全設計！")
+        elif "3,600円" in plan_choice:
             quota_pattern = [1, 2, 2, 3, 3]
             base_cost = 3600
             base_points = 36
-            st.info("💡 **おすすめNo.1**\n鉄板1レースを本命◎1点で突破し、他を2〜3頭でカバーする最もバランスの良い王道買い目！")
+            st.info("💡 **王道メリハリ**\n最も鉄板の1レースを本命◎1点で突破し、浮いた予算を残りのレースに集中投下する高回収率設計！")
         elif "4,800円" in plan_choice:
             quota_pattern = [1, 2, 2, 3, 4]
             base_cost = 4800
             base_points = 48
-            st.info("💡 **カバー重視**\n大荒れが予想されるメイン戦や混戦レースを4頭まで手広く抑える安心設計！")
+            st.info("💡 **カバー重視**\n大荒れが予想されるメイン重賞や難関ハンデ戦を4頭まで手広く抑える安心設計！")
+        elif "7,200円" in plan_choice:
+            quota_pattern = [2, 2, 2, 3, 3]
+            base_cost = 7200
+            base_points = 72
+            st.info("💡 **高的中・本気プラン**\n全レース2頭以上で不慮の取りこぼしを防ぎつつ、混戦レースを3頭で厚めに包囲する本格派！")
         elif "2,400円" in plan_choice:
             quota_pattern = [1, 2, 2, 2, 3]
             base_cost = 2400
             base_points = 24
             st.info("💡 **超節約エコノミー**\nわずか2,400円（24点）で毎週気軽にWIN5に挑戦できる高回収率特化プラン！")
         else:
-            quota_pattern = [1, 2, 2, 3, 3]
-            base_cost = 3600
-            base_points = 36
+            quota_pattern = [2, 2, 2, 2, 2]
+            base_cost = 3200
+            base_points = 32
             st.info("💡 **カスタム配分**\nAI診断後、各レースの選択頭数や対象馬を自由に微調整できます。")
 
     # データ更新バージョンカウンタ（外部取得・サンプルロード時にキーを一新して確実にUI反映させる）
@@ -309,6 +400,16 @@ def render_win5_simulator(
                                     horses_df["斤量"] = 56.0
 
                                 r_name_formatted = f"WIN{idx+1}: {res_data['race_name']} ({res_data['course_type']}{res_data['distance']}m)"
+                                act_ranks = res_data.get("actual_ranks")
+                                act_payouts = res_data.get("official_payouts")
+                                win_no = 0
+                                if act_ranks and isinstance(act_ranks, dict):
+                                    for _, h_row in horses_df.iterrows():
+                                        if act_ranks.get(str(h_row["馬名"]).strip()) == 1:
+                                            win_no = int(h_row["馬番"])
+                                            st.session_state[f"actual_win_{idx}"] = win_no
+                                            break
+
                                 st.session_state["win5_races_data"][idx] = {
                                     "id": idx + 1,
                                     "name": r_name_formatted,
@@ -320,9 +421,12 @@ def render_win5_simulator(
                                     "url": u,
                                     "past_records": res_data.get("past_records", {}),
                                     "horses": horses_df,
-                                    "actual_winner": 0
+                                    "actual_ranks": act_ranks,
+                                    "official_payouts": act_payouts,
+                                    "actual_winner": win_no
                                 }
-                                fetched_details.append(f"**WIN{idx+1}**: {res_data['race_name']} ({len(horses_df)}頭)")
+                                extra_tag = f" 🎯 確定1着: {win_no}番" if win_no > 0 else ""
+                                fetched_details.append(f"**WIN{idx+1}**: {res_data['race_name']} ({len(horses_df)}頭{extra_tag})")
 
                     if error_details:
                         for ed in error_details:
@@ -385,6 +489,16 @@ def render_win5_simulator(
                         if "斤量" not in horses_df.columns:
                             horses_df["斤量"] = 56.0
 
+                        act_ranks = res_data.get("actual_ranks")
+                        act_payouts = res_data.get("official_payouts")
+                        win_no = 0
+                        if act_ranks and isinstance(act_ranks, dict):
+                            for _, h_row in horses_df.iterrows():
+                                if act_ranks.get(str(h_row["馬名"]).strip()) == 1:
+                                    win_no = int(h_row["馬番"])
+                                    st.session_state[f"actual_win_{idx}"] = win_no
+                                    break
+
                         st.session_state["win5_races_data"][idx] = {
                             "id": idx + 1,
                             "name": f"WIN{idx+1}: {res_data['race_name']} ({res_data['course_type']}{res_data['distance']}m)",
@@ -396,7 +510,9 @@ def render_win5_simulator(
                             "url": single_url.strip(),
                             "past_records": res_data.get("past_records", {}),
                             "horses": horses_df,
-                            "actual_winner": 0
+                            "actual_ranks": act_ranks,
+                            "official_payouts": act_payouts,
+                            "actual_winner": win_no
                         }
                         # バッチURL欄にも反映
                         st.session_state[f"win5_batch_url_{idx}"] = single_url.strip()
@@ -487,7 +603,10 @@ def render_win5_simulator(
                 "condition": r_cond,
                 "url": single_url,
                 "past_records": p_recs,
-                "horses": clean_horses
+                "horses": clean_horses,
+                "actual_ranks": r_info.get("actual_ranks"),
+                "actual_winner": r_info.get("actual_winner", 0),
+                "official_payouts": r_info.get("official_payouts")
             })
 
     st.session_state["win5_races_data"] = edited_races
@@ -563,7 +682,11 @@ def render_win5_simulator(
                     "win2": win2,
                     "win_gap": win_gap,
                     "solid_score": solid_score,
-                    "past_records": r_data.get("past_records", {})
+                    "past_records": r_data.get("past_records", {}),
+                    "url": r_data.get("url", ""),
+                    "actual_ranks": r_data.get("actual_ranks"),
+                    "actual_winner": r_data.get("actual_winner", 0),
+                    "official_payouts": r_data.get("official_payouts")
                 })
 
             if len(race_diagnostics) < 5:
@@ -592,21 +715,21 @@ def render_win5_simulator(
             if "win5_custom_selections" not in st.session_state:
                 st.session_state["win5_custom_selections"] = {}
 
-            # 各レースの初期選択馬
+            # 各レースの初期選択馬 (WIN5専用勝ち切りアルゴリズム適用)
             active_selections = []
             for r_diag in race_diagnostics:
                 r_id = r_diag["id"]
                 p_df = r_diag["pred_df"]
                 q = r_diag["assigned_quota"]
 
-                # 以前にユーザーが選んだものがあればそれを優先、なければAI推奨上位q頭
+                # 以前にユーザーが選んだものがあればそれを優先、なければWIN5勝ち切りAI推奨q頭
                 saved_sel = st.session_state["win5_custom_selections"].get(r_id)
                 if saved_sel is not None and len(saved_sel) > 0:
                     chosen_horses = p_df[p_df["馬番"].isin(saved_sel)]
                     if chosen_horses.empty:
-                        chosen_horses = p_df.iloc[:q]
+                        chosen_horses = select_win5_horses_for_quota(p_df, q)
                 else:
-                    chosen_horses = p_df.iloc[:q]
+                    chosen_horses = select_win5_horses_for_quota(p_df, q)
                 active_selections.append(chosen_horses)
 
             # 点数・資金額の動的計算
@@ -942,14 +1065,23 @@ def render_win5_simulator(
             actual_win_nums = []
             for i in range(5):
                 p_df = race_diagnostics[i]["pred_df"]
+                detected_w = race_diagnostics[i].get("actual_winner", 0)
+                init_val = int(st.session_state.get(f"actual_win_{i}", detected_w))
                 with c_chk[i]:
-                    val = st.number_input(f"WIN{i+1} 確定1着馬番", min_value=0, max_value=18, value=int(st.session_state.get(f"actual_win_{i}", 0)), key=f"actual_win_{i}")
+                    val = st.number_input(
+                        f"WIN{i+1} 確定1着馬番",
+                        min_value=0,
+                        max_value=18,
+                        value=init_val,
+                        key=f"actual_win_{i}",
+                        help=f"WIN{i+1}の確定1着馬番。netkeibaから結果が取得された場合は自動セットされます。"
+                    )
                     actual_win_nums.append(val)
                     if val > 0:
                         matched_h = p_df[p_df["馬番"] == val]
                         if not matched_h.empty:
                             h_row = matched_h.iloc[0]
-                            st.caption(f"🏁 **{h_row['馬名']}** ({h_row.get('単勝人気', '-')}人気)")
+                            st.caption(f"🏁 **{h_row['馬名']}** ({h_row.get('単勝人気', '-')}人気 ｜ 単勝{get_horse_effective_odds(h_row)}倍)")
                         else:
                             st.caption(f"🏁 {val}番")
 
@@ -994,12 +1126,128 @@ def render_win5_simulator(
             elif not is_dead and any("⭕" in s for s in alive_status):
                 st.info(f"🔥 **現在 {passed_cnt} レース突破中！ 生き残り点数: {survived_points}点！ 次のレースへ進みます！**")
 
+            # ------------------------------------------
+            # 🔍 【過去検証モード】他プラン生還比較 ＆ 敗因勝因カルテ
+            # ------------------------------------------
+            if all_races_entered:
+                with st.expander("🔍 **【過去レース検証カルテ】なぜ当たったか／外れたかの詳細分析 ＆ 他プランでの生還比較**", expanded=True):
+                    st.markdown("##### 📊 各レースの確定勝馬とAI予想の対比分析")
+                    diag_rows = []
+                    for i, r_diag in enumerate(race_diagnostics):
+                        act_w = actual_win_nums[i]
+                        p_df = r_diag["pred_df"]
+                        c_horses = active_selections[i]
+                        sel_nums = [int(r["馬番"]) for _, r in c_horses.iterrows()]
+                        w_match = p_df[p_df["馬番"] == act_w]
+                        
+                        if not w_match.empty:
+                            w_row = w_match.iloc[0]
+                            w_name = w_row["馬名"]
+                            w_pop = int(w_row.get("単勝人気", 99))
+                            w_odds = get_horse_effective_odds(w_row)
+                            w_rank = int(w_row.get("予想着順", 99))
+                            w_mark = w_row.get("AI印", "-")
+                            w_prob = float(w_row.get("勝率(%)", 0.0))
+                        else:
+                            w_name = f"{act_w}番"
+                            w_pop = "-"
+                            w_odds = "-"
+                            w_rank = "-"
+                            w_mark = "-"
+                            w_prob = 0.0
+
+                        is_hit = act_w in sel_nums
+                        status_str = "⭕ 的中突破" if is_hit else "❌ 買い目漏れ"
+                        quota_len = len(sel_nums)
+
+                        # 要因コメント
+                        if is_hit:
+                            reason_note = f"AIが推奨した上位{quota_len}頭に合致。見事に1着的中！"
+                        else:
+                            if quota_len == 1:
+                                reason_note = f"⚠️ 1頭固定レースで本命が敗退（勝馬は{w_pop}番人気/AI{w_rank}位）。1頭固定の突然死が敗因。"
+                            else:
+                                reason_note = f"波乱決着（勝馬は{w_pop}番人気/AI{w_rank}位）。{quota_len}頭カバーの範囲外でした。"
+
+                        diag_rows.append({
+                            "レース": f"WIN{i+1}",
+                            "確定1着馬": f"{act_w}番 {w_name}",
+                            "単勝人気/オッズ": f"{w_pop}人気 ({w_odds}倍)",
+                            "AI評価": f"{w_mark} (AI{w_rank}位 / 勝率{w_prob}%)",
+                            "今回選択頭数": f"{quota_len}頭",
+                            "結果": status_str,
+                            "分析コメント": reason_note
+                        })
+
+                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+
+                    # 他プランでの生還比較シミュレーション
+                    st.markdown("##### 💡 もし他の買い目プランを選んでいたら？ 生還シミュレーション比較")
+                    comp_plans = [
+                        ("🛡️ 3,200円プラン (2×2×2×2×2)", [2, 2, 2, 2, 2], 3200, 32),
+                        ("🎯 3,600円プラン (1×2×2×3×3)", [1, 2, 2, 3, 3], 3600, 36),
+                        ("🏆 7,200円プラン (2×2×2×3×3)", [2, 2, 2, 3, 3], 7200, 72),
+                        ("🚀 4,800円プラン (1×2×2×3×4)", [1, 2, 2, 3, 4], 4800, 48),
+                        ("⚡ 2,400円プラン (1×2×2×2×3)", [1, 2, 2, 2, 3], 2400, 24)
+                    ]
+
+                    sorted_by_sol = sorted(race_diagnostics, key=lambda x: x["solid_score"], reverse=True)
+                    comp_cols = st.columns(len(comp_plans))
+
+                    for p_i, (p_name, p_quota, p_cost, p_pts) in enumerate(comp_plans):
+                        # 各レースへのquota割り振り
+                        sim_passed = 0
+                        for r_rank_idx, r_d in enumerate(sorted_by_sol):
+                            sim_q = p_quota[r_rank_idx]
+                            sim_chosen = select_win5_horses_for_quota(r_d["pred_df"], sim_q)
+                            sim_nums = [int(r["馬番"]) for _, r in sim_chosen.iterrows()]
+                            act_winner_num = actual_win_nums[r_d["id"] - 1]
+                            if act_winner_num in sim_nums:
+                                sim_passed += 1
+
+                        with comp_cols[p_i]:
+                            plan_short = p_name.split()[0] + " " + p_name.split()[1]
+                            if sim_passed == 5:
+                                st.success(f"**{plan_short}**\n\n🎉 **5/5 的中！**\n({p_cost:,}円 / {p_pts}点)")
+                            else:
+                                st.warning(f"**{plan_short}**\n\n**{sim_passed}/5 レース突破**\n({p_cost:,}円 / {p_pts}点)")
+
+                    # ワンクリックで確定1着馬を買い目に適用するボタン
+                    if not is_win5_hit:
+                        st.caption("💡 過去の検証・払戻金計算のために、確定1着馬を買い目にワンクリックで追加できます:")
+                        if st.button("🪄 確定1着馬を買い目に自動追加して払戻金をシミュレーションする", key="btn_apply_winners_to_sel"):
+                            for i, r_diag in enumerate(race_diagnostics):
+                                w_num = actual_win_nums[i]
+                                if w_num > 0:
+                                    curr_sel = list(st.session_state.get("win5_custom_selections", {}).get(r_diag["id"], []))
+                                    if not curr_sel:
+                                        curr_sel = [int(r["馬番"]) for _, r in active_selections[i].iterrows()]
+                                    if w_num not in curr_sel:
+                                        curr_sel.append(w_num)
+                                    st.session_state["win5_custom_selections"][r_diag["id"]] = sorted(curr_sel)
+                            st.success("🎉 確定1着馬を各レースの買い目に自動追加しました！")
+                            st.rerun()
+
             # ==========================================
             # 💰 WIN5 確定払戻金・回収率の自動計算
             # ==========================================
             st.markdown("---")
             st.subheader("💰 WIN5 確定払戻金・回収率の自動計算")
             st.caption("全5レース終了後、JRA公式発表の確定払戻金（100円あたり）を入力して、総払戻金額・純損益・回収率(ROI)を自動計算します。")
+
+            # 単勝オッズ合成による参考配当の算出
+            est_payout_synthetic = 0
+            if all_races_entered:
+                prod_odds = 1.0
+                for i_w, r_diag in enumerate(race_diagnostics):
+                    act_num = actual_win_nums[i_w]
+                    p_df = r_diag["pred_df"]
+                    m_row = p_df[p_df["馬番"] == act_num]
+                    if not m_row.empty:
+                        prod_odds *= get_horse_effective_odds(m_row.iloc[0])
+                    else:
+                        prod_odds *= 5.0
+                est_payout_synthetic = int(min(600_000_000, max(100, prod_odds * 70)))
 
             c_pay_in1, c_pay_in2 = st.columns([2, 1])
             with c_pay_in1:
@@ -1013,6 +1261,12 @@ def render_win5_simulator(
                     help="JRA公式結果のWIN5払戻金額（100円につき）を入力してください。"
                 )
                 st.session_state["win5_official_payout_val"] = official_win5_payout
+
+                if est_payout_synthetic > 0 and official_win5_payout == 0:
+                    st.caption(f"💡 5レースの確定オッズから推計した合成配当: **￥{est_payout_synthetic:,} 円**")
+                    if st.button(f"👆 推計配当（￥{est_payout_synthetic:,} 円）を配当金に自動入力する", key="btn_apply_synth_payout"):
+                        st.session_state["win5_official_payout_val"] = est_payout_synthetic
+                        st.rerun()
 
             with c_pay_in2:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
@@ -1140,7 +1394,7 @@ def render_win5_simulator(
                         # 確定着順辞書
                         actual_ranks_dict = {}
                         r_meta = r_diag.get("meta", {})
-                        scraped_ranks = r_meta.get("actual_ranks") if isinstance(r_meta, dict) else None
+                        scraped_ranks = r_diag.get("actual_ranks") or (r_meta.get("actual_ranks") if isinstance(r_meta, dict) else None)
 
                         if scraped_ranks and isinstance(scraped_ranks, dict) and len(scraped_ranks) > 0:
                             actual_ranks_dict = scraped_ranks.copy()
@@ -1161,6 +1415,12 @@ def render_win5_simulator(
                                     actual_ranks_dict[h_nm] = 3
                                 else:
                                     actual_ranks_dict[h_nm] = 8
+
+                        # 確定勝馬が確実に1着として登録されるよう安全補正
+                        num_to_name_all = {int(r["馬番"]): str(r["馬名"]).strip() for _, r in p_df.iterrows()}
+                        winner_horse_name = num_to_name_all.get(w_num)
+                        if winner_horse_name:
+                            actual_ranks_dict[winner_horse_name] = 1
 
                         # 【Tier 1】 過去レース完全記憶登録
                         if generate_race_sig_func:
