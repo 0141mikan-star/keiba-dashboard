@@ -3034,8 +3034,15 @@ def fetch_netkeiba_race(url: str):
                 h_name = h_a.text.strip()
 
                 past_tds = row.find_all("td", class_="Past")
+                if not past_tds:
+                    # 投票テーブルなどの過去走がない重複行はスキップ
+                    continue
+                if h_name in past_records_map:
+                    # すでに解析済みの馬は上書きしない
+                    continue
+
                 past_parsed = []
-                for ptd in past_tds[:3]:
+                for ptd in past_tds[:5]:
                     rank_num = None
                     rk_m = re.search(r"(\d{1,2})着", ptd.text)
                     if rk_m:
@@ -3055,7 +3062,6 @@ def fetch_netkeiba_race(url: str):
 
                     d02 = ptd.find("div", class_="Data02")
                     d05 = ptd.find("div", class_="Data05")
-                    d06 = ptd.find("div", class_="Data06")
                     r_name_str = " ".join(d02.text.split()) if d02 else ""
                     dist_time_str = " ".join(d05.text.split()) if d05 else ""
 
@@ -3065,7 +3071,7 @@ def fetch_netkeiba_race(url: str):
 
                     agari_m = re.search(r"\(([34]\d\.\d)\)", summary_text)
                     agari = f"上り{agari_m.group(1)}s" if agari_m else ""
-                    pass_m = re.search(r"(\d{1,2}-\d{1,2}(?:-\d{1,2})?)", summary_text)
+                    pass_m = re.search(r"(\d{1,2}(?:-\d{1,2})+)", summary_text)
                     pass_order = pass_m.group(1) if pass_m else ""
 
                     past_parsed.append({
@@ -3076,22 +3082,32 @@ def fetch_netkeiba_race(url: str):
                         "pass_order": pass_order
                     })
 
-                # 脚質判定
+                # 【高精度脚質自動判定エンジン】過去走の全通過順・隊列位置から判定
+                first_corners = []
+                final_corners = []
+                for p in past_parsed:
+                    po = p.get("pass_order", "")
+                    if po:
+                        parts = [int(x) for x in re.findall(r"\b\d{1,2}\b", po)]
+                        if parts:
+                            first_corners.append(parts[0])
+                            final_corners.append(parts[-1])
+
                 style = "先行"
-                if past_parsed and past_parsed[0]["pass_order"]:
-                    po = past_parsed[0]["pass_order"]
-                    try:
-                        first_pos = int(po.split("-")[0])
-                        if first_pos == 1:
-                            style = "逃げ"
-                        elif first_pos <= 4:
-                            style = "先行"
-                        elif first_pos <= 9:
-                            style = "差し"
-                        else:
-                            style = "追込"
-                    except Exception:
-                        pass
+                if first_corners and final_corners:
+                    avg_first = sum(first_corners) / len(first_corners)
+                    avg_final = sum(final_corners) / len(final_corners)
+                    has_led = any(p == 1 for p in first_corners)
+
+                    if has_led and avg_first <= 1.8:
+                        style = "逃げ"
+                    elif avg_first <= 4.2 or avg_final <= 4.0:
+                        style = "先行"
+                    elif avg_first <= 9.5 or avg_final <= 9.0:
+                        style = "差し"
+                    else:
+                        style = "追込"
+
                 if h_name in horses_map:
                     horses_map[h_name]["脚質"] = style
 
