@@ -3082,37 +3082,71 @@ def fetch_netkeiba_race(url: str):
                         "pass_order": pass_order
                     })
 
-                # 【高精度脚質自動判定エンジン】過去走の全通過順・直近走を最重視して判定
-                first_corners = []
-                final_corners = []
-                for p in past_parsed:
-                    po = p.get("pass_order", "")
-                    if po:
-                        parts = [int(x) for x in re.findall(r"\b\d{1,2}\b", po)]
-                        if parts:
-                            first_corners.append(parts[0])
-                            final_corners.append(parts[-1])
+                # 1. 【netkeiba公式脚質マーク判定 (最優先)】
+                # 馬柱に表示される公式の「逃」「先」「差」「追」アイコン（span.kyakusitu / horse_race_type0X.png）を直接取得
+                style_official = ""
+                k_span = row.find("span", class_="kyakusitu") or row.find(class_=re.compile(r"kyakusitu"))
+                if k_span and k_span.text.strip():
+                    kt = k_span.text.strip()
+                    if "逃" in kt:
+                        style_official = "逃げ"
+                    elif "先" in kt:
+                        style_official = "先行"
+                    elif "差" in kt:
+                        style_official = "差し"
+                    elif "追" in kt:
+                        style_official = "追込"
 
-                style = "先行"
-                if first_corners and final_corners:
-                    recent_first = first_corners[0]
-                    recent_final = final_corners[0]
-                    lead_count = sum(1 for p in first_corners if p == 1)
-                    avg_first = sum(first_corners) / len(first_corners)
-                    avg_final = sum(final_corners) / len(final_corners)
+                if not style_official:
+                    img_type = row.find("img", src=re.compile(r"horse_race_type0?(\d)\.png"))
+                    if img_type:
+                        m_num = re.search(r"horse_race_type0?(\d)\.png", img_type["src"])
+                        if m_num:
+                            t_num = m_num.group(1)
+                            if t_num == "1":
+                                style_official = "逃げ"
+                            elif t_num == "2":
+                                style_official = "先行"
+                            elif t_num == "3":
+                                style_official = "差し"
+                            elif t_num == "4":
+                                style_official = "追込"
 
-                    # 1. 逃げ: 前走ハナ(1番手)を切っている、または複数走でハナ、または先頭集団を牽引
-                    if recent_first == 1 or lead_count >= 2 or (lead_count >= 1 and avg_first <= 2.5):
-                        style = "逃げ"
-                    # 2. 先行: 好位追走 (平均4.5番手以内、または直近3番手以内)
-                    elif avg_first <= 4.5 or recent_first <= 3:
-                        style = "先行"
-                    # 3. 差し: 中団待機 (平均9.5番手以内、または勝負所8.5番手以内)
-                    elif avg_first <= 9.5 or avg_final <= 8.5:
-                        style = "差し"
-                    # 4. 追込: 後方待機からの直線一気
-                    else:
-                        style = "追込"
+                # 2. 公式マークが存在する場合は公式表記を完全採用
+                if style_official:
+                    style = style_official
+                else:
+                    # 3. 公式表記がない場合（新馬戦等）は過去走通過順から推定
+                    first_corners = []
+                    final_corners = []
+                    for p in past_parsed:
+                        po = p.get("pass_order", "")
+                        if po:
+                            parts = [int(x) for x in re.findall(r"\b\d{1,2}\b", po)]
+                            if parts:
+                                first_corners.append(parts[0])
+                                final_corners.append(parts[-1])
+
+                    style = "先行"
+                    if first_corners and final_corners:
+                        recent_first = first_corners[0]
+                        recent_final = final_corners[0]
+                        lead_count = sum(1 for p in first_corners if p == 1)
+                        avg_first = sum(first_corners) / len(first_corners)
+                        avg_final = sum(final_corners) / len(final_corners)
+
+                        # 1. 逃げ: 前走ハナ(1番手)を切っている、または複数走でハナ、または先頭集団を牽引
+                        if recent_first == 1 or lead_count >= 2 or (lead_count >= 1 and avg_first <= 2.5):
+                            style = "逃げ"
+                        # 2. 先行: 好位追走 (平均4.5番手以内、または直近3番手以内)
+                        elif avg_first <= 4.5 or recent_first <= 3:
+                            style = "先行"
+                        # 3. 差し: 中団待機 (平均9.5番手以内、または勝負所8.5番手以内)
+                        elif avg_first <= 9.5 or avg_final <= 8.5:
+                            style = "差し"
+                        # 4. 追込: 後方待機からの直線一気
+                        else:
+                            style = "追込"
 
                 if h_name in horses_map:
                     horses_map[h_name]["脚質"] = style
