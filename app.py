@@ -3082,7 +3082,7 @@ def fetch_netkeiba_race(url: str):
                         "pass_order": pass_order
                     })
 
-                # 【高精度脚質自動判定エンジン】過去走の全通過順・隊列位置から判定
+                # 【高精度脚質自動判定エンジン】過去走の全通過順・直近走を最重視して判定
                 first_corners = []
                 final_corners = []
                 for p in past_parsed:
@@ -3095,16 +3095,22 @@ def fetch_netkeiba_race(url: str):
 
                 style = "先行"
                 if first_corners and final_corners:
+                    recent_first = first_corners[0]
+                    recent_final = final_corners[0]
+                    lead_count = sum(1 for p in first_corners if p == 1)
                     avg_first = sum(first_corners) / len(first_corners)
                     avg_final = sum(final_corners) / len(final_corners)
-                    has_led = any(p == 1 for p in first_corners)
 
-                    if has_led and avg_first <= 1.8:
+                    # 1. 逃げ: 前走ハナ(1番手)を切っている、または複数走でハナ、または先頭集団を牽引
+                    if recent_first == 1 or lead_count >= 2 or (lead_count >= 1 and avg_first <= 2.5):
                         style = "逃げ"
-                    elif avg_first <= 4.2 or avg_final <= 4.0:
+                    # 2. 先行: 好位追走 (平均4.5番手以内、または直近3番手以内)
+                    elif avg_first <= 4.5 or recent_first <= 3:
                         style = "先行"
-                    elif avg_first <= 9.5 or avg_final <= 9.0:
+                    # 3. 差し: 中団待機 (平均9.5番手以内、または勝負所8.5番手以内)
+                    elif avg_first <= 9.5 or avg_final <= 8.5:
                         style = "差し"
+                    # 4. 追込: 後方待機からの直線一気
                     else:
                         style = "追込"
 
