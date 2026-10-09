@@ -594,6 +594,75 @@ if "horses_data" not in st.session_state or "適性距離" in st.session_state["
         {"馬番": 5, "馬名": "メイケイエール", "単勝人気": 6, "騎手名": "池添謙一", "脚質": "追込"},
     ])
 
+def parse_payout_tables(soup: BeautifulSoup) -> dict:
+    """
+    netkeibaの確定レース結果ページ（result.html）から
+    公式確定払戻金（単勝、複勝、枠連、馬連、ワイド、馬単、3連複、3連単）を高精度に抽出・構造化。
+    """
+    payouts = {}
+    p_tables = soup.find_all("table", class_="Payout_Detail_Table")
+    if not p_tables:
+        p_tables = soup.find_all("table", class_="PayBack_Table")
+
+    for t in p_tables:
+        for tr in t.find_all("tr"):
+            th = tr.find("th")
+            if not th:
+                continue
+            label = th.text.strip()
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+
+            combos_lines = [l.strip() for l in tds[0].get_text(separator="\n").splitlines() if l.strip()]
+            pays_raw = tds[1].get_text(separator="\n")
+            pays_nums = [int(p.replace(",", "")) for p in re.findall(r"([\d,]+)円", pays_raw)]
+            if not pays_nums:
+                pays_nums = [int(p.replace(",", "")) for p in re.findall(r"\b(\d{1,3}(?:,\d{3})+|\d+)\b", pays_raw) if int(p.replace(",", "")) >= 100]
+
+            if label == "単勝" and pays_nums:
+                h_no = int(re.search(r"\d+", combos_lines[0]).group(0)) if combos_lines else None
+                if h_no:
+                    payouts["単勝"] = {h_no: pays_nums[0]}
+            elif label == "複勝" and pays_nums:
+                fuk_map = {}
+                for idx_f, c_line in enumerate(combos_lines[:len(pays_nums)]):
+                    m = re.search(r"\d+", c_line)
+                    if m:
+                        fuk_map[int(m.group(0))] = pays_nums[idx_f]
+                payouts["複勝"] = fuk_map
+            elif label == "馬連" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 2:
+                    payouts["馬連"] = {frozenset([nums[0], nums[1]]): pays_nums[0]}
+            elif label == "ワイド" and pays_nums:
+                wide_map = {}
+                pair_idx = 0
+                for c_line in combos_lines:
+                    nums = [int(x) for x in re.findall(r"\d+", c_line)]
+                    if len(nums) == 2 and pair_idx < len(pays_nums):
+                        wide_map[frozenset(nums)] = pays_nums[pair_idx]
+                        pair_idx += 1
+                if not wide_map and len(combos_lines) >= len(pays_nums) * 2:
+                    nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                    for i in range(min(len(pays_nums), len(nums) // 2)):
+                        wide_map[frozenset([nums[i*2], nums[i*2+1]])] = pays_nums[i]
+                payouts["ワイド"] = wide_map
+            elif label == "馬単" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 2:
+                    payouts["馬単"] = {(nums[0], nums[1]): pays_nums[0]}
+            elif label == "3連複" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 3:
+                    payouts["3連複"] = {frozenset(nums[:3]): pays_nums[0]}
+            elif label == "3連単" and pays_nums:
+                nums = [int(x) for x in re.findall(r"\d+", " ".join(combos_lines))]
+                if len(nums) >= 3:
+                    payouts["3連単"] = {(nums[0], nums[1], nums[2]): pays_nums[0]}
+
+    return payouts
+
 def fetch_netkeiba_race(url: str):
     """
     【Web公式競馬データ連動エンジン（ハイブリッド高精度解析）】
@@ -801,7 +870,9 @@ def fetch_netkeiba_race(url: str):
             "能力指数": 75
         }
 
-    # 過去レースやオッズ確定後のレース（result.html）が存在する場合、結果テーブルから確定オッズ・確定人気・騎手名を補完
+    # 過去レースやオッズ確定後のレース（result.html）が存在する場合、結果テーブルから確定オッズ・確定人気・騎手名・着順・払戻金を補完
+    scraped_actual_ranks = {}
+    scraped_official_payouts = {}
     need_result_check = any(h["単勝人気"] is None for h in horses_map.values()) or "result.html" in clean_url
     if need_result_check:
         try:
@@ -826,8 +897,10 @@ def fetch_netkeiba_race(url: str):
                         if not h_a:
                             continue
                         h_name = h_a.text.strip()
+                        tds = [td.text.strip() for td in tr.find_all("td")]
+                        if tds and tds[0].isdigit():
+                            scraped_actual_ranks[h_name] = int(tds[0])
                         if h_name in horses_map:
-                            tds = [td.text.strip() for td in tr.find_all("td")]
                             if len(tds) >= 11:
                                 # 人気
                                 if tds[9].isdigit():
@@ -842,6 +915,11 @@ def fetch_netkeiba_race(url: str):
                                 j_a_res = tr.find("a", href=lambda h: h and "/jockey/" in h)
                                 if j_a_res and j_a_res.text.strip():
                                     horses_map[h_name]["騎手名"] = normalize_jockey_name(j_a_res.text.strip())
+
+                # 公式確定払戻金テーブルを解析
+                parsed_pay = parse_payout_tables(soup_res)
+                if parsed_pay:
+                    scraped_official_payouts = parsed_pay
         except Exception:
             pass
 
@@ -997,7 +1075,9 @@ def fetch_netkeiba_race(url: str):
         "course_type": course_type,
         "distance": distance,
         "horses": sorted_horses,
-        "past_records": past_records_map
+        "past_records": past_records_map,
+        "actual_ranks": scraped_actual_ranks if scraped_actual_ranks else None,
+        "official_payouts": scraped_official_payouts if scraped_official_payouts else None
     }, None
 
 def parse_horses_from_text(raw_text: str) -> list[dict]:
@@ -1118,7 +1198,15 @@ with st.expander("🌐 **【Web・画像から出走馬を一括自動入力】n
                         st.session_state["current_distance"] = res_data["distance"]
                         st.session_state["predicted_results"] = None
                         st.session_state["has_run_prediction"] = False
-                        st.success(f"🎉 **{res_data['race_name']}**（{res_data['track_name']} {res_data['course_type']}{res_data['distance']}m）の出走馬 {len(horses_df)}頭分と本物の過去走データを完璧に取得しました！")
+                        st.session_state["scraped_actual_ranks"] = res_data.get("actual_ranks")
+                        st.session_state["scraped_official_payouts"] = res_data.get("official_payouts")
+                        
+                        extra_msg = ""
+                        if res_data.get("actual_ranks"):
+                            extra_msg += f" ｜ 🎯 確定着順（{len(res_data['actual_ranks'])}頭分）も自動検知済"
+                        if res_data.get("official_payouts"):
+                            extra_msg += " ｜ 💵 公式確定払戻金も自動同期済"
+                        st.success(f"🎉 **{res_data['race_name']}**（{res_data['track_name']} {res_data['course_type']}{res_data['distance']}m）の出走馬 {len(horses_df)}頭分と本物の過去走データを完璧に取得しました！{extra_msg}")
                         st.rerun()
 
 
@@ -2018,6 +2106,484 @@ def generate_sanrentan_strategies(results_df: pd.DataFrame) -> dict:
             "bets": strat3_bets,
             "desc": "上位3頭の実力が抜きん出ているレースで、着順の入れ替わりを一切恐れずに6点で仕留めるBOX買い！"
         }
+    }
+
+def calculate_race_recovery_performance(
+    results_df: pd.DataFrame,
+    actual_ranks_df: pd.DataFrame,
+    official_payouts: dict = None,
+    dutching_calc: dict = None,
+    trio_strat: dict = None,
+    rentan_strat: dict = None,
+    payout_overrides: dict = None
+) -> dict:
+    """
+    確定着順およびオッズ/払戻金に基づき、全馬券種・全戦略の回収パフォーマンスを完全照合。
+    「回収できた最大値（最高払戻額・最高回収率）」を特定して返す。
+    """
+    if results_df is None or len(results_df) < 3 or actual_ranks_df is None:
+        return None
+
+    # 確定着順の整理
+    act_sorted = actual_ranks_df.sort_values(by="実際の着順").reset_index(drop=True)
+    if len(act_sorted) < 3:
+        return None
+
+    act_1_num = int(act_sorted.iloc[0]["馬番"])
+    act_2_num = int(act_sorted.iloc[1]["馬番"])
+    act_3_num = int(act_sorted.iloc[2]["馬番"])
+
+    act_1_name = str(act_sorted.iloc[0]["馬名"])
+    act_2_name = str(act_sorted.iloc[1]["馬名"])
+    act_3_name = str(act_sorted.iloc[2]["馬名"])
+
+    actual_top2_set = frozenset([act_1_num, act_2_num])
+    actual_top3_set = frozenset([act_1_num, act_2_num, act_3_num])
+    actual_exacta_tuple = (act_1_num, act_2_num)
+    actual_trifecta_tuple = (act_1_num, act_2_num, act_3_num)
+
+    # オッズマップ (馬番 -> 想定単勝オッズ)
+    odds_map = dict(zip(results_df["馬番"].astype(int), results_df["想定単勝オッズ"].astype(float)))
+    o1 = odds_map.get(act_1_num, 3.0)
+    o2 = odds_map.get(act_2_num, 5.0)
+    o3 = odds_map.get(act_3_num, 8.0)
+
+    # 払戻金辞書のマージ（手動上書き優先 > 公式確定払戻 > 推定配当）
+    p_dict = (official_payouts or {}).copy()
+    if payout_overrides:
+        p_dict.update(payout_overrides)
+
+    # 1. 単勝配当 (100円あたり)
+    pay_tansho = p_dict.get("単勝", {}).get(act_1_num, int(round(o1 * 100)))
+
+    # 2. 複勝配当 (100円あたり)
+    pay_fukusho_map = p_dict.get("複勝", {})
+    if not pay_fukusho_map:
+        pay_fukusho_map = {
+            act_1_num: max(110, int(round(max(1.1, o1 / 3.0) * 100))),
+            act_2_num: max(110, int(round(max(1.1, o2 / 3.0) * 100))),
+            act_3_num: max(110, int(round(max(1.1, o3 / 3.0) * 100)))
+        }
+
+    # 3. 馬連配当
+    pay_umaren = p_dict.get("馬連", {}).get(actual_top2_set)
+    if pay_umaren is None:
+        pay_umaren = int(round(estimate_quinella_odds(o1, o2) * 100))
+
+    # 4. ワイド配当マップ
+    pay_wide_map = p_dict.get("ワイド", {})
+    if not pay_wide_map:
+        val_w12 = int(round(estimate_wide_odds(o1, o2) * 100))
+        val_w13 = int(round(estimate_wide_odds(o1, o3) * 100))
+        val_w23 = int(round(estimate_wide_odds(o2, o3) * 100))
+        pay_wide_map = {
+            frozenset([act_1_num, act_2_num]): val_w12,
+            frozenset([act_1_num, act_3_num]): val_w13,
+            frozenset([act_2_num, act_3_num]): val_w23
+        }
+
+    # 5. 馬単配当
+    pay_umatan = p_dict.get("馬単", {}).get(actual_exacta_tuple)
+    if pay_umatan is None:
+        pay_umatan = int(round(pay_umaren * 1.85))
+
+    # 6. 3連複配当
+    pay_sanrenpuku = p_dict.get("3連複", {}).get(actual_top3_set)
+    if pay_sanrenpuku is None:
+        pay_sanrenpuku = int(round(estimate_trio_odds(o1, o2, o3) * 100))
+
+    # 7. 3連単配当
+    pay_sanrentan = p_dict.get("3連単", {}).get(actual_trifecta_tuple)
+    if pay_sanrentan is None:
+        pay_sanrentan = int(round(estimate_trifecta_odds(o1, o2, o3) * 100))
+
+    # AI推奨馬の整理
+    h1 = results_df.iloc[0]
+    h2 = results_df.iloc[1]
+    h3 = results_df.iloc[2]
+    h1_num = int(h1["馬番"])
+    h2_num = int(h2["馬番"])
+    h3_num = int(h3["馬番"])
+
+    # 特注穴馬
+    upset_rows = results_df[results_df["特注穴馬"] == True]
+    up_horse = None
+    if len(upset_rows) > 0:
+        for _, u_cand in upset_rows.iterrows():
+            if int(u_cand["馬番"]) != h1_num:
+                up_horse = u_cand
+                break
+
+    plans = []
+
+    # ① 【単勝】 本命◎ 1点勝負
+    hit_tan = (act_1_num == h1_num)
+    pay_tan_val = pay_tansho if hit_tan else 0
+    plans.append({
+        "category": "単勝",
+        "name": f"🎯 【単勝】 本命 ◎ {h1_num}番 {h1['馬名']}",
+        "points": 1,
+        "cost": 100,
+        "is_hit": hit_tan,
+        "hit_combo": f"{h1_num}番 ({h1['馬名']})" if hit_tan else "-",
+        "payout": pay_tan_val,
+        "roi": (pay_tan_val / 100.0) * 100.0,
+        "profit": pay_tan_val - 100,
+        "note": f"単勝 {pay_tansho:,}円" if hit_tan else "不的中"
+    })
+
+    # ② 【複勝】 本命◎ 1点勝負
+    hit_fuk1 = (h1_num in actual_top3_set)
+    pay_fuk1_val = pay_fukusho_map.get(h1_num, 0) if hit_fuk1 else 0
+    plans.append({
+        "category": "複勝",
+        "name": f"🛡️ 【複勝】 本命 ◎ {h1_num}番 {h1['馬名']}",
+        "points": 1,
+        "cost": 100,
+        "is_hit": hit_fuk1,
+        "hit_combo": f"{h1_num}番 ({h1['馬名']})" if hit_fuk1 else "-",
+        "payout": pay_fuk1_val,
+        "roi": (pay_fuk1_val / 100.0) * 100.0,
+        "profit": pay_fuk1_val - 100,
+        "note": f"複勝 {pay_fuk1_val:,}円" if hit_fuk1 else "着外"
+    })
+
+    # ③ 【複勝】 対抗○ 1点勝負
+    hit_fuk2 = (h2_num in actual_top3_set)
+    pay_fuk2_val = pay_fukusho_map.get(h2_num, 0) if hit_fuk2 else 0
+    plans.append({
+        "category": "複勝",
+        "name": f"🛡️ 【複勝】 対抗 ○ {h2_num}番 {h2['馬名']}",
+        "points": 1,
+        "cost": 100,
+        "is_hit": hit_fuk2,
+        "hit_combo": f"{h2_num}番 ({h2['馬名']})" if hit_fuk2 else "-",
+        "payout": pay_fuk2_val,
+        "roi": (pay_fuk2_val / 100.0) * 100.0,
+        "profit": pay_fuk2_val - 100,
+        "note": f"複勝 {pay_fuk2_val:,}円" if hit_fuk2 else "着外"
+    })
+
+    # ④ 【複勝】 特注穴馬☆ 1点勝負 (もし存在する場合)
+    if up_horse is not None:
+        up_num = int(up_horse["馬番"])
+        hit_up = (up_num in actual_top3_set)
+        pay_up_val = pay_fukusho_map.get(up_num, 0) if hit_up else 0
+        plans.append({
+            "category": "複勝",
+            "name": f"🔥 【複勝】 特注穴馬 ☆ {up_num}番 {up_horse['馬名']}",
+            "points": 1,
+            "cost": 100,
+            "is_hit": hit_up,
+            "hit_combo": f"{up_num}番 ({up_horse['馬名']})" if hit_up else "-",
+            "payout": pay_up_val,
+            "roi": (pay_up_val / 100.0) * 100.0,
+            "profit": pay_up_val - 100,
+            "note": f"複勝 {pay_up_val:,}円" if hit_up else "着外"
+        })
+
+    # ⑤ 【馬連】 上位3頭BOX (3点)
+    pred_top3_set = frozenset([h1_num, h2_num, h3_num])
+    hit_uma = (actual_top2_set.issubset(pred_top3_set))
+    pay_uma_val = pay_umaren if hit_uma else 0
+    plans.append({
+        "category": "馬連",
+        "name": f"🤝 【馬連】 上位3頭BOX ({h1_num},{h2_num},{h3_num})",
+        "points": 3,
+        "cost": 300,
+        "is_hit": hit_uma,
+        "hit_combo": f"{act_1_num} - {act_2_num}" if hit_uma else "-",
+        "payout": pay_uma_val,
+        "roi": (pay_uma_val / 300.0) * 100.0,
+        "profit": pay_uma_val - 300,
+        "note": f"馬連 {pay_umaren:,}円" if hit_uma else "不成立"
+    })
+
+    # ⑥ 【ワイド】 上位3頭BOX (3点)
+    pred_wide_pairs = [
+        frozenset([h1_num, h2_num]),
+        frozenset([h1_num, h3_num]),
+        frozenset([h2_num, h3_num])
+    ]
+    hit_wide_combos = []
+    tot_wide_pay = 0
+    for p_pair in pred_wide_pairs:
+        if p_pair.issubset(actual_top3_set) and p_pair in pay_wide_map:
+            w_pay = pay_wide_map[p_pair]
+            p_list = list(p_pair)
+            hit_wide_combos.append(f"{p_list[0]}-{p_list[1]} ({w_pay:,}円)")
+            tot_wide_pay += w_pay
+    hit_wide = len(hit_wide_combos) > 0
+    plans.append({
+        "category": "ワイド",
+        "name": f"🤝 【ワイド】 上位3頭BOX ({h1_num},{h2_num},{h3_num})",
+        "points": 3,
+        "cost": 300,
+        "is_hit": hit_wide,
+        "hit_combo": " / ".join(hit_wide_combos) if hit_wide else "-",
+        "payout": tot_wide_pay,
+        "roi": (tot_wide_pay / 300.0) * 100.0,
+        "profit": tot_wide_pay - 300,
+        "note": f"ワイド {len(hit_wide_combos)}点的中" if hit_wide else "2頭以上入着せず"
+    })
+
+    # ⑦ 【馬単】 本命頭固定 (2点)
+    hit_umatan = (act_1_num == h1_num and act_2_num in [h2_num, h3_num])
+    pay_utan_val = pay_umatan if hit_umatan else 0
+    plans.append({
+        "category": "馬単",
+        "name": f"🚀 【馬単】 本命頭固定 ({h1_num} → {h2_num},{h3_num})",
+        "points": 2,
+        "cost": 200,
+        "is_hit": hit_umatan,
+        "hit_combo": f"{h1_num} → {act_2_num}" if hit_umatan else "-",
+        "payout": pay_utan_val,
+        "roi": (pay_utan_val / 200.0) * 100.0,
+        "profit": pay_utan_val - 200,
+        "note": f"馬単 {pay_umatan:,}円" if hit_umatan else "不的中"
+    })
+
+    # ⑧ 3連複 各戦略
+    if trio_strat:
+        # 戦略① 軸1頭フォーメーション
+        s1 = trio_strat.get("formation", {})
+        s1_bets = s1.get("bets", [])
+        hit_s1 = False
+        hit_s1_str = ""
+        for b in s1_bets:
+            if frozenset(b["nums"]) == actual_top3_set:
+                hit_s1 = True
+                hit_s1_str = b["nums_str"]
+                break
+        pay_s1_val = pay_sanrenpuku if hit_s1 else 0
+        plans.append({
+            "category": "3連複",
+            "name": "👑 【3連複】 戦略①: 軸1頭フォーメーション",
+            "points": len(s1_bets),
+            "cost": len(s1_bets) * 100,
+            "is_hit": hit_s1,
+            "hit_combo": hit_s1_str if hit_s1 else "-",
+            "payout": pay_s1_val,
+            "roi": (pay_s1_val / max(100, len(s1_bets) * 100)) * 100.0,
+            "profit": pay_s1_val - (len(s1_bets) * 100),
+            "note": f"3連複 {pay_sanrenpuku:,}円" if hit_s1 else "不的中"
+        })
+
+        # 戦略② 厳選4頭BOX
+        s2 = trio_strat.get("box", {})
+        s2_bets = s2.get("bets", [])
+        hit_s2 = False
+        hit_s2_str = ""
+        for b in s2_bets:
+            if frozenset(b["nums"]) == actual_top3_set:
+                hit_s2 = True
+                hit_s2_str = b["nums_str"]
+                break
+        pay_s2_val = pay_sanrenpuku if hit_s2 else 0
+        plans.append({
+            "category": "3連複",
+            "name": "🎲 【3連複】 戦略②: 上位厳選4頭BOX",
+            "points": len(s2_bets),
+            "cost": len(s2_bets) * 100,
+            "is_hit": hit_s2,
+            "hit_combo": hit_s2_str if hit_s2 else "-",
+            "payout": pay_s2_val,
+            "roi": (pay_s2_val / max(100, len(s2_bets) * 100)) * 100.0,
+            "profit": pay_s2_val - (len(s2_bets) * 100),
+            "note": f"3連複 {pay_sanrenpuku:,}円" if hit_s2 else "不的中"
+        })
+
+        # 戦略③ 軸2頭ながし
+        s3 = trio_strat.get("axis2", {})
+        s3_bets = s3.get("bets", [])
+        hit_s3 = False
+        hit_s3_str = ""
+        for b in s3_bets:
+            if frozenset(b["nums"]) == actual_top3_set:
+                hit_s3 = True
+                hit_s3_str = b["nums_str"]
+                break
+        pay_s3_val = pay_sanrenpuku if hit_s3 else 0
+        plans.append({
+            "category": "3連複",
+            "name": "🚀 【3連複】 戦略③: 軸2頭ながし",
+            "points": len(s3_bets),
+            "cost": len(s3_bets) * 100,
+            "is_hit": hit_s3,
+            "hit_combo": hit_s3_str if hit_s3 else "-",
+            "payout": pay_s3_val,
+            "roi": (pay_s3_val / max(100, len(s3_bets) * 100)) * 100.0,
+            "profit": pay_s3_val - (len(s3_bets) * 100),
+            "note": f"3連複 {pay_sanrenpuku:,}円" if hit_s3 else "不的中"
+        })
+
+    # ⑨ 3連単 各戦略
+    if rentan_strat:
+        # 戦略① 1着固定フォーメーション
+        r1 = rentan_strat.get("formation", {})
+        r1_bets = r1.get("bets", [])
+        hit_r1 = False
+        hit_r1_str = ""
+        for b in r1_bets:
+            if tuple(b["nums"]) == actual_trifecta_tuple:
+                hit_r1 = True
+                hit_r1_str = b["nums_str"]
+                break
+        pay_r1_val = pay_sanrentan if hit_r1 else 0
+        plans.append({
+            "category": "3連単",
+            "name": "🔥 【3連単】 戦略①: 1着固定フォーメーション",
+            "points": len(r1_bets),
+            "cost": len(r1_bets) * 100,
+            "is_hit": hit_r1,
+            "hit_combo": hit_r1_str if hit_r1 else "-",
+            "payout": pay_r1_val,
+            "roi": (pay_r1_val / max(100, len(r1_bets) * 100)) * 100.0,
+            "profit": pay_r1_val - (len(r1_bets) * 100),
+            "note": f"3連単 {pay_sanrentan:,}円" if hit_r1 else "不的中"
+        })
+
+        # 戦略② 1・2着マルチ裏表
+        r2 = rentan_strat.get("mult", {})
+        r2_bets = r2.get("bets", [])
+        hit_r2 = False
+        hit_r2_str = ""
+        for b in r2_bets:
+            if tuple(b["nums"]) == actual_trifecta_tuple:
+                hit_r2 = True
+                hit_r2_str = b["nums_str"]
+                break
+        pay_r2_val = pay_sanrentan if hit_r2 else 0
+        plans.append({
+            "category": "3連単",
+            "name": "🚀 【3連単】 戦略②: 1・2着マルチ裏表",
+            "points": len(r2_bets),
+            "cost": len(r2_bets) * 100,
+            "is_hit": hit_r2,
+            "hit_combo": hit_r2_str if hit_r2 else "-",
+            "payout": pay_r2_val,
+            "roi": (pay_r2_val / max(100, len(r2_bets) * 100)) * 100.0,
+            "profit": pay_r2_val - (len(r2_bets) * 100),
+            "note": f"3連単 {pay_sanrentan:,}円" if hit_r2 else "不的中"
+        })
+
+        # 戦略③ 上位3頭BOX
+        r3 = rentan_strat.get("box", {})
+        r3_bets = r3.get("bets", [])
+        hit_r3 = False
+        hit_r3_str = ""
+        for b in r3_bets:
+            if tuple(b["nums"]) == actual_trifecta_tuple:
+                hit_r3 = True
+                hit_r3_str = b["nums_str"]
+                break
+        pay_r3_val = pay_sanrentan if hit_r3 else 0
+        plans.append({
+            "category": "3連単",
+            "name": "🎲 【3連単】 戦略③: 上位3頭厳選BOX",
+            "points": len(r3_bets),
+            "cost": len(r3_bets) * 100,
+            "is_hit": hit_r3,
+            "hit_combo": hit_r3_str if hit_r3 else "-",
+            "payout": pay_r3_val,
+            "roi": (pay_r3_val / max(100, len(r3_bets) * 100)) * 100.0,
+            "profit": pay_r3_val - (len(r3_bets) * 100),
+            "note": f"3連単 {pay_sanrentan:,}円" if hit_r3 else "不的中"
+        })
+
+    # ⑩ ダッチング最適資金配分プラン (もし実行されていれば)
+    if dutching_calc and "res" in dutching_calc and "items" in dutching_calc["res"]:
+        d_res = dutching_calc["res"]
+        d_items = d_res.get("items", [])
+        d_name = dutching_calc.get("plan_name", "ダッチング最適配分")
+        d_total_cost = d_res.get("actual_total", 3000)
+
+        hit_d_items = []
+        d_total_pay = 0
+        for item in d_items:
+            n_raw = item.get("nums", ())
+            is_item_hit = False
+            item_pay_rate = item.get("odds", 1.0)
+            if len(n_raw) == 3:
+                if "→" in item.get("nums_str", ""):
+                    if tuple(n_raw) == actual_trifecta_tuple:
+                        is_item_hit = True
+                        if pay_sanrentan:
+                            item_pay_rate = pay_sanrentan / 100.0
+                else:
+                    if frozenset(n_raw) == actual_top3_set:
+                        is_item_hit = True
+                        if pay_sanrenpuku:
+                            item_pay_rate = pay_sanrenpuku / 100.0
+            elif len(n_raw) == 2:
+                if frozenset(n_raw) == actual_top2_set:
+                    is_item_hit = True
+                    if pay_umaren:
+                        item_pay_rate = pay_umaren / 100.0
+
+            if is_item_hit:
+                hit_pay = int(round(item["bet_amount"] * item_pay_rate))
+                hit_d_items.append(f"{item.get('nums_str', '')} ({hit_pay:,}円)")
+                d_total_pay += hit_pay
+
+        hit_d = len(hit_d_items) > 0
+        plans.append({
+            "category": "資金配分電卓",
+            "name": f"💰 【資金配分電卓】 {d_name}",
+            "points": len(d_items),
+            "cost": d_total_cost,
+            "is_hit": hit_d,
+            "hit_combo": " / ".join(hit_d_items) if hit_d else "-",
+            "payout": d_total_pay,
+            "roi": (d_total_pay / max(100, d_total_cost)) * 100.0,
+            "profit": d_total_pay - d_total_cost,
+            "note": f"最適配分 {d_total_pay:,}円払戻" if hit_d else "配分買い目不的中"
+        })
+
+    # 回収額順にソート（的中優先、払戻額降順、回収率降順）
+    plans_sorted = sorted(plans, key=lambda p: (1 if p["is_hit"] else 0, p["payout"], p["roi"]), reverse=True)
+
+    hitting_plans = [p for p in plans if p["is_hit"]]
+    if hitting_plans:
+        best_payout_plan = max(hitting_plans, key=lambda p: p["payout"])
+        best_roi_plan = max(hitting_plans, key=lambda p: p["roi"])
+        best_profit_plan = max(hitting_plans, key=lambda p: p["profit"])
+        max_payout = best_payout_plan["payout"]
+        max_roi = best_roi_plan["roi"]
+        max_profit = best_profit_plan["profit"]
+    else:
+        best_payout_plan = None
+        best_roi_plan = None
+        best_profit_plan = None
+        max_payout = 0
+        max_roi = 0.0
+        max_profit = 0
+
+    return {
+        "max_payout": max_payout,
+        "max_roi": max_roi,
+        "max_profit": max_profit,
+        "best_payout_plan": best_payout_plan,
+        "best_roi_plan": best_roi_plan,
+        "best_profit_plan": best_profit_plan,
+        "hitting_count": len(hitting_plans),
+        "total_plans": len(plans),
+        "total_recovered": sum(p["payout"] for p in hitting_plans),
+        "total_cost": sum(p["cost"] for p in plans),
+        "plans": plans_sorted,
+        "finish_1st": f"{act_1_num}番 {act_1_name}",
+        "finish_2nd": f"{act_2_num}番 {act_2_name}",
+        "finish_3rd": f"{act_3_num}番 {act_3_name}",
+        "payouts_used": {
+            "単勝": pay_tansho,
+            "複勝": pay_fukusho_map,
+            "馬連": pay_umaren,
+            "ワイド": pay_wide_map,
+            "馬単": pay_umatan,
+            "3連複": pay_sanrenpuku,
+            "3連単": pay_sanrentan
+        },
+        "is_official": bool(official_payouts)
     }
 
 def get_draw_bias(h_num: int, total_horses: int, track_str: str, course_type: str, distance: int) -> tuple[float, str]:
@@ -3014,7 +3580,11 @@ if st.session_state["has_run_prediction"]:
         # 確定着順入力用データの同期・整合性維持
         if "actual_results_df" not in st.session_state or set(st.session_state["actual_results_df"]["馬番"]) != set(results["馬番"]):
             st.session_state["actual_results_df"] = results[["馬番", "馬名", "予想着順", "予想着順数値"]].copy()
-            st.session_state["actual_results_df"]["実際の着順"] = results["予想着順数値"]
+            if st.session_state.get("scraped_actual_ranks"):
+                s_map = st.session_state["scraped_actual_ranks"]
+                st.session_state["actual_results_df"]["実際の着順"] = st.session_state["actual_results_df"]["馬名"].map(s_map).fillna(results["予想着順数値"]).astype(int)
+            else:
+                st.session_state["actual_results_df"]["実際の着順"] = results["予想着順数値"]
         else:
             # 既存の入力値を保持しながら予想着順を最新化
             curr_map = st.session_state["actual_results_df"].set_index("馬番")["実際の着順"].to_dict()
@@ -3788,6 +4358,10 @@ if st.session_state["predicted_results"] is not None:
 
     # 5. 資金配分計算
     dutch_res = calculate_dutching_allocation(active_bets, budget=st.session_state["bet_budget"], mode=mode_sel)
+    st.session_state["latest_dutching_calc"] = {
+        "plan_name": selected_plan_label,
+        "res": dutch_res
+    }
 
     # 6. サマリーメトリック
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -4046,6 +4620,175 @@ if st.session_state["predicted_results"] is not None:
         hide_index=True
     )
 
+    # ==========================================
+    # 🏆 確定着順による回収パフォーマンス検証 ＆ 回収できた最大値
+    # ==========================================
+    st.markdown("---")
+    st.subheader("🏆 確定結果の回収パフォーマンス検証 ＆ 回収できた最大値")
+    st.caption("AIが推奨・生成した全馬券プラン（単勝・複勝・馬連・ワイド・馬単・3連複・3連単・ダッチング資金配分）を確定着順と照合し、回収できた最大値（最高払戻額・最高回収率）を特定！")
+
+    sorted_actual_tmp = comp_df.sort_values(by="実際の着順").reset_index(drop=True)
+    actual_1st_num = int(sorted_actual_tmp.iloc[0]["馬番"]) if len(sorted_actual_tmp) >= 1 else 1
+    actual_2nd_num = int(sorted_actual_tmp.iloc[1]["馬番"]) if len(sorted_actual_tmp) >= 2 else 2
+    actual_3rd_num = int(sorted_actual_tmp.iloc[2]["馬番"]) if len(sorted_actual_tmp) >= 3 else 3
+    actual_top2_set = frozenset([actual_1st_num, actual_2nd_num])
+    actual_top3_set = frozenset([actual_1st_num, actual_2nd_num, actual_3rd_num])
+
+    # 公式確定払戻金またはオッズ推定の確認・手動調整UI
+    official_payouts_data = st.session_state.get("scraped_official_payouts")
+    is_official_synced = bool(official_payouts_data)
+
+    payout_override_dict = {}
+
+    with st.expander(
+        f"💵 **確定払戻金・配当の確認＆手動調整** ({'🌐 netkeiba公式確定払戻金を自動連動中' if is_official_synced else '📊 想定オッズから高精度自動試算中'})",
+        expanded=False
+    ):
+        if is_official_synced:
+            st.success("✅ **netkeiba公式確定払戻金を取得・適用中**: レース結果ページから抽出した100%リアルな公式配当で回収額を計算しています。手動で微調整することも可能です。")
+        else:
+            st.info("ℹ️ **想定オッズによる推計配当を適用中**: レース確定前または出馬表から入力された場合はオッズから高精度に算出しています。手元に実際の確定払戻金がある場合は、下の各項目に入力すると即座に反映されます。")
+
+        odds_map_lookup = dict(zip(results["馬番"].astype(int), results["想定単勝オッズ"].astype(float)))
+
+        col_p1, col_p2, col_p3 = st.columns(3)
+        with col_p1:
+            default_tan_pay = 0
+            if is_official_synced and "単勝" in official_payouts_data and actual_1st_num in official_payouts_data["単勝"]:
+                default_tan_pay = int(official_payouts_data["単勝"][actual_1st_num])
+            else:
+                o1_val = float(odds_map_lookup.get(actual_1st_num, 3.0))
+                default_tan_pay = int(round(o1_val * 100))
+            custom_tan = st.number_input("単勝 払戻金 (100円あたり)", min_value=100, max_value=9999990, value=default_tan_pay, step=10, key="custom_pay_tan")
+            if custom_tan != default_tan_pay or is_official_synced:
+                payout_override_dict["単勝"] = {actual_1st_num: custom_tan}
+
+            default_uma_pay = 0
+            if is_official_synced and "馬連" in official_payouts_data and actual_top2_set in official_payouts_data["馬連"]:
+                default_uma_pay = int(official_payouts_data["馬連"][actual_top2_set])
+            else:
+                default_uma_pay = int(round(estimate_quinella_odds(float(odds_map_lookup.get(actual_1st_num, 3.0)), float(odds_map_lookup.get(actual_2nd_num, 5.0))) * 100))
+            custom_uma = st.number_input("馬連 払戻金 (100円あたり)", min_value=100, max_value=9999990, value=default_uma_pay, step=10, key="custom_pay_uma")
+            if custom_uma != default_uma_pay or is_official_synced:
+                payout_override_dict["馬連"] = {actual_top2_set: custom_uma}
+
+        with col_p2:
+            default_trio_pay = 0
+            if is_official_synced and "3連複" in official_payouts_data and actual_top3_set in official_payouts_data["3連複"]:
+                default_trio_pay = int(official_payouts_data["3連複"][actual_top3_set])
+            else:
+                default_trio_pay = int(round(estimate_trio_odds(float(odds_map_lookup.get(actual_1st_num, 3.0)), float(odds_map_lookup.get(actual_2nd_num, 5.0)), float(odds_map_lookup.get(actual_3rd_num, 8.0))) * 100))
+            custom_trio = st.number_input("3連複 払戻金 (100円あたり)", min_value=100, max_value=99999990, value=default_trio_pay, step=10, key="custom_pay_trio")
+            if custom_trio != default_trio_pay or is_official_synced:
+                payout_override_dict["3連複"] = {actual_top3_set: custom_trio}
+
+            default_utan_pay = 0
+            if is_official_synced and "馬単" in official_payouts_data and (actual_1st_num, actual_2nd_num) in official_payouts_data["馬単"]:
+                default_utan_pay = int(official_payouts_data["馬単"][(actual_1st_num, actual_2nd_num)])
+            else:
+                default_utan_pay = int(round(default_uma_pay * 1.85))
+            custom_utan = st.number_input("馬単 払戻金 (100円あたり)", min_value=100, max_value=99999990, value=default_utan_pay, step=10, key="custom_pay_utan")
+            if custom_utan != default_utan_pay or is_official_synced:
+                payout_override_dict["馬単"] = {(actual_1st_num, actual_2nd_num): custom_utan}
+
+        with col_p3:
+            default_tan3_pay = 0
+            if is_official_synced and "3連単" in official_payouts_data and (actual_1st_num, actual_2nd_num, actual_3rd_num) in official_payouts_data["3連単"]:
+                default_tan3_pay = int(official_payouts_data["3連単"][(actual_1st_num, actual_2nd_num, actual_3rd_num)])
+            else:
+                default_tan3_pay = int(round(estimate_trifecta_odds(float(odds_map_lookup.get(actual_1st_num, 3.0)), float(odds_map_lookup.get(actual_2nd_num, 5.0)), float(odds_map_lookup.get(actual_3rd_num, 8.0))) * 100))
+            custom_tan3 = st.number_input("3連単 払戻金 (100円あたり)", min_value=100, max_value=999999990, value=default_tan3_pay, step=100, key="custom_pay_tan3")
+            if custom_tan3 != default_tan3_pay or is_official_synced:
+                payout_override_dict["3連単"] = {(actual_1st_num, actual_2nd_num, actual_3rd_num): custom_tan3}
+
+    # 回収パフォーマンスの実行計算
+    trio_strat_obj = generate_sanrenpuku_strategies(results)
+    rentan_strat_obj = generate_sanrentan_strategies(results)
+    dutching_calc_obj = st.session_state.get("latest_dutching_calc")
+
+    rec_perf = calculate_race_recovery_performance(
+        results_df=results,
+        actual_ranks_df=comp_df,
+        official_payouts=official_payouts_data,
+        dutching_calc=dutching_calc_obj,
+        trio_strat=trio_strat_obj,
+        rentan_strat=rentan_strat_obj,
+        payout_overrides=payout_override_dict if payout_override_dict else None
+    )
+    st.session_state["latest_recovery_perf"] = rec_perf
+
+    # 👑 回収できた最大値のハイライト表示
+    if rec_perf and rec_perf.get("best_payout_plan"):
+        best_p = rec_perf["best_payout_plan"]
+        best_roi_item = rec_perf["best_roi_plan"]
+        max_pay = rec_perf["max_payout"]
+        max_roi_val = rec_perf["max_roi"]
+        max_prof = rec_perf["max_profit"]
+        hit_cnt = rec_perf["hitting_count"]
+        tot_cnt = rec_perf["total_plans"]
+        tot_rec = rec_perf["total_recovered"]
+
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #1b382b 0%, #0d2818 50%, #041b0f 100%); border: 2px solid #2ecc71; border-radius: 12px; padding: 20px 24px; color: white; margin-top: 15px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(46, 204, 113, 0.25);">
+                <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px;">
+                    <span style="font-size: 22px; font-weight: bold; color: #f1c40f;">
+                        👑 【確定結果検証】 回収できた最大値: <span style="font-size: 30px; color: #2ecc71; text-shadow: 0 0 10px rgba(46,204,113,0.5);">￥{max_pay:,} 円</span>
+                    </span>
+                    <span style="background-color: #2ecc71; color: #041b0f; font-weight: bold; padding: 4px 14px; border-radius: 20px; font-size: 14px;">
+                        最高回収率 {max_roi_val:,.1f}% （純利益 +{max_prof:,}円）
+                    </span>
+                </div>
+                <div style="font-size: 16px; margin-top: 10px; color: #ffffff; line-height: 1.6;">
+                    🏆 <b>最大回収を達成したプラン</b>: <span style="color: #ffeb3b; font-weight: bold;">{best_p['name']}</span><br>
+                    💎 <b>的中買い目</b>: <code>{best_p['hit_combo']}</code> ｜ <b>確定配当</b>: {best_p['note']}<br>
+                    📊 <b>的中実績サマリー</b>: 推奨全{tot_cnt}戦略中 <b>{hit_cnt}戦略が的中！</b> （全的中プランの合計払戻: <b>￥{tot_rec:,} 円</b>）
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+        with col_r1:
+            st.metric("🥇 回収できた最大値", f"{max_pay:,}円", delta=f"純利益 +{max_prof:,}円", delta_color="normal")
+        with col_r2:
+            st.metric("🎯 最高回収プラン", best_p["category"], delta=best_p["name"][:18] + "...")
+        with col_r3:
+            st.metric("📈 最大回収率 (ROI)", f"{max_roi_val:,.1f}%", delta="投資リターン")
+        with col_r4:
+            st.metric("🎫 的中プラン数", f"{hit_cnt} / {tot_cnt} 的中", delta=f"合算回収 {tot_rec:,}円")
+    else:
+        st.warning(
+            f"⚠️ **【結果検証】 本レースでの的中戦略はありませんでした（回収できた最大値: 0円）。**\n\n"
+            f"波乱や出遅れ等の着順結果を「競走馬メモリー」に蓄積し、次回レースでの精度向上・リベンジに繋げましょう。"
+        )
+
+    # 全馬券種・全戦略の回収実績ランキング対比表
+    if rec_perf and rec_perf.get("plans"):
+        st.markdown("#### 📊 全馬券種・全戦略の回収実績ランキング対比表 (1位〜最下位)")
+        st.caption("AIが推奨・生成した全馬券プラン（単勝・複勝・馬連・ワイド・馬単・3連複各戦略・3連単各戦略・資金配分電卓）の回収額・回収率を完全順位付け！")
+
+        rank_rows = []
+        for rank_idx, p_item in enumerate(rec_perf["plans"], start=1):
+            rank_medal = "🥇 1位" if rank_idx == 1 else ("🥈 2位" if rank_idx == 2 else ("🥉 3位" if rank_idx == 3 else f"{rank_idx}位"))
+            hit_badge = "🎯 的中！" if p_item["is_hit"] else "❌ 不的中"
+            rank_rows.append({
+                "順位": rank_medal,
+                "戦略プラン名": p_item["name"],
+                "券種": p_item["category"],
+                "点数": f"{p_item['points']}点",
+                "投資金額": f"{p_item['cost']:,}円",
+                "的中判定": hit_badge,
+                "的中買い目": p_item["hit_combo"],
+                "払戻金額 (回収額)": f"{p_item['payout']:,}円",
+                "回収率 (ROI)": f"{p_item['roi']:,.1f}%",
+                "純損益": f"{p_item['profit']:+,}円",
+                "備考": p_item["note"]
+            })
+
+        st.dataframe(pd.DataFrame(rank_rows), use_container_width=True, hide_index=True)
+
     # ------------------------------------------
     # 🧠 レース結果の記憶・競走馬メモリー蓄積 (黄金比率固定モデル)
     # ------------------------------------------
@@ -4153,11 +4896,19 @@ if st.session_state["predicted_results"] is not None:
 
                 horse_mem[h_name] = h_data
 
+            rec_perf_save = st.session_state.get("latest_recovery_perf")
+            max_pay_str = f"{rec_perf_save['max_payout']:,}円" if (rec_perf_save and rec_perf_save.get("best_payout_plan")) else "0円"
+            best_plan_str = rec_perf_save["best_payout_plan"]["name"] if (rec_perf_save and rec_perf_save.get("best_payout_plan")) else "なし"
+            max_roi_str = f"{rec_perf_save['max_roi']:.1f}%" if (rec_perf_save and rec_perf_save.get("best_roi_plan")) else "0.0%"
+
             hist_entry = {
                 "レース番号": f"第{len(st.session_state['training_history']) + 1}戦",
                 "学習日時": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
                 "コース・距離": f"{course_type} {race_distance}m",
                 "想定ペース": pace_prediction,
+                "最大回収額": max_pay_str,
+                "最高回収プラン": best_plan_str,
+                "最大回収率": max_roi_str,
                 "3連複": "👑 本線完全的中" if trio_perfect_hit else ("⭕ フォーメーション的中" if trio_box_hit else "❌ 不的中"),
                 "馬連BOX(3点)": "⭕ 的中" if umaren_hit else "❌ 不的中",
                 "ワイドBOX(3点)": "⭕ 的中" if wide_hit else "❌ 不的中",
@@ -4179,6 +4930,8 @@ if st.session_state["predicted_results"] is not None:
             insights = []
             insights.append(f"🧠 **【過去レース完全記憶（Tier 1）】** このレースの確定着順（全{len(actual_ranks_dict)}頭）を永久保存しました。次回同じ出走馬・レースを入力した際は100%完全再現して的中させます。")
             insights.append(f"🐎 **【個別競走馬メモリー更新（Tier 2）】** 出走全{len(comp_df)}頭の実績・人気着順ギャップを馬メモリーに反映しました。別レースに出走した際にも実力差として自動適用されます。")
+            if rec_perf_save and rec_perf_save.get("best_payout_plan"):
+                insights.append(f"💰 **【回収できた最大値】** {rec_perf_save['best_payout_plan']['name']} で最高払戻 **{rec_perf_save['max_payout']:,}円**（回収率 **{rec_perf_save['max_roi']:.1f}%** / 純利益 **+{rec_perf_save['max_profit']:,}円**）を記録しました！")
             if trio_perfect_hit:
                 insights.append("👑 **【3連複 本線完全的中】** AI推奨上位3頭がそのまま1・2・3着を独占！3連複の最高峰的中で特大払戻を獲得しました！")
             elif trio_box_hit:
