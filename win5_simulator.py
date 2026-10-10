@@ -1048,9 +1048,15 @@ def render_win5_simulator(
                                     res_data, _ = fetch_netkeiba_func(target_url)
                                     if res_data and res_data.get("actual_ranks"):
                                         r_diag["meta"]["actual_ranks"] = res_data["actual_ranks"]
+                                        if res_data.get("official_payouts"):
+                                            r_diag["official_payouts"] = res_data["official_payouts"]
                                         for h_obj in res_data.get("horses", []):
                                             if res_data["actual_ranks"].get(h_obj["馬名"]) == 1:
-                                                st.session_state[f"actual_win_{idx_f}"] = int(h_obj["馬番"])
+                                                w_num = int(h_obj["馬番"])
+                                                st.session_state[f"actual_win_{idx_f}"] = w_num
+                                                r_diag["actual_winner"] = w_num
+                                                if idx_f < len(st.session_state.get("win5_races_data", [])):
+                                                    st.session_state["win5_races_data"][idx_f]["actual_winner"] = w_num
                                                 fetched_cnt += 1
                                                 break
                                 except Exception:
@@ -1094,14 +1100,15 @@ def render_win5_simulator(
                 act_num = actual_win_nums[i]
                 c_horses = active_selections[i]
                 selected_nums = [int(r["馬番"]) for _, r in c_horses.iterrows()]
+                sel_str = "・".join(str(n) for n in selected_nums) + "番"
 
                 if act_num == 0:
                     alive_status.append("⏳ 待機中")
                 elif act_num in selected_nums:
-                    alive_status.append("⭕ 突破！")
+                    alive_status.append(f"⭕ 突破！ ({act_num}番的中)")
                     survived_points = max(1, int(survived_points / max(1, len(selected_nums))))
                 else:
-                    alive_status.append(f"❌ 脱落 ({act_num}番)")
+                    alive_status.append(f"❌ 脱落 (勝馬:{act_num}番 ｜ 買目:{sel_str})")
                     is_dead = True
                     survived_points = 0
 

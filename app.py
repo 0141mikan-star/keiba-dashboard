@@ -2962,26 +2962,59 @@ def fetch_netkeiba_race(url: str):
         if h_name in horses_map:
             continue
 
-        # 馬番
+        # テーブル形式（出馬表 vs 結果表）に応じたカラム判定の強化
+        # 馬名リンクが含まれるtdを特定（馬名の直前が馬番、2つ前が枠番という競馬テーブル共通の規則）
+        h_td_idx = -1
+        for idx_td, td in enumerate(tds):
+            if td.find("a", href=lambda h: h and "/horse/" in h):
+                h_td_idx = idx_td
+                break
+
+        # 馬番・枠番の高精度抽出
         umaban_str = ""
+        waku_str = ""
+
+        # 1. クラス名による特定
         umaban_el = row.find("td", class_=re.compile(r"Umaban\d*"))
         if umaban_el and umaban_el.text.strip().isdigit():
             umaban_str = umaban_el.text.strip()
-        elif len(tds) >= 2 and tds[1].text.strip().isdigit():
-            umaban_str = tds[1].text.strip()
-        elif len(tds) >= 1 and tds[0].text.strip().isdigit():
-            umaban_str = tds[0].text.strip()
+        waku_el = row.find("td", class_=re.compile(r"Waku\d*"))
+        if waku_el and waku_el.text.strip().isdigit():
+            waku_str = waku_el.text.strip()
+
+        # 2. 馬名セル相対位置による特定（出馬表・結果表・db問わず共通: 馬名の直前が馬番、2つ前が枠番）
+        if not umaban_str and h_td_idx >= 1:
+            cand_uma = tds[h_td_idx - 1].text.strip()
+            if cand_uma.isdigit():
+                umaban_str = cand_uma
+            if not waku_str and h_td_idx >= 2:
+                cand_waku = tds[h_td_idx - 2].text.strip()
+                if cand_waku.isdigit():
+                    waku_str = cand_waku
+
+        # 3. フォールバック判定（結果表: [着順, 枠, 馬番, ...] / 出馬表: [枠, 馬番, ...]）
+        if not umaban_str:
+            if len(tds) >= 4 and tds[0].text.strip().isdigit() and tds[1].text.strip().isdigit() and tds[2].text.strip().isdigit():
+                umaban_str = tds[2].text.strip()
+                if not waku_str:
+                    waku_str = tds[1].text.strip()
+            elif len(tds) >= 2 and tds[1].text.strip().isdigit():
+                umaban_str = tds[1].text.strip()
+                if not waku_str and tds[0].text.strip().isdigit():
+                    waku_str = tds[0].text.strip()
+            elif len(tds) >= 1 and tds[0].text.strip().isdigit():
+                umaban_str = tds[0].text.strip()
 
         try:
             umaban = int(umaban_str) if umaban_str else (len(horses_map) + 1)
         except Exception:
             umaban = len(horses_map) + 1
 
-        # 枠番
-        waku = str(((umaban - 1) // 2) + 1)
-        waku_el = row.find("td", class_=re.compile(r"Waku\d*"))
-        if waku_el and waku_el.text.strip():
-            waku = waku_el.text.strip()
+        # 枠番のフォールバック
+        if not waku_str:
+            waku = str(((umaban - 1) // 2) + 1)
+        else:
+            waku = waku_str
 
         # 騎手名（フルネーム正規化）
         jockey_raw = "騎手未定"
@@ -3100,6 +3133,11 @@ def fetch_netkeiba_race(url: str):
                             scraped_actual_ranks[h_name] = int(tds[0])
                         if h_name in horses_map:
                             if len(tds) >= 11:
+                                # 馬番・枠番を確定結果テーブルから確実に同期補正
+                                if len(tds) >= 3 and tds[2].isdigit():
+                                    horses_map[h_name]["馬番"] = int(tds[2])
+                                if len(tds) >= 2 and tds[1].isdigit():
+                                    horses_map[h_name]["枠番"] = tds[1]
                                 # 人気
                                 if tds[9].isdigit():
                                     horses_map[h_name]["単勝人気"] = int(tds[9])
