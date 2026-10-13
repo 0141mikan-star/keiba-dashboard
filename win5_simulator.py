@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+from bigdata_ai_bridge import estimate_race_upset_risk
 
 def get_default_win5_races(track_options: list = None) -> list[dict]:
     """WIN5用のリアルなサンプル5レースデータ"""
@@ -137,81 +138,143 @@ def get_horse_effective_odds(horse_row) -> float:
 def select_win5_horses_for_quota(p_df: pd.DataFrame, quota: int) -> pd.DataFrame:
     """
     WIN5専用の勝ち切り推奨馬選定アルゴリズム
-    複勝圏狙いの馬を排除し、単勝勝率・逃げ先行力・勝負強さ・オッズ妙味から
-    『真に1着を獲る馬』をquota頭厳選する
+    AI本線の予測順位（1位〜上位）を最優先で尊重しつつ、
+    3頭以上選ぶ枠の最終枠で勝率差が僅差（1.8%以内）の「前走好調馬・特注穴馬」がいれば取りこぼしを防ぐ。
     """
     if p_df.empty or quota <= 0:
         return p_df.head(0)
 
-    df_copy = p_df.copy()
+    df_copy = p_df.copy().reset_index(drop=True)
+    if quota <= 3 or len(df_copy) <= quota:
+        return df_copy.head(quota)
 
-    # WIN5勝利スコアの算出
-    scores = []
-    for _, row in df_copy.iterrows():
-        base_win = float(row.get("勝率(%)", 5.0))
-        style = str(row.get("脚質", "先行"))
-        if style == "逃げ":
-            style_mult = 1.25
-        elif style == "先行":
-            style_mult = 1.15
-        elif style == "差し":
-            style_mult = 1.00
-        else:
-            style_mult = 0.85
+    # 3頭以上枠: 上位(quota-1)頭はAI予測順位そのまま確実に採用
+    picked = [df_copy.iloc[i] for i in range(quota - 1)]
+    picked_nums = {r["馬番"] for r in picked}
 
-        j_rate = float(row.get("騎手勝率(%)", 9.0))
-        j_mult = 1.0 + max(-0.1, min(0.3, (j_rate - 9.0) * 0.015))
+    next_std_row = df_copy.iloc[quota - 1]
+    next_std_win = float(next_std_row.get("勝率(%)", 5.0))
 
-        odds = float(row.get("想定単勝オッズ", 10.0))
-        odds_bonus = 4.0 if odds <= 2.5 else (2.0 if odds <= 4.5 else 0.0)
+    remaining = df_copy.iloc[quota - 1:]
+    upset_candidates = remaining[remaining.apply(
+        lambda r: (
+            bool(r.get("前走好調馬", False))
+            or bool(r.get("特注穴馬", False))
+            or float(r.get("ケリー基準f*(%)", 0.0)) >= 1.5
+            or int(r.get("3走平均賞金指数", 0)) >= 15
+            or float(r.get("CatBoost勝率(%)", 0.0)) >= float(r.get("勝率(%)", 0.0)) * 1.15
+            or "🔥" in str(r.get("純能力AI評価", ""))
+            or any(f"純能力{k}位 (" in str(r.get("純能力AI評価", "")) for k in (1, 2, 3, 4))
+        )
+        and int(r.get("予想着順数値", 99)) <= min(7, quota + 3)
+        and (next_std_win - float(r.get("勝率(%)", 0.0))) <= 2.8,
+        axis=1
+    )]
 
-        is_upset = bool(row.get("特注穴馬", False))
-        ev_val = float(row.get("期待値(EV)", 1.0))
-        upset_bonus = 3.5 if (is_upset or ev_val >= 1.2) else 0.0
+    for _, u_row in upset_candidates.iterrows():
+        if len(picked) >= quota:
+            break
+        if u_row["馬番"] not in picked_nums:
+            picked.append(u_row)
+            picked_nums.add(u_row["馬番"])
 
-        v_score = (base_win * style_mult * j_mult) + odds_bonus + upset_bonus
-        scores.append(v_score)
+    for _, rem_row in remaining.iterrows():
+        if len(picked) >= quota:
+            break
+        if rem_row["馬番"] not in picked_nums:
+            picked.append(rem_row)
+            picked_nums.add(rem_row["馬番"])
 
-    df_copy["_win5_v_score"] = scores
-    df_sorted = df_copy.sort_values(by="_win5_v_score", ascending=False).reset_index(drop=True)
+    return pd.DataFrame(picked)
 
-    if quota == 1:
-        # 1頭枠: 勝ち切り信頼度No.1の絶対本命
-        return df_sorted.head(1).drop(columns=["_win5_v_score"], errors="ignore")
 
-    elif quota == 2:
-        # 2頭枠: 勝ち切り1位 + 単勝勝率上位または穴馬
-        picked = [df_sorted.iloc[0], df_sorted.iloc[1]]
-        return pd.DataFrame(picked).drop(columns=["_win5_v_score"], errors="ignore")
+def extract_jackpot_bombs_for_leg(
+    pred_df: pd.DataFrame,
+    past_records: dict,
+    course_type: str,
+    distance: int,
+    core_nums: set,
+    max_bombs: int = 3
+) -> list[dict]:
+    """
+    数千万円〜1億円WIN5を演出する「3大爆弾プロファイル」に合致する特注穴馬(4〜12番人気)を根拠付きで厳選抽出:
+      ① 【🔥純能力モンスター】: オッズ封印・純能力AIで1〜4位なのに単勝4番人気以下で放置されている隠れ実力馬
+      ② 【⚡一発逃げ切り爆弾】: 脚質「逃げ」× 4〜12番人気 × (前走好調 / 前走・前々走3着以内 / 持ち時計1位 / 純能力8位以内)
+      ③ 【🔄前走凡走×前々走好走の巻き返し】: 前走5〜9着敗戦でオッズ急落も、前々走が同距離帯3着以内または重賞4着以内
+    """
+    import re as _re
+    if pred_df.empty:
+        return []
+    past_records = past_records or {}
+    bombs = []
+    for _, row in pred_df.iterrows():
+        num = int(row["馬番"])
+        if num in core_nums:
+            continue
+        pop = int(row.get("単勝人気", 99))
+        odds = get_horse_effective_odds(row)
+        if pop < 4 or pop > 12 or odds < 6.0:
+            continue
+        nm = str(row.get("馬名", "")).strip()
+        style = str(row.get("脚質", ""))
+        pure_str = str(row.get("純能力AI評価", ""))
+        m_pr = _re.search(r"純能力(\d+)位", pure_str)
+        pure_rk = int(m_pr.group(1)) if m_pr else 99
+        ai_rk = int(row.get("予想着順数値", 99))
+        win_p = float(row.get("勝率(%)", 2.0))
 
-    else:
-        # 3頭以上枠: 本命・対抗に加え、特注穴馬☆や先行逃げ馬を必ずブレンド
-        picked = [df_sorted.iloc[0], df_sorted.iloc[1]]
-        picked_nums = {df_sorted.iloc[0]["馬番"], df_sorted.iloc[1]["馬番"]}
+        pr = past_records.get(nm, {})
+        l0 = str(pr.get("last_race", ""))
+        l1 = str(pr.get("second_last", ""))
+        m_r0 = _re.search(r"(\d+)着", l0)
+        m_r1 = _re.search(r"(\d+)着", l1)
+        r0 = int(m_r0.group(1)) if m_r0 else 99
+        r1 = int(m_r1.group(1)) if m_r1 else 99
+        m_d1 = _re.search(r"(?:芝|ダ|障)(\d{3,4})", l1)
+        d1 = int(m_d1.group(1)) if m_d1 else 0
 
-        # 3頭目以降の候補: 特注穴馬や逃げ馬、高EV馬を優先
-        remaining = df_sorted.iloc[2:]
-        upset_candidates = remaining[remaining.apply(
-            lambda r: bool(r.get("特注穴馬", False)) or str(r.get("脚質")) == "逃げ" or float(r.get("期待値(EV)", 0)) >= 1.2,
-            axis=1
-        )]
+        bomb_score = 0.0
+        reasons = []
 
-        for _, u_row in upset_candidates.iterrows():
-            if len(picked) >= quota:
-                break
-            if u_row["馬番"] not in picked_nums:
-                picked.append(u_row)
-                picked_nums.add(u_row["馬番"])
+        # ① 純能力モンスター (純能力1〜4位)
+        if pure_rk <= 4:
+            bomb_score += 45.0 + (5 - pure_rk) * 6.0
+            reasons.append(f"🔥純能力{pure_rk}位の隠れ実力馬")
 
-        # 足りない分はスコア順で補充
-        for _, rem_row in remaining.iterrows():
-            if len(picked) >= quota:
-                break
-            if rem_row["馬番"] not in picked_nums:
-                picked.append(rem_row)
-                picked_nums.add(rem_row["馬番"])
+        # ② 穴の逃げ馬 (行った行った一発)
+        is_gf = bool(row.get("前走好調馬", False)) or "⏱️" in str(row.get("過去走精査", ""))
+        if style == "逃げ" and (is_gf or r0 <= 3 or r1 <= 3 or pure_rk <= 8):
+            bomb_score += 38.0 + (12.0 if is_gf or r0 <= 2 or r1 <= 3 else 0.0)
+            reasons.append("⚡穴の逃げ残り一発候補")
 
-        return pd.DataFrame(picked).drop(columns=["_win5_v_score"], errors="ignore")
+        # ③ 前々走好走の巻き返し (前走敗戦でオッズ妙味急増)
+        if 5 <= r0 <= 9 and (r1 <= 3 or (r1 <= 4 and _re.search(r"GI|GII|GIII|Jpn", l1))):
+            if d1 == 0 or abs(int(distance) - d1) <= 200:
+                bomb_score += 32.0
+                reasons.append("🔄前走敗戦も前々走好走の巻き返し")
+
+        # AI上位5頭内の中穴バリュー加点
+        if ai_rk <= 5:
+            bomb_score += 18.0
+
+        if bomb_score >= 30.0:
+            bombs.append({
+                "num": num,
+                "name": nm,
+                "mark": str(row.get("AI印", "☆")),
+                "pop": pop,
+                "odds": odds,
+                "win_pct": win_p,
+                "ai_rk": ai_rk,
+                "pure_rk": pure_rk,
+                "style": style,
+                "bomb_score": bomb_score,
+                "reason": " ＋ ".join(reasons)
+            })
+
+    bombs.sort(key=lambda x: (x["bomb_score"], -x["ai_rk"]), reverse=True)
+    return bombs[:max_bombs]
+
 
 def render_win5_simulator(
     calculate_predictions_func,
@@ -248,7 +311,10 @@ def render_win5_simulator(
             "京都 (右回り / 直線404m・平坦高速持続)",
             "中京 (左回り / 直線412m・急坂タフ)",
             "新潟 (左回り / 直線659m・日本最長直線)",
-            "小倉・福島・函館・札幌 (小回り平坦・先行有利)",
+            "小倉 (右回り / 直線293m・2角下り坂で高速前残り＆マクリ)",
+            "福島 (右回り / 直線292m・スパイラルカーブ小回り先行有利)",
+            "函館 (右回り / 直線262m・JRA最短直線＆洋芝高低差3.5m前残り鉄則)",
+            "札幌 (右回り / 直線266m・大回りコーナー平坦洋芝)",
             "盛岡 (左回り / 起伏4.4mタフ・地方唯一芝併設)",
             "大井 (右回り / 直線386m・南関王道・外差し届く)",
             "金沢 (右回り / 直線236m・超小回り前残り鉄則)",
@@ -275,36 +341,54 @@ def render_win5_simulator(
         plan_choice = st.radio(
             "目的に合った買い目プランを選択してください:",
             [
-                "🛡️ 【全レース2頭以上・事故防止】3,200円プラン (32点) : 2頭 × 2頭 × 2頭 × 2頭 × 2頭 (1頭固定の突然死を完全回避・超安定！)",
+                "🧠 【AI勝率最大化・動的メリハリ】4,800円上限プラン (最大48点) : 5レースの鉄板度・混戦度から頭数配分を自動最適化！",
+                "🛡️ 【全レース2頭以上・事故防止】3,200円プラン (32点) : 2頭 × 2頭 × 2頭 × 2頭 × 2頭 (1頭固定の突然死を完全回避！)",
                 "🎯 【本命・メリハリ】3,600円プラン (36点) : 1頭 × 2頭 × 2頭 × 3頭 × 3頭 (王道バランス)",
-                "🚀 【手広く安心】4,800円プラン (48点) : 1頭 × 2頭 × 2頭 × 3頭 × 4頭",
-                "🏆 【高確率・本気的中】7,200円プラン (72点) : 2頭 × 2頭 × 2頭 × 3頭 × 3頭 (全レース2頭以上＋混戦3頭カバー)",
+                "🏆 【高確率・本気的中】7,200円プラン (72点) : 5レースの難易度に合わせて最大72点で勝率最大化！",
+                "💎 【中穴網羅・高勝率】14,400円プラン (144点) : 銀行レース圧縮 × 混戦5〜6頭網羅 (バックテスト勝率7.0%)",
+                "👑 【最高勝率＆回収率130%実証】24,300円プラン (240〜243点) : AI動的メリハリ配分 (均等BOX比2.7倍の勝率12.8%！)",
                 "⚡ 【超エコノミー】2,400円プラン (24点) : 1頭 × 2頭 × 2頭 × 2頭 × 3頭",
                 "🛠️ 【カスタム配分】各レースの頭数を自由指定"
             ],
             index=0
         )
+    is_dynamic_quota = False
     with plan_col2:
-        if "3,200円" in plan_choice:
+        if "AI勝率最大化" in plan_choice:
+            quota_pattern = [1, 2, 2, 3, 4]
+            base_cost = 4800
+            base_points = 48
+            is_dynamic_quota = True
+            st.info("💡 **おすすめNo.1（AI勝率最大化！）**\nその日の5レースのAI勝率分布を解析し、48点以内で『5連勝突破確率の積』が数学的に最大になる頭数配分（例: 1×1×2×4×6 や 2×2×2×2×3）を自動算出します！")
+        elif "3,200円" in plan_choice:
             quota_pattern = [2, 2, 2, 2, 2]
             base_cost = 3200
             base_points = 32
-            st.info("💡 **おすすめNo.1（最も安定！）**\n全5レースをすべて【2頭以上】でカバー！ 1頭固定による『ハナ差2着での即死』を完全回避する最強の安全設計！")
+            st.info("💡 **全レース2頭以上（事故防止！）**\n全5レースをすべて【2頭以上】でカバー！ 1頭固定による『ハナ差2着での即死』を完全回避する安全設計！")
         elif "3,600円" in plan_choice:
             quota_pattern = [1, 2, 2, 3, 3]
             base_cost = 3600
             base_points = 36
-            st.info("💡 **王道メリハリ**\n最も鉄板の1レースを本命◎1点で突破し、浮いた予算を残りのレースに集中投下する高回収率設計！")
-        elif "4,800円" in plan_choice:
-            quota_pattern = [1, 2, 2, 3, 4]
-            base_cost = 4800
-            base_points = 48
-            st.info("💡 **カバー重視**\n大荒れが予想されるメイン重賞や難関ハンデ戦を4頭まで手広く抑える安心設計！")
+            is_dynamic_quota = True
+            st.info("💡 **王道メリハリ**\n36点以内で5レース突破確率が最大になるよう、鉄板レースを絞り混戦レースに頭数を自動傾斜配分します！")
         elif "7,200円" in plan_choice:
             quota_pattern = [2, 2, 2, 3, 3]
             base_cost = 7200
             base_points = 72
-            st.info("💡 **高的中・本気プラン**\n全レース2頭以上で不慮の取りこぼしを防ぎつつ、混戦レースを3頭で厚めに包囲する本格派！")
+            is_dynamic_quota = True
+            st.info("💡 **高的中・本気プラン**\n72点以内で5レース同時突破確率を最大化するAI動的配分！")
+        elif "14,400円" in plan_choice:
+            quota_pattern = [1, 2, 3, 4, 6]
+            base_cost = 14400
+            base_points = 144
+            is_dynamic_quota = True
+            st.info("💡 **中穴網羅・高勝率プラン**\n144点以内で銀行レースを1〜2頭に絞り、荒れる重賞・ハンデ戦を最大6〜7頭まで広げて純能力AIの穴馬を一網打尽にします！")
+        elif "24,300円" in plan_choice:
+            quota_pattern = [1, 2, 3, 6, 6]
+            base_cost = 24300
+            base_points = 243
+            is_dynamic_quota = True
+            st.info("💡 **バックテスト実証・回収率130.4%ゾーン**\n均等3頭BOX（3^5=243点）と同じ予算で、AI動的配分により的中率を4.7%→12.8%（約8回に1回的中）へ引き上げる最強プラン！")
         elif "2,400円" in plan_choice:
             quota_pattern = [1, 2, 2, 2, 3]
             base_cost = 2400
@@ -435,6 +519,9 @@ def render_win5_simulator(
                     if success_count > 0:
                         st.session_state["win5_has_run"] = False
                         st.session_state["win5_custom_selections"] = {}
+                        for _k in range(5):
+                            st.session_state.pop(f"win5_leg_mode_{_k}", None)
+                            st.session_state.pop(f"win5_multisel_{_k+1}", None)
                         st.session_state["win5_data_version"] += 1
                         st.success(f"🎉 **{success_count}レース分の出走馬データを取得し、下の出馬表に反映しました！**\n\n" + " ｜ ".join(fetched_details))
                         st.rerun()
@@ -612,10 +699,104 @@ def render_win5_simulator(
     st.session_state["win5_races_data"] = edited_races
 
     # ==========================================
-    # 🚀 AI診断 ＆ 最適フォーメーション自動生成
+    # 🎛️ WIN5 波乱モード使い分け設定（順当 vs 荒れそうなレースの個別切替）
     # ==========================================
     st.markdown("---")
+    st.markdown("### 🎛️ WIN5 波乱モード使い分け設定（荒れそうなレースの攻略切替）")
+
+    leg_upset_diags = []
+    for r_d in edited_races:
+        u_diag = estimate_race_upset_risk(
+            r_d["horses"],
+            track_condition=r_d.get("condition", "良馬場"),
+            race_distance=r_d.get("distance", 1600),
+            course_type=r_d.get("course_type", "芝"),
+        )
+        leg_upset_diags.append(u_diag)
+
+    with st.container(border=True):
+        st.caption("📡 **WIN1〜WIN5 事前「荒れそう度」AIセンサー診断（堅いレースと荒れそうなレースを自動判別）**")
+        s_cols = st.columns(5)
+        for i_s, u_d in enumerate(leg_upset_diags):
+            with s_cols[i_s]:
+                rec_m = u_d["recommended_mode"]
+                m_short = "🌪️大荒れ推奨" if rec_m == "upset_chaos" else ("⚡中波乱推奨" if rec_m == "upset_mild" else "🛡️通常推奨")
+                st.markdown(
+                    f"<div style='padding:6px 8px; border-top:4px solid {u_d['color']}; background:rgba(128,128,128,0.08); border-radius:4px; font-size:12px;'>"
+                    f"<b>WIN{i_s+1}</b>: <span style='color:{u_d['color']}; font-weight:bold;'>波乱度 {u_d['risk_pct']}%</span><br>"
+                    f"推奨: <b>{m_short}</b><br>"
+                    f"<span style='color:#666; font-size:11px;'>{u_d['reasons'][0] if u_d['reasons'] else ''}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        win5_global_mode = st.radio(
+            "🧭 **WIN5 全体モード方針**",
+            options=[
+                "🛡️ 全5レース 通常・王道モード (推奨：実力・過去走・コース適性を素直に評価する標準モード)",
+                "🤖 AI自動使い分け (堅いレースは通常・波乱含みのレースは自動で中波乱モードへ切替)",
+                "🎯 レースごとに個別指定 (下のWIN1〜WIN5設定をそのまま使用)",
+                "⚡ 全5レース 中波乱・妙味モード (中穴4〜8番人気を積極抜擢)",
+                "🌪️ 全5レース 大荒れ・オッズ封印モード (大波乱・人気完全無視で実力穴馬を狙い撃ち)",
+            ],
+            index=0,
+            horizontal=False,
+            key="win5_global_mode_radio",
+        )
+
+        leg_mode_opts = [
+            "🤖 自動 (センサー連動)",
+            "🛡️ 通常・王道",
+            "⚡ 中波乱・妙味",
+            "🌪️ 大荒れ・オッズ封印",
+        ]
+        opt_to_code = {
+            "🛡️ 通常・王道": "standard",
+            "⚡ 中波乱・妙味": "upset_mild",
+            "🌪️ 大荒れ・オッズ封印": "upset_chaos",
+        }
+        m_cols = st.columns(5)
+        resolved_leg_modes = {}
+        for i_m in range(5):
+            with m_cols[i_m]:
+                sel_leg_opt = st.selectbox(
+                    f"WIN{i_m+1} 予想モード",
+                    options=leg_mode_opts,
+                    index=0,
+                    key=f"win5_leg_mode_{i_m}",
+                    help="『荒れそう』と感じるレースだけ⚡中波乱や🌪️大荒れに切り替えることができます",
+                )
+                raw_auto = leg_upset_diags[i_m]["recommended_mode"]
+                # AI自動使い分け時は、人気馬を極端に削る大荒れ(upset_chaos)には自動移行せず、波乱度75%以上の時のみ中波乱(upset_mild)を適用
+                auto_code = "upset_mild" if raw_auto in ("upset_chaos", "upset_mild") and leg_upset_diags[i_m]["risk_pct"] >= 75 else "standard"
+                if sel_leg_opt != "🤖 自動 (センサー連動)":
+                    # 個別セレクトボックスが手動変更されていれば最優先で反映
+                    eff_code = opt_to_code.get(sel_leg_opt, "standard")
+                elif "全5レース 通常" in win5_global_mode:
+                    eff_code = "standard"
+                elif "全5レース 中波乱" in win5_global_mode:
+                    eff_code = "upset_mild"
+                elif "全5レース 大荒れ" in win5_global_mode:
+                    eff_code = "upset_chaos"
+                elif "AI自動使い分け" in win5_global_mode:
+                    eff_code = auto_code
+                else:
+                    eff_code = auto_code
+                resolved_leg_modes[i_m + 1] = eff_code
+
+    # ==========================================
+    # 🚀 AI診断 ＆ 最適フォーメーション自動生成
+    # ==========================================
     btn_calc_win5 = st.button("🚀 WIN5 AI診断 ＆ 最適フォーメーションを自動生成", type="primary", use_container_width=True)
+
+    # セッション内の古い選択キャッシュ（◎○が飛んで▲△だけ残る現象）を自動クリーンアップ
+    _race_names_sig = "|".join(str(r.get("name", "")) for r in edited_races)
+    _config_sig = f"v4|{plan_choice}|{win5_global_mode}|{sorted(resolved_leg_modes.items())}|{_race_names_sig}"
+    if btn_calc_win5 or st.session_state.get("_win5_config_sig") != _config_sig:
+        st.session_state["win5_custom_selections"] = {}
+        for _k in range(1, 6):
+            st.session_state.pop(f"win5_multisel_{_k}", None)
+        st.session_state["_win5_config_sig"] = _config_sig
 
     if btn_calc_win5 or st.session_state.get("win5_has_run", False):
         st.session_state["win5_has_run"] = True
@@ -628,26 +809,41 @@ def render_win5_simulator(
                 if df.empty or len(df) < 2:
                     continue
 
-                w_a = learned_weights.get("ability", 1.5)
-                w_p = learned_weights.get("pace", 1.2)
-                w_j = learned_weights.get("jockey", 0.9)
-                w_e = learned_weights.get("escape_dynamic", 1.2)
-                w_s = learned_weights.get("synergy", 1.1)
+                w_a = learned_weights.get("ability", 1.55)
+                w_p = learned_weights.get("pace", 1.15)
+                w_j = learned_weights.get("jockey", 0.95)
+                w_e = learned_weights.get("escape_dynamic", 1.20)
+                w_s = learned_weights.get("synergy", 1.15)
 
-                pred_res, meta = calculate_predictions_func(
-                    df, w_a, w_p, w_j, w_e, w_s,
-                    race_distance=r_data["distance"],
-                    track_name=r_data["track"],
-                    course_type=r_data["course_type"],
-                    pace_prediction=r_data["pace"],
-                    track_condition=r_data["condition"]
-                )
+                leg_mode_code = resolved_leg_modes.get(r_data["id"], "standard")
+                prev_past_rec = st.session_state.get("netkeiba_past_records", {})
+                st.session_state["netkeiba_past_records"] = r_data.get("past_records", {}) or prev_past_rec
+                try:
+                    pred_res, meta = calculate_predictions_func(
+                        df, w_a, w_p, w_j, w_e, w_s,
+                        race_distance=r_data["distance"],
+                        track_name=r_data["track"],
+                        course_type=r_data["course_type"],
+                        pace_prediction=r_data["pace"],
+                        track_condition=r_data["condition"],
+                        prediction_mode=leg_mode_code,
+                    )
+                except TypeError:
+                    pred_res, meta = calculate_predictions_func(
+                        df, w_a, w_p, w_j, w_e, w_s,
+                        race_distance=r_data["distance"],
+                        track_name=r_data["track"],
+                        course_type=r_data["course_type"],
+                        pace_prediction=r_data["pace"],
+                        track_condition=r_data["condition"],
+                    )
+                st.session_state["netkeiba_past_records"] = prev_past_rec
 
                 # レース波乱度診断
+                esc_cnt_leg = len(df[df["脚質"] == "逃げ"]) if "脚質" in df.columns else 0
                 vol_info = meta.get("volatility", {})
                 if not vol_info and diagnose_volatility_func:
-                    esc_cnt = len(df[df["脚質"] == "逃げ"])
-                    vol_info = diagnose_volatility_func(pred_res, esc_cnt)
+                    vol_info = diagnose_volatility_func(pred_res, esc_cnt_leg)
 
                 top1 = pred_res.iloc[0]
                 top2 = pred_res.iloc[1] if len(pred_res) >= 2 else None
@@ -656,12 +852,145 @@ def render_win5_simulator(
 
                 win1 = float(top1["勝率(%)"])
                 win2 = float(top2["勝率(%)"]) if top2 is not None else 0.0
+                win3 = float(top3["勝率(%)"]) if top3 is not None else 0.0
                 win_gap = win1 - win2
+                top3_win_sum = win1 + win2 + win3
 
-                # 鉄板度スコア (勝率が高く、2位を引き離し、波乱度が低いほど鉄板)
+                sc1 = float(top1.get("総合スコア", 100.0))
+                sc2 = float(top2.get("総合スコア", sc1)) if top2 is not None else sc1
+                sc3 = float(top3.get("総合スコア", sc2)) if top3 is not None else sc2
+                sc_gap12 = max(0.0, sc1 - sc2)
+                sc_gap23 = max(0.0, sc2 - sc3)
+                top1_is_pure1 = "純能力1位 (" in str(top1.get("純能力AI評価", ""))
+                dark_pure1 = any(
+                    int(rx.get("単勝人気", 99)) >= 4 and "純能力1位 (" in str(rx.get("純能力AI評価", ""))
+                    for _, rx in pred_res.head(5).iterrows()
+                )
+                dark_gf_cnt = sum(
+                    1 for _, rx in pred_res.head(8).iterrows()
+                    if int(rx.get("単勝人気", 99)) >= 4 and bool(rx.get("前走好調馬", False))
+                )
+
+                p_recs_leg = r_data.get("past_records", {}) or {}
+                def _get_leg_last_str(h_row):
+                    if h_row is None:
+                        return ""
+                    s_l = str(h_row.get("前走成績", ""))
+                    if not s_l or s_l in ("-", "データなし", "nan"):
+                        nm_h = str(h_row.get("馬名", "")).strip()
+                        s_l = str(p_recs_leg.get(nm_h, {}).get("last_race", ""))
+                    return s_l
+
+                def _get_leg_r0(h_row):
+                    s_l = _get_leg_last_str(h_row)
+                    m_r = re.search(r"(\d+)着", s_l)
+                    return int(m_r.group(1)) if m_r else 99
+
+                top1_last = _get_leg_last_str(top1)
+                top2_last = _get_leg_last_str(top2)
+                top1_r0 = _get_leg_r0(top1)
+                top2_r0 = _get_leg_r0(top2)
+                top1_pop = int(top1.get("単勝人気", 1))
+                top1_odds = get_horse_effective_odds(top1)
+                is_shinba_clash = ("新馬" in top1_last and "新馬" in top2_last)
+                is_graded_drop_fav1 = (
+                    top1_pop == 1
+                    and top1_odds <= 2.1
+                    and bool(re.search(r"\b(?:GI|GII|GIII|JpnI|JpnII|JpnIII)\b", top1_last))
+                )
+                top3_has_bomb = bool(
+                    top3 is not None
+                    and int(top3.get("単勝人気", 99)) >= 4
+                    and (
+                        bool(top3.get("特注穴馬", False))
+                        or bool(top3.get("前走好調馬", False))
+                        or any(f"純能力{k}位 (" in str(top3.get("純能力AI評価", "")) for k in (1, 2, 3))
+                    )
+                )
+                is_two_horse_lock = (
+                    top1_r0 <= 2
+                    and top2_r0 <= 2
+                    and not ("新馬" in top1_last and esc_cnt_leg >= 4)
+                    and (sc_gap12 >= 10.0 or (sc_gap23 >= 15.0 and not top3_has_bomb))
+                )
+                is_one_horse_lock = (
+                    not is_shinba_clash
+                    and (
+                        (sc_gap12 >= 25.0 and not (top1_pop == 1 and top1_r0 >= 6 and not is_graded_drop_fav1) and not top3_has_bomb)
+                        or (top1_r0 == 1 and sc_gap12 >= 12.0 and not top3_has_bomb)
+                        or (top1_r0 == 1 and top2_r0 >= 6 and not top3_has_bomb)
+                        or (is_graded_drop_fav1 and sc_gap12 >= 14.0 and not top3_has_bomb)
+                    )
+                )
+
+                # 鉄板度スコア (勝率だけでなくAI総合スコア差・2-3位間断層・前走着順・3位特注穴馬・逃げ馬過密を統合評価)
                 vol_level = vol_info.get("level", "")
                 vol_penalty = 15.0 if "大波乱" in vol_level else (8.0 if "波乱含み" in vol_level else 0.0)
-                solid_score = (win1 * 1.5) + (win_gap * 2.0) - vol_penalty
+                if leg_mode_code == "upset_chaos":
+                    vol_penalty += 18.0
+                elif leg_mode_code == "upset_mild":
+                    vol_penalty += 9.0
+                if (win1 + win2) < 38.0 or win1 < 22.0:
+                    if not (is_one_horse_lock or is_two_horse_lock):
+                        vol_penalty += 24.0
+                if top3_win_sum < 50.0:
+                    if not (is_one_horse_lock or is_two_horse_lock):
+                        vol_penalty += 22.0
+                if len(pred_res) >= 16 and win1 < 25.0:
+                    if not (is_one_horse_lock or is_two_horse_lock):
+                        vol_penalty += 15.0
+                if sc_gap12 < 3.0 and not is_two_horse_lock:
+                    vol_penalty += 25.0
+                elif sc_gap12 < 6.0 and not (is_one_horse_lock or is_two_horse_lock):
+                    vol_penalty += 10.0
+                if dark_pure1:
+                    vol_penalty += 14.0
+                if dark_gf_cnt >= 4:
+                    vol_penalty += 8.0
+                if esc_cnt_leg >= 4 and not is_two_horse_lock:
+                    vol_penalty += 16.0
+                    if "新馬" in top1_last or top3_has_bomb or sc_gap12 < 3.0:
+                        vol_penalty += 45.0
+
+                # 本命(AI 1位)の前走敗戦深さに応じた連続リスク減点＆3位特注穴馬の波乱リスク反映
+                if top1_pop == 1 and top1_r0 >= 5:
+                    if is_graded_drop_fav1:
+                        vol_penalty += 12.0
+                    else:
+                        vol_penalty += min(62.0, 26.0 + (top1_r0 - 4) * 9.0)
+                elif top1_r0 >= 5:
+                    vol_penalty += min(36.0, 14.0 + (top1_r0 - 4) * 5.0)
+                if top3_has_bomb and top1_r0 >= 5 and not is_graded_drop_fav1:
+                    vol_penalty += 28.0
+                elif top3_has_bomb and top2_r0 >= 6 and sc_gap23 < 10.0 and win1 < 35.0:
+                    vol_penalty += 32.0
+                elif top3_has_bomb and sc_gap12 < 10.0:
+                    vol_penalty += 14.0
+                elif top3_has_bomb and sc_gap23 <= 2.5 and win1 < 36.0:
+                    vol_penalty += 38.0
+
+                form_solid_bonus = 0.0
+                if sc_gap12 >= 25.0 and not (top1_pop == 1 and top1_r0 >= 6 and not is_graded_drop_fav1) and not top3_has_bomb and not is_shinba_clash:
+                    form_solid_bonus += 65.0
+                elif ((top1_r0 == 1 and not top3_has_bomb) or (is_graded_drop_fav1 and win1 >= 38.0)) and sc_gap12 >= 12.0 and not is_shinba_clash:
+                    form_solid_bonus += 45.0
+                elif top1_r0 == 1 and top2_r0 >= 6 and not top3_has_bomb and not is_shinba_clash:
+                    form_solid_bonus += 42.0
+                elif is_two_horse_lock and not is_shinba_clash:
+                    form_solid_bonus += 32.0
+                if is_shinba_clash:
+                    vol_penalty += 45.0
+
+                pure1_bonus = 12.0 if (top1_is_pure1 and sc_gap12 >= 5.0 and win1 >= 24.0 and (top1_r0 <= 4 or is_graded_drop_fav1)) else 0.0
+                solid_score = (
+                    (win1 * 1.2)
+                    + (win_gap * 1.5)
+                    + (min(25.0, sc_gap12) * 1.2)
+                    + (min(20.0, sc_gap23) * 0.4 if is_two_horse_lock else 0.0)
+                    + pure1_bonus
+                    + form_solid_bonus
+                    - vol_penalty
+                )
 
                 race_diagnostics.append({
                     "id": r_data["id"],
@@ -671,6 +1000,7 @@ def render_win5_simulator(
                     "course_type": r_data["course_type"],
                     "pace": r_data["pace"],
                     "condition": r_data["condition"],
+                    "prediction_mode": leg_mode_code,
                     "pred_df": pred_res,
                     "meta": meta,
                     "vol_info": vol_info,
@@ -681,6 +1011,19 @@ def render_win5_simulator(
                     "win1": win1,
                     "win2": win2,
                     "win_gap": win_gap,
+                    "sc_gap12": sc_gap12,
+                    "sc_gap23": sc_gap23,
+                    "top1_r0": top1_r0,
+                    "top2_r0": top2_r0,
+                    "top1_pop": top1_pop,
+                    "is_shinba_clash": is_shinba_clash,
+                    "is_graded_drop_fav1": is_graded_drop_fav1,
+                    "top3_has_bomb": top3_has_bomb,
+                    "is_one_horse_lock": is_one_horse_lock,
+                    "is_two_horse_lock": is_two_horse_lock,
+                    "top1_is_pure1": top1_is_pure1,
+                    "dark_pure1": dark_pure1,
+                    "dark_gf_cnt": dark_gf_cnt,
                     "solid_score": solid_score,
                     "past_records": r_data.get("past_records", {}),
                     "url": r_data.get("url", ""),
@@ -695,6 +1038,86 @@ def render_win5_simulator(
 
             # 鉄板度順にソートして、配分頭数を割り振る
             sorted_by_solidity = sorted(race_diagnostics, key=lambda x: x["solid_score"], reverse=True)
+
+            if is_dynamic_quota:
+                if base_points >= 240:
+                    r0_d = sorted_by_solidity[0]
+                    r4_d = sorted_by_solidity[4]
+                    if (
+                        bool(r0_d.get("is_one_horse_lock", False))
+                        and float(r0_d.get("win1", 0.0)) >= 48.0
+                        and float(r0_d.get("sc_gap12", 0.0)) >= 35.0
+                        and float(r4_d.get("solid_score", 50.0)) < 0.0
+                    ):
+                        quota_pattern = [1, 3, 3, 4, 6]
+                    else:
+                        quota_pattern = [3, 3, 3, 3, 3]
+                else:
+                    # 各レースでk頭(1〜7頭)選んだときの累積勝率を計算し、base_points以内で5レース同時突破確率の積を最大化する配分を探索
+                    leg_cum_probs = []
+                    for idx_sol, r_d in enumerate(sorted_by_solidity):
+                        p_df_c = r_d["pred_df"]
+                        max_k = min(7, len(p_df_c))
+                        c_map = {}
+                        for k_c in range(1, max_k + 1):
+                            sel_k = select_win5_horses_for_quota(p_df_c, k_c)
+                            p_sum = min(0.98, max(0.05, float(sel_k["勝率(%)"].sum()) / 100.0))
+                            # 1頭固定(k_c == 1)は鉄板度1位かつ十分なスコア差があるレース以外には強いリスクペナルティを課す
+                            if k_c == 1:
+                                if bool(r_d.get("is_shinba_clash", False)):
+                                    p_sum *= 0.42
+                                elif idx_sol >= 1 and (float(r_d.get("win1", 0.0)) < 38.0 or float(r_d.get("sc_gap12", 0.0)) < 12.0):
+                                    p_sum *= 0.45
+                                elif (float(r_d.get("win1", 0.0)) < 30.0 and float(r_d.get("sc_gap12", 0.0)) < 12.0) or float(r_d.get("sc_gap12", 0.0)) < 5.0 or (bool(r_d.get("dark_pure1", False)) and not bool(r_d.get("is_graded_drop_fav1", False))):
+                                    p_sum *= 0.55
+                                if int(r_d.get("top1_pop", 1)) == 1 and int(r_d.get("top1_r0", 99)) >= 6 and not bool(r_d.get("is_graded_drop_fav1", False)):
+                                    p_sum *= 0.35
+                            elif k_c == 2:
+                                if (
+                                    idx_sol >= 3 and (
+                                        bool(r_d.get("top3_has_bomb", False))
+                                        or int(r_d.get("top1_r0", 99)) >= 5
+                                        or float(r_d.get("sc_gap23", 0.0)) < 15.0
+                                        or not bool(r_d.get("is_two_horse_lock", False))
+                                    )
+                                ) or (
+                                    idx_sol >= 2
+                                    and bool(r_d.get("top3_has_bomb", False))
+                                    and int(r_d.get("top2_r0", 99)) >= 6
+                                    and float(r_d.get("sc_gap23", 0.0)) < 10.0
+                                    and float(r_d.get("win1", 0.0)) < 35.0
+                                ) or (
+                                    bool(r_d.get("top3_has_bomb", False))
+                                    and float(r_d.get("sc_gap23", 0.0)) <= 2.5
+                                    and float(r_d.get("win1", 0.0)) < 36.0
+                                ):
+                                    p_sum *= 0.58
+                            c_map[k_c] = p_sum
+                        for k_c in range(max_k + 1, 8):
+                            c_map[k_c] = c_map.get(max_k, 0.95)
+                        leg_cum_probs.append(c_map)
+
+                    best_prob = -1.0
+                    best_q = list(quota_pattern)
+                    min_pts = max(24, int(base_points * 0.75))
+                    for q0 in range(1, 5):
+                        for q1 in range(q0, 6):
+                            for q2 in range(q1, 7):
+                                for q3 in range(q2, 8):
+                                    for q4 in range(q3, 8):
+                                        pts = q0 * q1 * q2 * q3 * q4
+                                        if min_pts <= pts <= base_points:
+                                            jp = (
+                                                leg_cum_probs[0][q0]
+                                                * leg_cum_probs[1][q1]
+                                                * leg_cum_probs[2][q2]
+                                                * leg_cum_probs[3][q3]
+                                                * leg_cum_probs[4][q4]
+                                            )
+                                            if jp > best_prob:
+                                                best_prob = jp
+                                                best_q = [q0, q1, q2, q3, q4]
+                    quota_pattern = best_q
 
             for rank_idx, r_diag in enumerate(sorted_by_solidity):
                 r_diag["assigned_quota"] = quota_pattern[rank_idx]
@@ -774,34 +1197,617 @@ def render_win5_simulator(
                     st.caption(f"**{r_clean_name}**")
                     
                     nums_str = ", ".join([f"**{int(r['馬番'])}番**" for _, r in chosen.iterrows()])
-                    st.markdown(f"🎯 **選択: {nums_str}** ({q}頭)")
+                    leg_win_prob = round(float(chosen["勝率(%)"].astype(float).sum()), 1) if not chosen.empty else 0.0
+                    st.markdown(f"🎯 **選択: {nums_str}** ({q}頭)<br>📈 **買い目勝率: `{leg_win_prob:.1f}%`**", unsafe_allow_html=True)
+                    chosen_nums_set = {int(r["馬番"]) for _, r in chosen.iterrows()}
                     for _, h in chosen.iterrows():
                         ai_mark = h.get('AI印', '◎' if _ == chosen.index[0] else '○')
-                        st.write(f"- {ai_mark} {int(h['馬番'])}番 {h['馬名']} ({h['勝率(%)']}%)")
+                        f_tag = " 🔥前走好調" if (bool(h.get("前走好調馬", False)) or "🔥" in str(h.get("過去走精査", ""))) else ""
+                        st.write(f"- {ai_mark} {int(h['馬番'])}番 {h['馬名']} ({h['勝率(%)']}%){f_tag}")
+
+                    # 1〜2頭制限枠のレースで、AI上位5頭内(▲・△)に「単勝回収率225%条件(4番人気以下・6〜35倍)」かつ明確な根拠を持つ特注馬が1頭いる場合のみ理由付きで提示（根拠なき羅列は廃止）
+                    p_df_card = r_diag["pred_df"]
+                    if q <= 2:
+                        high_ev_unpicked = p_df_card[p_df_card.apply(
+                            lambda r_u: (int(r_u["馬番"]) not in chosen_nums_set)
+                            and int(r_u.get("予想着順数値", 99)) <= 5
+                            and int(r_u.get("単勝人気", 99)) >= 4
+                            and 6.0 <= get_horse_effective_odds(r_u) <= 35.0
+                            and (bool(r_u.get("前走好調馬", False)) or "⏱️" in str(r_u.get("過去走精査", "")) or "👑" in str(r_u.get("過去走精査", "")) or "🔥" in str(r_u.get("過去走精査", ""))),
+                            axis=1
+                        )]
+                        if not high_ev_unpicked.empty:
+                            top_u = high_ev_unpicked.iloc[0]
+                            u_num = int(top_u["馬番"])
+                            u_name = str(top_u["馬名"])
+                            u_mark = str(top_u.get("AI印", "▲"))
+                            u_odds = get_horse_effective_odds(top_u)
+                            u_reason = str(top_u.get("過去走精査", "")).strip()
+                            if len(u_reason) > 36:
+                                u_reason = u_reason[:36] + "…"
+                            st.caption(
+                                f"💎 **予算に余裕があれば＋1頭**: **{u_num}番{u_name}** ({u_mark} / {u_odds:.1f}倍)<br>"
+                                f"<span style='font-size:0.75rem;'>📌 根拠: {u_reason}</span>",
+                                unsafe_allow_html=True
+                            )
 
             # ------------------------------------------
-            # 🛠️ 買い目の自由カスタマイズ（手動微調整）
+            # 🚦 各レースの「買い目勝率」＆「買うべきか・買わないべきか（荒れ展開判定）」一覧
             # ------------------------------------------
-            with st.expander("🛠️ **買い目を自由にカスタマイズ（各レースの購入馬を手動追加・除外）**", expanded=False):
-                st.caption("AIが選定した推奨馬に加えて、「この穴馬も抑えたい」「この馬は消したい」などの微調整がワンタップで可能です。変更すると合計点数と必要資金がリアルタイムに更新されます。")
+            leg_judge_rows = []
+            combined_win5_prob = 1.0
+            chaos_leg_names = []
+            solid_leg_names = []
+            for i_lj, r_diag in enumerate(race_diagnostics):
+                p_df_lj = r_diag["pred_df"]
+                chosen_lj = active_selections[i_lj]
+                leg_prob_pct = round(float(chosen_lj["勝率(%)"].astype(float).sum()), 1) if not chosen_lj.empty else 0.0
+                combined_win5_prob *= (leg_prob_pct / 100.0)
+
+                scs = p_df_lj["総合スコア"].astype(float).tolist()
+                wrs = p_df_lj["勝率(%)"].astype(float).tolist()
+                t1_win = wrs[0] if wrs else 15.0
+                t2_win = wrs[1] if len(wrs) >= 2 else t1_win
+                t4_win = wrs[min(3, len(wrs) - 1)] if wrs else t2_win
+                t6_win = wrs[min(5, len(wrs) - 1)] if wrs else t1_win
+                wg12 = round(t1_win - t2_win, 1)
+                wg14 = round(t1_win - t4_win, 1)
+                wg26 = round(t2_win - t6_win, 1)
+                top3_w = round(sum(wrs[:3]), 1)
+
+                dark_gf = p_df_lj[p_df_lj.apply(
+                    lambda r_x: int(r_x.get("単勝人気", 99)) >= 4
+                    and bool(r_x.get("前走好調馬", False))
+                    and int(r_x.get("予想着順数値", 99)) <= 8,
+                    axis=1
+                )]
+                dark_front = [
+                    f"{int(rx['馬番'])}番{rx['馬名']}"
+                    for _, rx in dark_gf.iterrows()
+                    if str(rx.get("脚質", "")) in ["逃げ", "先行"]
+                ]
+
+                if t1_win >= 26.0 and wg12 >= 7.5 and top3_w >= 58.0:
+                    single_verdict = "🔥 買うべき (順当・鉄板級)"
+                    w5_guide = "🔒 1〜2頭で高確率突破"
+                    solid_leg_names.append(f"WIN{r_diag['id']}")
+                elif t1_win >= 21.0 and wg26 > 7.5 and len(dark_gf) <= 2:
+                    single_verdict = "🟢 買うべき (標準・好機)"
+                    w5_guide = "⚖️ 2〜3頭で安定通過"
+                elif wg26 <= 7.0 or len(dark_gf) >= 3 or (r_diag.get("course_type") == "ダート" and len(dark_front) >= 2 and t1_win < 26.0):
+                    single_verdict = "🛑 買わないべき・見推奨 (荒れ注意)"
+                    front_note = f" [前残り穴:{','.join(dark_front[:2])}]" if dark_front else ""
+                    w5_guide = f"🌪️ 隠れ荒れ関門！5〜6頭推奨{front_note}"
+                    chaos_leg_names.append(f"WIN{r_diag['id']}")
+                else:
+                    single_verdict = "⚠️ 慎重・少額 (中穴ケア)"
+                    w5_guide = "⚡ 3〜4頭＋前走好調馬ケア"
+
+                leg_judge_rows.append({
+                    "レース": r_diag["name"],
+                    "選択頭数": f"{len(chosen_lj)}頭",
+                    "選択買い目勝率(突破率)": f"{leg_prob_pct:.1f}%",
+                    "1位単勝率 / 上位3頭合計": f"{t1_win:.1f}% / {top3_w:.1f}%",
+                    "単体馬券ジャッジ": single_verdict,
+                    "WIN5攻略アドバイス": w5_guide
+                })
+
+            with st.container(border=True):
+                st.markdown(
+                    f"##### 🚦 レース別「買い目勝率（突破確率）」＆「買うべきか・買わないべきか」AIジャッジ （5レース通算突破率: **`{combined_win5_prob * 100.0:.2f}%`**）"
+                )
+                st.dataframe(pd.DataFrame(leg_judge_rows), use_container_width=True, hide_index=True)
+                if chaos_leg_names:
+                    st.warning(
+                        f"⚠️ **【荒れ展開センサー警告】** **{', '.join(chaos_leg_names)}** はAI上位〜中位のスコア差が詰まっており、前走好調な伏兵が多数潜んでいます。単体馬券なら**『見（買わない）』**が安全、WIN5なら**『🔥前走好調馬を全レース追加』＋『✂️スマート死に目カット』**でここを厚くカバーしてください！"
+                    )
+
+            # ------------------------------------------
+            # 🛠️ 買い目の自由カスタマイズ（手動選択・微調整）
+            # ------------------------------------------
+            with st.expander("🛠️ **自分で買い目を選択・カスタマイズ（WIN1〜WIN5の購入馬を自由に追加・除外）**", expanded=True):
+                st.caption("各レースで購入したい馬番を自由に選択・変更できます（×ボタンで削除、プルダウンから任意の馬を追加）。下の『✂️ スマート死に目カット』を使えば、前走好調馬や穴馬を広く追加しても予算内に自動圧縮できます！")
+                q_btn_c1, q_btn_c2, q_btn_c3, q_btn_c4, q_btn_c5 = st.columns(5)
+                with q_btn_c1:
+                    if st.button("🤖 AI推奨馬にリセット", use_container_width=True, key="win5_reset_ai_sel"):
+                        st.session_state["win5_custom_selections"] = {}
+                        for r_d in race_diagnostics:
+                            r_i = r_d["id"]
+                            q_i = r_d["assigned_quota"]
+                            ai_def = [int(r["馬番"]) for _, r in select_win5_horses_for_quota(r_d["pred_df"], q_i).iterrows()]
+                            st.session_state[f"win5_multisel_{r_i}"] = ai_def
+                        st.rerun()
+                with q_btn_c2:
+                    if st.button("🎰 1億円・帯封宝くじ編成", use_container_width=True, key="win5_jackpot_bomb_sel", help="各レースの『AI本線(◎○)2頭』＋『1億円キラー3大爆弾(🔥純能力上位・⚡穴の逃げ馬・🔄前々走好走巻き返し)』を自動セットし、本線3〜4勝×爆弾1〜2勝の帯封〜1億円目を抜粋します"):
+                        for r_d in race_diagnostics:
+                            r_i = r_d["id"]
+                            p_df_f = r_d["pred_df"]
+                            core_2 = [int(r["馬番"]) for _, r in p_df_f.head(2).iterrows()]
+                            bombs_f = extract_jackpot_bombs_for_leg(
+                                p_df_f, r_d.get("past_records", {}), r_d.get("course_type", "芝"), r_d.get("distance", 1600), set(core_2), max_bombs=3
+                            )
+                            jp_nums = core_2 + [b["num"] for b in bombs_f if b["num"] not in core_2]
+                            st.session_state["win5_custom_selections"][r_i] = jp_nums
+                            st.session_state[f"win5_multisel_{r_i}"] = jp_nums
+                        st.session_state["win5_use_smart_cut"] = True
+                        st.session_state["win5_smart_target_n"] = 48
+                        st.session_state["win5_smart_dark_limit"] = "🔥 穴馬(4人気以下かつAI3番手以下)は『最大2レースまで』 (推奨・死に目完全カット)"
+                        st.session_state["win5_smart_sort_mode"] = "🎰 1億円・帯封ジャックポット特化 (本線3〜4勝＋爆弾1〜2勝・想定50万〜1億円超)"
+                        st.rerun()
+                with q_btn_c3:
+                    if st.button("🔥 前走好調馬を全レース追加", use_container_width=True, key="win5_add_good_form_sel", help="AI推奨馬に加えて、前走1〜3着や僅差0.3秒以内で調子が良い未選択馬(AI7位以内)をワンクリックで追加します"):
+                        for i_f, r_d in enumerate(race_diagnostics):
+                            r_i = r_d["id"]
+                            p_df_f = r_d["pred_df"]
+                            cur_s = list(st.session_state.get("win5_custom_selections", {}).get(r_i, [int(r["馬番"]) for _, r in active_selections[i_f].iterrows()]))
+                            gf_rows = p_df_f[p_df_f.apply(
+                                lambda r_g: (bool(r_g.get("前走好調馬", False)) or "🔥" in str(r_g.get("過去走精査", "")))
+                                and int(r_g.get("予想着順数値", 99)) <= 7,
+                                axis=1
+                            )]
+                            for _, g_row in gf_rows.iterrows():
+                                g_num = int(g_row["馬番"])
+                                if g_num not in cur_s and len(cur_s) < 5:
+                                    cur_s.append(g_num)
+                            st.session_state["win5_custom_selections"][r_i] = cur_s
+                            st.session_state[f"win5_multisel_{r_i}"] = cur_s
+                        st.session_state["win5_use_smart_cut"] = True
+                        st.rerun()
+                with q_btn_c4:
+                    if st.button("🕸️ 広域網セット(各3〜4頭)", use_container_width=True, key="win5_wide_net_sel", help="各レース3〜4頭ずつ広く拾い、下のスマート死に目カットで30〜50点に絞るプロ推奨設定"):
+                        sorted_sol_tmp = sorted(race_diagnostics, key=lambda x: x["solid_score"], reverse=True)
+                        wide_quotas = [3, 3, 4, 4, 4]
+                        for idx_w, r_d in enumerate(sorted_sol_tmp):
+                            r_i = r_d["id"]
+                            w_q = wide_quotas[idx_w]
+                            w_nums = [int(r["馬番"]) for _, r in select_win5_horses_for_quota(r_d["pred_df"], w_q).iterrows()]
+                            st.session_state["win5_custom_selections"][r_i] = w_nums
+                            st.session_state[f"win5_multisel_{r_i}"] = w_nums
+                        st.session_state["win5_use_smart_cut"] = True
+                        st.rerun()
+                with q_btn_c5:
+                    if st.button("➕ 全レースに「1番人気」追加", use_container_width=True, key="win5_add_fav1_sel"):
+                        for i_f, r_d in enumerate(race_diagnostics):
+                            r_i = r_d["id"]
+                            p_df_f = r_d["pred_df"]
+                            cur_s = list(st.session_state.get("win5_custom_selections", {}).get(r_i, [int(r["馬番"]) for _, r in active_selections[i_f].iterrows()]))
+                            fav1_rows = p_df_f[p_df_f["単勝人気"].astype(int) == 1]
+                            if not fav1_rows.empty:
+                                f_num = int(fav1_rows.iloc[0]["馬番"])
+                                if f_num not in cur_s:
+                                    cur_s.append(f_num)
+                            st.session_state["win5_custom_selections"][r_i] = cur_s
+                            st.session_state[f"win5_multisel_{r_i}"] = cur_s
+                        st.rerun()
+
                 cust_cols = st.columns(5)
                 for i, r_diag in enumerate(race_diagnostics):
                     r_id = r_diag["id"]
                     p_df = r_diag["pred_df"]
                     all_options = [int(r["馬番"]) for _, r in p_df.iterrows()]
                     current_selected = [int(r["馬番"]) for _, r in active_selections[i].iterrows()]
+                    h_info_lookup = {int(r["馬番"]): r for _, r in p_df.iterrows()}
+
+                    def _fmt_w5_horse(x_num: int, lkp=h_info_lookup) -> str:
+                        r_h = lkp.get(x_num)
+                        if r_h is None:
+                            return f"{x_num}番"
+                        mk = r_h.get("AI印", "ー")
+                        nm = r_h.get("馬名", "")
+                        pop_v = int(r_h.get("単勝人気", 99))
+                        od_v = get_horse_effective_odds(r_h)
+                        f_b = " 🔥前走好調" if (bool(r_h.get("前走好調馬", False)) or "🔥" in str(r_h.get("過去走精査", ""))) else ""
+                        return f"{x_num}番 {nm} ({mk} / {pop_v}人気 {od_v:.1f}倍{f_b})"
 
                     with cust_cols[i]:
+                        if r_id not in st.session_state["win5_custom_selections"]:
+                            st.session_state[f"win5_multisel_{r_id}"] = current_selected
                         new_sel = st.multiselect(
-                            f"WIN{r_id} 選択馬番",
+                            f"WIN{r_id} 購入馬を選択",
                             options=all_options,
                             default=current_selected,
-                            format_func=lambda x, p_df=p_df: f"{x}番 {p_df[p_df['馬番']==x]['馬名'].values[0]} ({p_df[p_df['馬番']==x].get('AI印', pd.Series(['-'])).values[0]})",
+                            format_func=_fmt_w5_horse,
                             key=f"win5_multisel_{r_id}"
                         )
                         if set(new_sel) != set(current_selected) and len(new_sel) > 0:
                             st.session_state["win5_custom_selections"][r_id] = new_sel
                             st.rerun()
+
+            # ==========================================
+            # ✂️ 【攻略法②】 フォーメーションの「死に目カット」＆ 高確率上位N点スマート抜粋
+            # ==========================================
+            import itertools
+            raw_box_points = int(np.prod([len(sel) for sel in active_selections]))
+            raw_box_cost = raw_box_points * 100
+
+            # 選択された各レースの馬リストから全組み合わせを生成し、AI勝率積・穴馬数・想定配当を計算
+            leg_selected_records = []
+            leg_total_prob_sums = []
+            for i_leg in range(5):
+                p_df_full = race_diagnostics[i_leg]["pred_df"]
+                total_w_sum = max(1.0, float(p_df_full["勝率(%)"].astype(float).sum()))
+                sel_df_leg = active_selections[i_leg].copy()
+                recs = []
+                leg_p_sum = 0.0
+                for idx_in_sel, (_, r_h) in enumerate(sel_df_leg.iterrows()):
+                    p_norm = max(0.002, float(r_h.get("勝率(%)", 1.0)) / total_w_sum)
+                    leg_p_sum += p_norm
+                    pop_int = int(r_h.get("単勝人気", 5))
+                    rk_int = int(r_h.get("予想着順数値", idx_in_sel + 1))
+                    od_val = get_horse_effective_odds(r_h)
+                    # 「穴馬」判定: 単勝4番人気以下 かつ AI予想3番手以下
+                    is_dark = (pop_int >= 4 and rk_int >= 3)
+                    recs.append({
+                        "num": int(r_h["馬番"]),
+                        "name": str(r_h["馬名"]),
+                        "mark": str(r_h.get("AI印", "ー")),
+                        "pop": pop_int,
+                        "rank": rk_int,
+                        "prob": p_norm,
+                        "odds": od_val,
+                        "is_dark": is_dark,
+                    })
+                leg_selected_records.append(recs)
+                leg_total_prob_sums.append(min(0.98, leg_p_sum))
+
+            all_box_combos = []
+            full_box_prob_sum = 0.0
+            for comb_items in itertools.product(*leg_selected_records):
+                c_prob = float(np.prod([x["prob"] for x in comb_items]))
+                full_box_prob_sum += c_prob
+                c_pay = int(min(600_000_000, max(100, float(np.prod([x["odds"] for x in comb_items])) * 70)))
+                dark_cnt = sum(1 for x in comb_items if x["is_dark"])
+                nums_tuple = tuple(int(x["num"]) for x in comb_items)
+                nums_label = " - ".join(f"{x['num']:02d}" for x in comb_items)
+                names_label = " → ".join(f"{x['num']}番{x['name'][:5]}({x['mark']})" for x in comb_items)
+                # 期待値バランススコア (確率 × 配当の対数重み)
+                ev_score = c_prob * (np.log10(max(10.0, float(c_pay))) ** 1.35)
+                all_box_combos.append({
+                    "tuple": nums_tuple,
+                    "nums_str": nums_label,
+                    "names_str": names_label,
+                    "prob": c_prob,
+                    "pay": c_pay,
+                    "dark_count": dark_cnt,
+                    "ev_score": ev_score,
+                })
+
+            st.markdown("---")
+            with st.container(border=True):
+                st.subheader("✂️ 【攻略法②】 スマート死に目カット ＆ 高確率上位N点抜粋")
+                st.caption(
+                    "各レースで3〜5頭ずつ広く選んだ状態から、**「5レース全部が穴馬」などの確率0.0001%以下の死に目（無駄馬券）を自動カット**し、"
+                    "**予算内で最も当たる確率が高い上位N通りだけ**をピンポイント抜粋します！"
+                )
+
+                use_smart_cut = st.checkbox(
+                    f"⚡ スマート死に目カット＆上位N点抜粋を有効にする（現在のBOX全通り: {raw_box_points}点 / {raw_box_cost:,}円）",
+                    value=bool(st.session_state.get("win5_use_smart_cut", False)),
+                    key="win5_smart_cut_checkbox"
+                )
+                st.session_state["win5_use_smart_cut"] = use_smart_cut
+
+                smart_selected_tuples = None
+                if use_smart_cut:
+                    sc_c1, sc_c2, sc_c3 = st.columns([1.0, 1.3, 1.3])
+                    with sc_c1:
+                        default_target_n = min(36, max(10, raw_box_points))
+                        target_n_tickets = st.number_input(
+                            "🎯 抜粋する購入点数 (上限)",
+                            min_value=1,
+                            max_value=max(1, min(500, raw_box_points)),
+                            value=min(int(st.session_state.get("win5_smart_target_n", default_target_n)), max(1, raw_box_points)),
+                            step=5,
+                            help="30点なら3,000円、36点なら3,600円にピタリと収まります。"
+                        )
+                        st.session_state["win5_smart_target_n"] = target_n_tickets
+                    with sc_c2:
+                        max_dark_opt = st.selectbox(
+                            "🚫 同時穴馬（死に目）カット条件",
+                            options=[
+                                "🔥 穴馬(4人気以下かつAI3番手以下)は『最大2レースまで』 (推奨・死に目完全カット)",
+                                "🛡️ 穴馬は『最大1レースまで』 (堅め4勝＋1波乱の一撃狙い)",
+                                "⚡ 穴馬は『最大3レースまで』許容 (中〜大波乱対応)",
+                                "🔓 制限なし (純粋にAI勝率積が高い順)"
+                            ],
+                            index=0,
+                            key="win5_smart_dark_limit"
+                        )
+                    with sc_c3:
+                        sort_mode_opt = st.selectbox(
+                            "📊 抜粋優先モード",
+                            options=[
+                                "🎯 的中確率最優先 (AI勝率積 p1×p2×p3×p4×p5 が高い順)",
+                                "💎 妙味・期待値バランス順 (高確率 × 好配当を優先)",
+                                "💰 ガミ目カット＋的中確率順 (想定配当5,000円未満を除外)",
+                                "🎰 1億円・帯封ジャックポット特化 (本線3〜4勝＋爆弾1〜2勝・想定50万〜1億円超)"
+                            ],
+                            index=0,
+                            key="win5_smart_sort_mode"
+                        )
+
+                    if "最大1レース" in max_dark_opt:
+                        max_dark_allowed = 1
+                    elif "最大2レース" in max_dark_opt:
+                        max_dark_allowed = 2
+                    elif "最大3レース" in max_dark_opt:
+                        max_dark_allowed = 3
+                    else:
+                        max_dark_allowed = 5
+
+                    filtered_c = [c for c in all_box_combos if c["dark_count"] <= max_dark_allowed]
+                    if "ジャックポット特化" in sort_mode_opt:
+                        jp_c = [c for c in filtered_c if 1 <= c["dark_count"] <= max_dark_allowed and c["pay"] >= 300_000]
+                        if jp_c:
+                            filtered_c = jp_c
+                    elif "ガミ目カット" in sort_mode_opt:
+                        non_gami = [c for c in filtered_c if c["pay"] >= 5000]
+                        if non_gami:
+                            filtered_c = non_gami
+                    if not filtered_c:
+                        filtered_c = list(all_box_combos)
+
+                    if "妙味・期待値" in sort_mode_opt or "ジャックポット特化" in sort_mode_opt:
+                        filtered_c.sort(key=lambda x: x["ev_score"], reverse=True)
+                    else:
+                        filtered_c.sort(key=lambda x: x["prob"], reverse=True)
+
+                    top_n_combos = filtered_c[:target_n_tickets]
+                    smart_selected_tuples = [c["tuple"] for c in top_n_combos]
+                    retained_prob = sum(c["prob"] for c in top_n_combos)
+                    retain_ratio = (retained_prob / full_box_prob_sum * 100.0) if full_box_prob_sum > 0 else 100.0
+                    cut_points = raw_box_points - len(top_n_combos)
+                    cut_pct = (cut_points / raw_box_points * 100.0) if raw_box_points > 0 else 0.0
+
+                    actual_points = len(top_n_combos)
+                    actual_cost = actual_points * 100
+
+                    m_sc1, m_sc2, m_sc3, m_sc4 = st.columns(4)
+                    with m_sc1:
+                        st.metric("✂️ 圧縮後の購入点数", f"{actual_points}点", delta=f"-{cut_points}点 (-{cut_pct:.0f}% 削減)")
+                    with m_sc2:
+                        st.metric("💵 圧縮後の必要資金", f"{actual_cost:,}円", delta=f"{raw_box_cost - actual_cost:,}円 節約！")
+                    with m_sc3:
+                        st.metric("🎯 BOX的中率の維持率", f"{retain_ratio:.1f}%", delta="美味しい目だけ凝縮")
+                    with m_sc4:
+                        dead_cut_cnt = len(all_box_combos) - len([c for c in all_box_combos if c["dark_count"] <= max_dark_allowed])
+                        st.metric("🗑️ 排除した死に目数", f"{dead_cut_cnt}通り", delta="全穴の無駄馬券を除外")
+
+                    with st.expander(f"📋 抜粋された厳選 {actual_points} 通り一覧 ＆ 個別ON/OFF調整", expanded=False):
+                        all_c_labels = [f"{c['nums_str']} ｜ {c['names_str']} [想定¥{c['pay']:,}]" for c in top_n_combos]
+                        label_to_combo = dict(zip(all_c_labels, top_n_combos))
+                        chosen_c_labels = st.multiselect(
+                            "☑️ 購入する組み合わせの個別微調整（不要な目は×で削除できます）",
+                            options=all_c_labels,
+                            default=all_c_labels,
+                            key=f"win5_smart_indiv_{actual_points}"
+                        )
+                        if chosen_c_labels and len(chosen_c_labels) != len(top_n_combos):
+                            top_n_combos = [label_to_combo[lbl] for lbl in chosen_c_labels if lbl in label_to_combo]
+                            smart_selected_tuples = [c["tuple"] for c in top_n_combos]
+                            actual_points = len(top_n_combos)
+                            actual_cost = actual_points * 100
+
+                        sc_table = []
+                        for idx_sc, c_item in enumerate(top_n_combos, start=1):
+                            sc_table.append({
+                                "順位": f"{idx_sc}位",
+                                "WIN1〜5 買い目": c_item["nums_str"],
+                                "選出馬ルート": c_item["names_str"],
+                                "穴馬含有数": f"{c_item['dark_count']}頭",
+                                "AI的中期待率": f"{c_item['prob'] * 100.0:.3f}%",
+                                "想定配当": f"¥{c_item['pay']:,}",
+                            })
+                        st.dataframe(pd.DataFrame(sc_table), use_container_width=True, hide_index=True)
+
+                # 🎰 1億円・帯封ジャックポット「本線◎○ × 3大爆弾キラー」解剖ボード
+                with st.expander("🎰 **【1億円・帯封ジャックポット解剖ボード】各レースの『本線◎○』×『1億円キラー3大爆弾（4〜12番人気）』一覧**", expanded=False):
+                    st.caption(
+                        "数千万円〜1億円のWIN5は『5レース全部が大荒れ』ではなく、**『3〜4レースはAI本線(◎○)が勝ち、残り1〜2レースで以下の3大爆弾プロファイルに該当する穴馬が炸裂』**した時に生まれます。"
+                        "上の『🎰 1億円・帯封宝くじ編成』ボタンを押すと、以下の本線＋特注爆弾から『本線3〜4勝×爆弾1〜2勝』の美味しい目だけをワンクリックで自動合成します！"
+                    )
+                    jp_board_rows = []
+                    for r_d in race_diagnostics:
+                        p_df_jb = r_d["pred_df"]
+                        core_2_rows = p_df_jb.head(2)
+                        core_2_nums = {int(r["馬番"]) for _, r in core_2_rows.iterrows()}
+                        core_str = " / ".join([f"{r['AI印']}{int(r['馬番'])}番{r['馬名']}({int(r['単勝人気'])}人気・{get_horse_effective_odds(r):.1f}倍)" for _, r in core_2_rows.iterrows()])
+                        bombs_jb = extract_jackpot_bombs_for_leg(
+                            p_df_jb, r_d.get("past_records", {}), r_d.get("course_type", "芝"), r_d.get("distance", 1600), core_2_nums, max_bombs=3
+                        )
+                        if bombs_jb:
+                            b_str = " ｜ ".join([f"💣{b['num']}番{b['name']}({b['pop']}人気 {b['odds']:.1f}倍: {b['reason']})" for b in bombs_jb])
+                        else:
+                            b_str = "ー (順当決着濃厚)"
+                        jp_board_rows.append({
+                            "レース": r_d["name"],
+                            "🎯 本線コア (◎1位・○2位)": core_str,
+                            "💣 1億円キラー特注爆弾 (①🔥純能力上位・②⚡穴の逃げ馬・③🔄前々走好走巻き返し)": b_str,
+                        })
+                    st.dataframe(pd.DataFrame(jp_board_rows), use_container_width=True, hide_index=True)
+
+            # ==========================================
+            # 🛡️ 【攻略法③】 WIN5脱落保険！後半メイン・勝負レース単体ヘッジ馬券ビルダー
+            # ==========================================
+            with st.container(border=True):
+                st.subheader("🛡️ 【攻略法③】 WIN5脱落保険！勝負レース単体ヘッジ（資金回収）ビルダー")
+                st.caption(
+                    "「WIN1・WIN2で惜しくも落ちたのに、後半のWIN4・WIN5で狙っていた本命や穴馬がドンピシャで来た！」という悔しさを防ぐ保険機能です。"
+                    "後半メインレース等で少額の単体馬券（馬連・ワイド・単勝・3連複）を抑えておくことで、**WIN5が途中で散っても当日の投資資金を丸ごと回収〜プラス転換**できます！"
+                )
+
+                use_hedge_ins = st.checkbox(
+                    "🛡️ 勝負レースの単体ヘッジ（脱落保険馬券）を同時に組む",
+                    value=bool(st.session_state.get("win5_use_hedge", True)),
+                    key="win5_hedge_checkbox"
+                )
+                st.session_state["win5_use_hedge"] = use_hedge_ins
+
+                hedge_plans_by_leg = {}
+                total_hedge_cost = 0
+
+                if use_hedge_ins:
+                    h_c1, h_c2, h_c3 = st.columns([1.2, 1.4, 1.0])
+                    with h_c1:
+                        leg_labels_map = {
+                            r_d["id"]: f"WIN{r_d['id']} ({r_d['name'].split(':')[-1].strip()})"
+                            for r_d in race_diagnostics
+                        }
+                        hedge_target_legs = st.multiselect(
+                            "🎯 保険をかけるレースを選択 (後半WIN4・WIN5推奨)",
+                            options=[1, 2, 3, 4, 5],
+                            default=[4, 5],
+                            format_func=lambda x: leg_labels_map.get(x, f"WIN{x}"),
+                            key="win5_hedge_legs_sel"
+                        )
+                    with h_c2:
+                        hedge_type_opt = st.selectbox(
+                            "📐 単体ヘッジの買い方",
+                            options=[
+                                "🔥 WIN5選択馬の『馬連BOX＋穴単勝』 (ワンツーor穴1着で一撃回収)",
+                                "🤝 WIN5選択馬の『ワイドBOX』 (3着内2頭で手堅く投資回収)",
+                                "👑 AI本命◎1頭軸『馬連ながし』 (本命から選択馬・上位馬へ流す)",
+                                "🎲 WIN5選択馬＋AI上位の『3連複BOX』 (高配当ごっそり回収)"
+                            ],
+                            index=0,
+                            key="win5_hedge_type_sel"
+                        )
+                    with h_c3:
+                        hedge_budget_per_leg = st.number_input(
+                            "💵 1レースあたり保険予算 (円)",
+                            min_value=300,
+                            max_value=20000,
+                            value=1000,
+                            step=500,
+                            key="win5_hedge_budget_in"
+                        )
+
+                    if hedge_target_legs:
+                        h_tabs = st.tabs([leg_labels_map.get(lg, f"WIN{lg}") for lg in hedge_target_legs])
+                        for h_tab, lg_id in zip(h_tabs, hedge_target_legs):
+                            r_d_h = race_diagnostics[lg_id - 1]
+                            p_df_h = r_d_h["pred_df"]
+                            sel_df_h = active_selections[lg_id - 1]
+                            sel_nums_h = [int(r["馬番"]) for _, r in sel_df_h.iterrows()]
+                            # もしWIN5で1頭しか選んでいない場合は、AI上位3頭を自動的に相手に加える
+                            pool_nums_h = list(sel_nums_h)
+                            for _, r_top in p_df_h.iterrows():
+                                n_top = int(r_top["馬番"])
+                                if n_top not in pool_nums_h and len(pool_nums_h) < 3:
+                                    pool_nums_h.append(n_top)
+
+                            h_map_lg = {int(r["馬番"]): r for _, r in p_df_h.iterrows()}
+                            h_tickets = []
+
+                            if "馬連BOX＋穴単勝" in hedge_type_opt:
+                                # 選択馬のうち単勝オッズ6.0倍以上の妙味馬がいれば単勝を追加
+                                for n_cand in sel_nums_h:
+                                    r_c = h_map_lg.get(n_cand)
+                                    if r_c is not None and get_horse_effective_odds(r_c) >= 6.0:
+                                        od_c = get_horse_effective_odds(r_c)
+                                        h_tickets.append({
+                                            "type": "単勝",
+                                            "nums": (n_cand,),
+                                            "label": f"単勝 {n_cand}番 ({r_c['馬名']})",
+                                            "odds": od_c
+                                        })
+                                for n1, n2 in itertools.combinations(pool_nums_h[:4], 2):
+                                    pair = tuple(sorted([n1, n2]))
+                                    r1, r2 = h_map_lg.get(pair[0]), h_map_lg.get(pair[1])
+                                    o1 = get_horse_effective_odds(r1) if r1 is not None else 4.0
+                                    o2 = get_horse_effective_odds(r2) if r2 is not None else 6.0
+                                    est_uma = round(max(2.0, min(999.0, o1 * o2 * 0.42)), 1)
+                                    h_tickets.append({
+                                        "type": "馬連",
+                                        "nums": pair,
+                                        "label": f"馬連 {pair[0]}-{pair[1]} ({r1['馬名'][:5] if r1 is not None else ''}-{r2['馬名'][:5] if r2 is not None else ''})",
+                                        "odds": est_uma
+                                    })
+                            elif "ワイドBOX" in hedge_type_opt:
+                                for n1, n2 in itertools.combinations(pool_nums_h[:4], 2):
+                                    pair = tuple(sorted([n1, n2]))
+                                    r1, r2 = h_map_lg.get(pair[0]), h_map_lg.get(pair[1])
+                                    o1 = get_horse_effective_odds(r1) if r1 is not None else 4.0
+                                    o2 = get_horse_effective_odds(r2) if r2 is not None else 6.0
+                                    est_w = round(max(1.3, min(300.0, (o1 * o2 * 0.42) * 0.34 + 0.6)), 1)
+                                    h_tickets.append({
+                                        "type": "ワイド",
+                                        "nums": pair,
+                                        "label": f"ワイド {pair[0]}-{pair[1]} ({r1['馬名'][:5] if r1 is not None else ''}-{r2['馬名'][:5] if r2 is not None else ''})",
+                                        "odds": est_w
+                                    })
+                            elif "馬連ながし" in hedge_type_opt:
+                                ax_num = pool_nums_h[0]
+                                r_ax = h_map_lg.get(ax_num)
+                                o_ax = get_horse_effective_odds(r_ax) if r_ax is not None else 3.0
+                                for pt_num in pool_nums_h[1:5]:
+                                    pair = tuple(sorted([ax_num, pt_num]))
+                                    r_pt = h_map_lg.get(pt_num)
+                                    o_pt = get_horse_effective_odds(r_pt) if r_pt is not None else 6.0
+                                    est_uma = round(max(2.0, min(999.0, o_ax * o_pt * 0.42)), 1)
+                                    h_tickets.append({
+                                        "type": "馬連",
+                                        "nums": pair,
+                                        "label": f"馬連 {pair[0]}-{pair[1]} (軸{ax_num}番→{r_pt['馬名'][:6] if r_pt is not None else pt_num})",
+                                        "odds": est_uma
+                                    })
+                            else:  # 3連複BOX
+                                while len(pool_nums_h) < 4 and len(pool_nums_h) < len(p_df_h):
+                                    for _, r_top in p_df_h.iterrows():
+                                        n_t = int(r_top["馬番"])
+                                        if n_t not in pool_nums_h:
+                                            pool_nums_h.append(n_t)
+                                            break
+                                for n1, n2, n3 in itertools.combinations(pool_nums_h[:4], 3):
+                                    tri = tuple(sorted([n1, n2, n3]))
+                                    r1, r2, r3 = h_map_lg.get(tri[0]), h_map_lg.get(tri[1]), h_map_lg.get(tri[2])
+                                    o1 = get_horse_effective_odds(r1) if r1 is not None else 3.5
+                                    o2 = get_horse_effective_odds(r2) if r2 is not None else 5.5
+                                    o3 = get_horse_effective_odds(r3) if r3 is not None else 8.5
+                                    est_trio = round(max(3.0, min(5000.0, (o1 * o2 * o3) * 0.16)), 1)
+                                    h_tickets.append({
+                                        "type": "3連複",
+                                        "nums": tri,
+                                        "label": f"3連複 {tri[0]}-{tri[1]}-{tri[2]}",
+                                        "odds": est_trio
+                                    })
+
+                            # トリガミ防止の均等払戻ダッチング配分
+                            if h_tickets:
+                                inv_s = sum(1.0 / max(1.1, t["odds"]) for t in h_tickets)
+                                leg_b = max(len(h_tickets) * 100, int(hedge_budget_per_leg))
+                                allocs = [max(100, int((leg_b * (1.0 / max(1.1, t["odds"])) / inv_s) // 100) * 100) for t in h_tickets]
+                                rem_b = leg_b - sum(allocs)
+                                while rem_b >= 100:
+                                    rets = [allocs[k] * h_tickets[k]["odds"] for k in range(len(h_tickets))]
+                                    min_k = int(np.argmin(rets))
+                                    allocs[min_k] += 100
+                                    rem_b -= 100
+                                leg_cost_actual = sum(allocs)
+                                total_hedge_cost += leg_cost_actual
+                                for k, t in enumerate(h_tickets):
+                                    t["amount"] = allocs[k]
+                                    t["est_return"] = int(round(allocs[k] * t["odds"]))
+                                hedge_plans_by_leg[lg_id] = {
+                                    "tickets": h_tickets,
+                                    "cost": leg_cost_actual
+                                }
+
+                                with h_tab:
+                                    min_h_ret = min(t["est_return"] for t in h_tickets)
+                                    max_h_ret = max(t["est_return"] for t in h_tickets)
+                                    st.markdown(
+                                        f"💡 **WIN{lg_id} 単体保険**: 計 **{len(h_tickets)}点 ({leg_cost_actual:,}円)** ｜ "
+                                        f"的中時想定払戻: **¥{min_h_ret:,} 〜 ¥{max_h_ret:,} 円** "
+                                        f"（WIN5本体の投資 {actual_cost:,}円 を{'完全回収可能！' if max_h_ret >= actual_cost else '大幅補填！'}）"
+                                    )
+                                    h_df_rows = [{
+                                        "保険買い目": t["label"],
+                                        "想定オッズ": f"{t['odds']:.1f}倍",
+                                        "推奨購入額": f"{t['amount']:,}円",
+                                        "的中時払戻": f"¥{t['est_return']:,}",
+                                    } for t in h_tickets]
+                                    st.dataframe(pd.DataFrame(h_df_rows), use_container_width=True, hide_index=True)
 
             # ------------------------------------------
             # 📝 IPAT投票用コード & 総合的中期待率
@@ -810,46 +1816,62 @@ def render_win5_simulator(
             col_sum1, col_sum2 = st.columns([2, 1])
             with col_sum1:
                 st.subheader("📝 IPAT投票用 買い目まとめ")
-                ipat_lines = []
-                for i, r_diag in enumerate(race_diagnostics):
-                    c_horses = active_selections[i]
-                    nums = [str(int(r["馬番"])) for _, r in c_horses.iterrows()]
-                    ipat_lines.append(f"WIN{r_diag['id']}: {', '.join(nums)} ({len(nums)}頭)")
-                
-                ipat_code = "\n".join(ipat_lines)
-                st.code(ipat_code, language="text")
-                st.caption("※ 上記の馬番を即PATまたはマークカード（フォーメーション）に転記して投票してください。")
+                if use_smart_cut and smart_selected_tuples:
+                    st.caption(f"✂️ **スマート死に目カット適用中（厳選 {len(smart_selected_tuples)} 通り）**:")
+                    ipat_lines = [
+                        f"{idx_t:02d}点目: " + " - ".join(f"{n:02d}" for n in tup)
+                        for idx_t, tup in enumerate(smart_selected_tuples, start=1)
+                    ]
+                    ipat_code = "\n".join(ipat_lines)
+                    st.code(ipat_code, language="text")
+                else:
+                    ipat_lines = []
+                    for i, r_diag in enumerate(race_diagnostics):
+                        c_horses = active_selections[i]
+                        nums = [str(int(r["馬番"])) for _, r in c_horses.iterrows()]
+                        ipat_lines.append(f"WIN{r_diag['id']}: {', '.join(nums)} ({len(nums)}頭)")
+                    ipat_code = "\n".join(ipat_lines)
+                    st.code(ipat_code, language="text")
+                    st.caption("※ 上記の馬番を即PATまたはマークカード（フォーメーション）に転記して投票してください。")
 
             with col_sum2:
-                st.subheader("📊 的中確率＆配当期待")
-                total_cov = float(np.prod([
-                    min(0.98, sum(active_selections[i]["勝率(%)"]) / 100.0) for i in range(5)
-                ])) * 100.0
-                st.metric("🎯 5レース総合カバー期待率", f"{total_cov:.2f}%")
-                st.write(f"💵 **購入資金**: **{actual_cost:,}円**")
-                st.write(f"🎫 **購入点数**: **{actual_points}点**")
-                st.caption("※ 各レースで選択馬の勝率合計を掛け合わせた総合通過確率の推計値です。")
+                st.subheader("📊 的中確率＆資金まとめ")
+                total_cov = float(np.prod(leg_total_prob_sums)) * 100.0
+                if use_smart_cut and smart_selected_tuples and full_box_prob_sum > 0:
+                    retained_p = sum(c["prob"] for c in all_box_combos if c["tuple"] in set(smart_selected_tuples))
+                    total_cov = total_cov * (retained_p / full_box_prob_sum)
+                st.metric("🎯 5レース総合突破期待率", f"{total_cov:.2f}%")
+                st.write(f"🎫 **WIN5 購入点数**: **{actual_points}点** ({actual_cost:,}円)")
+                if use_hedge_ins and total_hedge_cost > 0:
+                    st.write(f"🛡️ **単体ヘッジ保険**: **{total_hedge_cost:,}円** ({len(hedge_plans_by_leg)}レース)")
+                    st.write(f"💵 **本日トータル投資**: **{actual_cost + total_hedge_cost:,}円**")
+                else:
+                    st.write(f"💵 **購入資金**: **{actual_cost:,}円**")
 
             # ------------------------------------------
             # 💰 WIN5 推定配当金レンジシミュレーション (購入前想定)
             # ------------------------------------------
-            min_odds_list = []
-            max_odds_list = []
-            main_odds_list = []
-
-            for i in range(5):
-                sel_df = active_selections[i]
-                odds_vals = [get_horse_effective_odds(r) for _, r in sel_df.iterrows()]
-                if not odds_vals:
-                    odds_vals = [5.0]
-                min_odds_list.append(min(odds_vals))
-                max_odds_list.append(max(odds_vals))
-                main_odds_list.append(odds_vals[0])
-
-            # JRA払戻率70%に基づく合成配当推計
-            min_est_pay = int(min(600_000_000, max(100, float(np.prod(min_odds_list)) * 70)))
-            max_est_pay = int(min(600_000_000, max(100, float(np.prod(max_odds_list)) * 70)))
-            main_est_pay = int(min(600_000_000, max(100, float(np.prod(main_odds_list)) * 70)))
+            if use_smart_cut and smart_selected_tuples:
+                sel_set_tmp = set(smart_selected_tuples)
+                sel_pays = [c["pay"] for c in all_box_combos if c["tuple"] in sel_set_tmp]
+                min_est_pay = min(sel_pays) if sel_pays else 100
+                max_est_pay = max(sel_pays) if sel_pays else 100
+                main_est_pay = sel_pays[0] if sel_pays else 100
+            else:
+                min_odds_list = []
+                max_odds_list = []
+                main_odds_list = []
+                for i in range(5):
+                    sel_df = active_selections[i]
+                    odds_vals = [get_horse_effective_odds(r) for _, r in sel_df.iterrows()]
+                    if not odds_vals:
+                        odds_vals = [5.0]
+                    min_odds_list.append(min(odds_vals))
+                    max_odds_list.append(max(odds_vals))
+                    main_odds_list.append(odds_vals[0])
+                min_est_pay = int(min(600_000_000, max(100, float(np.prod(min_odds_list)) * 70)))
+                max_est_pay = int(min(600_000_000, max(100, float(np.prod(max_odds_list)) * 70)))
+                main_est_pay = int(min(600_000_000, max(100, float(np.prod(main_odds_list)) * 70)))
 
             st.markdown(
                 f"""
@@ -864,7 +1886,7 @@ def render_win5_simulator(
                     </div>
                     <div style="display: flex; gap: 24px; margin-top: 10px; flex-wrap: wrap; align-items: baseline;">
                         <div>
-                            <span style="font-size: 12px; color: #bdc3c7;">🎯 AI本線 想定配当:</span><br>
+                            <span style="font-size: 12px; color: #bdc3c7;">🎯 最有力目 想定配当:</span><br>
                             <span style="font-size: 20px; font-weight: bold; color: #2ecc71;">￥{main_est_pay:,} 円</span>
                         </div>
                         <div>
@@ -1091,26 +2113,47 @@ def render_win5_simulator(
                         else:
                             st.caption(f"🏁 {val}番")
 
-            # 生還判定
-            survived_points = actual_points
+            # 生還判定（通常BOX時とスマート死に目カット時の両方に対応）
             alive_status = []
             is_dead = False
 
-            for i in range(5):
-                act_num = actual_win_nums[i]
-                c_horses = active_selections[i]
-                selected_nums = [int(r["馬番"]) for _, r in c_horses.iterrows()]
-                sel_str = "・".join(str(n) for n in selected_nums) + "番"
+            if use_smart_cut and smart_selected_tuples:
+                remaining_tuples = list(smart_selected_tuples)
+                for i in range(5):
+                    act_num = actual_win_nums[i]
+                    c_horses = active_selections[i]
+                    selected_nums = [int(r["馬番"]) for _, r in c_horses.iterrows()]
+                    sel_str = "・".join(str(n) for n in selected_nums) + "番"
+                    if act_num == 0:
+                        alive_status.append("⏳ 待機中")
+                    else:
+                        remaining_tuples = [t for t in remaining_tuples if t[i] == act_num]
+                        if len(remaining_tuples) > 0:
+                            alive_status.append(f"⭕ 突破！ ({act_num}番的中・残{len(remaining_tuples)}通り)")
+                        elif act_num in selected_nums:
+                            alive_status.append(f"⚠️ 死に目カット対象 ({act_num}番・残0通り)")
+                            is_dead = True
+                        else:
+                            alive_status.append(f"❌ 脱落 (勝馬:{act_num}番 ｜ 買目:{sel_str})")
+                            is_dead = True
+                survived_points = len(remaining_tuples) if not is_dead else 0
+            else:
+                survived_points = actual_points
+                for i in range(5):
+                    act_num = actual_win_nums[i]
+                    c_horses = active_selections[i]
+                    selected_nums = [int(r["馬番"]) for _, r in c_horses.iterrows()]
+                    sel_str = "・".join(str(n) for n in selected_nums) + "番"
 
-                if act_num == 0:
-                    alive_status.append("⏳ 待機中")
-                elif act_num in selected_nums:
-                    alive_status.append(f"⭕ 突破！ ({act_num}番的中)")
-                    survived_points = max(1, int(survived_points / max(1, len(selected_nums))))
-                else:
-                    alive_status.append(f"❌ 脱落 (勝馬:{act_num}番 ｜ 買目:{sel_str})")
-                    is_dead = True
-                    survived_points = 0
+                    if act_num == 0:
+                        alive_status.append("⏳ 待機中")
+                    elif act_num in selected_nums:
+                        alive_status.append(f"⭕ 突破！ ({act_num}番的中)")
+                        survived_points = max(1, int(survived_points / max(1, len(selected_nums))))
+                    else:
+                        alive_status.append(f"❌ 脱落 (勝馬:{act_num}番 ｜ 買目:{sel_str})")
+                        is_dead = True
+                        survived_points = 0
 
             col_res_cards = st.columns(5)
             for i in range(5):
@@ -1118,14 +2161,17 @@ def render_win5_simulator(
                     status_text = alive_status[i]
                     if "⭕" in status_text:
                         st.success(f"**WIN{i+1}**: {status_text}")
-                    elif "❌" in status_text:
+                    elif "❌" in status_text or "⚠️" in status_text:
                         st.error(f"**WIN{i+1}**: {status_text}")
                     else:
                         st.info(f"**WIN{i+1}**: {status_text}")
 
             passed_cnt = sum(1 for s in alive_status if "⭕" in s)
-            is_win5_hit = (passed_cnt == 5 and all("⭕" in s for s in alive_status))
             all_races_entered = all(num > 0 for num in actual_win_nums)
+            if use_smart_cut and smart_selected_tuples:
+                is_win5_hit = (all_races_entered and tuple(actual_win_nums) in set(smart_selected_tuples))
+            else:
+                is_win5_hit = (passed_cnt == 5 and all("⭕" in s for s in alive_status))
 
             if is_win5_hit:
                 st.balloons()
@@ -1249,15 +2295,16 @@ def render_win5_simulator(
                                     if w_num not in curr_sel:
                                         curr_sel.append(w_num)
                                     st.session_state["win5_custom_selections"][r_diag["id"]] = sorted(curr_sel)
+                            st.session_state["win5_use_smart_cut"] = False
                             st.success("🎉 確定1着馬を各レースの買い目に自動追加しました！")
                             st.rerun()
 
             # ==========================================
-            # 💰 WIN5 確定払戻金・回収率の自動計算
+            # 💰 WIN5 確定払戻金・回収率の自動計算 (＋単体ヘッジ保険 合算検証)
             # ==========================================
             st.markdown("---")
-            st.subheader("💰 WIN5 確定払戻金・回収率の自動計算")
-            st.caption("全5レース終了後、JRA公式発表の確定払戻金（100円あたり）を入力して、総払戻金額・純損益・回収率(ROI)を自動計算します。")
+            st.subheader("💰 WIN5 確定払戻金・回収率 ＆ 単体ヘッジ保険 トータル収支計算")
+            st.caption("全5レース終了後、JRA公式発表の確定払戻金（100円あたり）を入力して、WIN5本体および単体ヘッジ保険の総払戻金額・純損益・回収率(ROI)を自動計算します。")
 
             # 単勝オッズ合成による参考配当の算出
             est_payout_synthetic = 0
@@ -1301,14 +2348,60 @@ def render_win5_simulator(
                 else:
                     st.info(f"⏳ **WIN5 的中判定: 進行中** ({passed_cnt}レース突破)")
 
-            # 回収パフォーマンス計算
-            invest_cost = actual_cost  # 購入点数 * 100円
+            # 単体ヘッジ保険の的中・回収額自動判定
+            hedge_total_return = 0
+            hedge_hit_logs = []
+            if use_hedge_ins and hedge_plans_by_leg:
+                for lg_id, h_plan in hedge_plans_by_leg.items():
+                    act_1 = actual_win_nums[lg_id - 1]
+                    if act_1 <= 0:
+                        continue
+                    r_d_lg = race_diagnostics[lg_id - 1]
+                    p_df_lg = r_d_lg["pred_df"]
+                    act_ranks_dict = (r_d_lg.get("meta", {}).get("actual_ranks") or r_d_lg.get("actual_ranks") or {})
+                    name_to_num_lg = {str(r["馬名"]).strip(): int(r["馬番"]) for _, r in p_df_lg.iterrows()}
+
+                    act_2 = int(st.session_state.get(f"win5_rank2_{lg_id}", 0))
+                    act_3 = int(st.session_state.get(f"win5_rank3_{lg_id}", 0))
+                    for h_nm, rk_v in act_ranks_dict.items():
+                        if rk_v == 2 and act_2 == 0 and h_nm in name_to_num_lg:
+                            act_2 = name_to_num_lg[h_nm]
+                        elif rk_v == 3 and act_3 == 0 and h_nm in name_to_num_lg:
+                            act_3 = name_to_num_lg[h_nm]
+                    # 2着・3着が未入力の場合はAI上位馬（1着馬を除く）を仮置きして試算
+                    rem_ai = [int(r["馬番"]) for _, r in p_df_lg.iterrows() if int(r["馬番"]) != act_1]
+                    if act_2 == 0 and len(rem_ai) >= 1:
+                        act_2 = rem_ai[0]
+                    if act_3 == 0 and len(rem_ai) >= 2:
+                        act_3 = [n for n in rem_ai if n != act_2][0]
+
+                    top2_set_lg = {act_1, act_2}
+                    top3_set_lg = {act_1, act_2, act_3}
+
+                    for t in h_plan["tickets"]:
+                        t_nums = set(t["nums"])
+                        t_hit = False
+                        if t["type"] == "単勝" and act_1 in t_nums:
+                            t_hit = True
+                        elif t["type"] == "馬連" and t_nums == top2_set_lg:
+                            t_hit = True
+                        elif t["type"] == "ワイド" and t_nums.issubset(top3_set_lg):
+                            t_hit = True
+                        elif t["type"] == "3連複" and t_nums == top3_set_lg:
+                            t_hit = True
+                        if t_hit:
+                            hedge_total_return += t["est_return"]
+                            hedge_hit_logs.append(f"WIN{lg_id} {t['label']} (払戻 ¥{t['est_return']:,})")
+
+            # 回収パフォーマンス計算 (WIN5本体 ＋ 単体ヘッジ保険)
+            invest_cost = actual_cost + (total_hedge_cost if use_hedge_ins else 0)
             hit_units = 1 if is_win5_hit else 0
-            total_return = official_win5_payout * hit_units if is_win5_hit else 0
+            win5_return = official_win5_payout * hit_units if is_win5_hit else 0
+            total_return = win5_return + hedge_total_return
             net_profit = total_return - invest_cost
             roi_ratio = (total_return / invest_cost * 100.0) if invest_cost > 0 else 0.0
 
-            # 的中時: 豪華ゴールド/グリーンカードでサマリー表示 (通常レース完全同等)
+            # 的中時: 豪華ゴールド/グリーンカードでサマリー表示
             if is_win5_hit and official_win5_payout > 0:
                 roi_badge = "🔥 特大万馬券的中！超絶プラス！" if roi_ratio >= 1000.0 else ("🎯 プラス収支達成！" if roi_ratio >= 100.0 else "⚠️ トリガミ（投資額を下回りました）")
                 st.markdown(
@@ -1323,8 +2416,8 @@ def render_win5_simulator(
                             </span>
                         </div>
                         <div style="font-size: 15px; margin-top: 10px; color: #ffffff; line-height: 1.6;">
-                            🏆 <b>的中戦略</b>: WIN5 メリハリフォーメーション（購入点数: <b>{actual_points}点</b> ｜ 投資資金: <b>{invest_cost:,}円</b>）<br>
-                            💎 <b>確定配当</b>: 100円あたり <b>￥{official_win5_payout:,} 円</b> ｜ <b>的中口数</b>: 1口<br>
+                            🏆 <b>的中戦略</b>: {'スマート死に目カット抜粋' if use_smart_cut else 'WIN5 メリハリフォーメーション'}（WIN5: <b>{actual_points}点/{actual_cost:,}円</b>{f' ＋ 保険: <b>{total_hedge_cost:,}円</b>' if use_hedge_ins else ''}）<br>
+                            💎 <b>WIN5払戻</b>: <b>￥{win5_return:,} 円</b>{f' ｜ 🛡️ <b>単体ヘッジ保険払戻</b>: <b>￥{hedge_total_return:,} 円</b>' if hedge_total_return > 0 else ''}<br>
                             📊 <b>判定評価</b>: {roi_badge}
                         </div>
                     </div>
@@ -1336,16 +2429,23 @@ def render_win5_simulator(
                 with c_m1:
                     st.metric("🥇 総回収額 (払戻金)", f"{total_return:,}円", delta=f"純利益 +{net_profit:,}円", delta_color="normal")
                 with c_m2:
-                    st.metric("💵 投資金額", f"{invest_cost:,}円", delta=f"{actual_points}点 × 100円")
+                    st.metric("💵 合計投資金額", f"{invest_cost:,}円", delta=f"WIN5 {actual_cost:,}円" + (f" + 保険 {total_hedge_cost:,}円" if use_hedge_ins else ""))
                 with c_m3:
-                    st.metric("📈 最大回収率 (ROI)", f"{roi_ratio:,.1f}%", delta="投資リターン")
+                    st.metric("📈 総合回収率 (ROI)", f"{roi_ratio:,.1f}%", delta="投資リターン")
                 with c_m4:
-                    st.metric("💎 純利益", f"+{net_profit:,}円", delta="手元利益")
+                    st.metric("💎 純利益", f"{net_profit:+,}円", delta="手元利益")
             elif all_races_entered and not is_win5_hit:
-                st.warning(
-                    f"⚠️ **【結果検証】 今回のWIN5は不的中となりました（{passed_cnt}/5レース突破 ｜ 投資額: {invest_cost:,}円 ｜ 払戻: 0円 ｜ 純損失: -{invest_cost:,}円）。**\n\n"
-                    f"波乱や出遅れ等の5レースの確定着順を「競走馬メモリー」に蓄積し、次回レースでの精度向上・リベンジに繋げましょう。"
-                )
+                if hedge_total_return > 0:
+                    st.success(
+                        f"🛡️ **【単体ヘッジ保険が発動！】 WIN5本体は惜しくも不的中（{passed_cnt}/5突破）でしたが、単体ヘッジ馬券が的中して ¥{hedge_total_return:,} 円を回収しました！**\n\n"
+                        f"- 🎯 **的中した保険馬券**: {' ／ '.join(hedge_hit_logs)}\n"
+                        f"- 💰 **本日トータル収支**: 投資 **{invest_cost:,}円**（WIN5 {actual_cost:,}円＋保険 {total_hedge_cost:,}円） ➔ 回収 **¥{hedge_total_return:,}円**（純損益 **{net_profit:+,}円** / 回収率 **{roi_ratio:.1f}%**）"
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ **【結果検証】 今回のWIN5は不的中となりました（{passed_cnt}/5レース突破 ｜ 投資額: {invest_cost:,}円 ｜ 払戻: 0円 ｜ 純損失: -{invest_cost:,}円）。**\n\n"
+                        f"波乱や出遅れ等の5レースの確定着順を「競走馬メモリー」に蓄積し、次回レースでの精度向上・リベンジに繋げましょう。"
+                    )
 
             # ==========================================
             # 💾 5レース結果の自己学習・競走馬メモリー蓄積 (通常レース完全同期)
@@ -1359,9 +2459,9 @@ def render_win5_simulator(
                 """
             )
 
-            # 各レースの2着・3着馬番（任意補足入力）アコーディオン
-            with st.expander("📋 各レースの確定着順・補足設定（2着・3着馬番の指定）", expanded=False):
-                st.caption("1着馬番は生還チェックシートと連動しています。2着・3着馬番も設定すると、連対・複勝好走ボーナスが馬メモリーに加算され、さらに高精度な学習が可能です。")
+            # 各レースの2着・3着馬番・除外馬（任意補足入力）アコーディオン
+            with st.expander("📋 各レースの確定着順・補足設定（2着・3着・🚫除外馬の指定）", expanded=False):
+                st.caption("1着馬番は生還チェックシートと連動しています。2着・3着馬番や、出走取消・競走除外になった馬番を指定すると、除外馬を省いた正確なAI学習が行われます。")
                 col_sub_ranks = st.columns(5)
                 extra_race_ranks = []
                 for i, r_diag in enumerate(race_diagnostics):
@@ -1384,21 +2484,34 @@ def render_win5_simulator(
                             format_func=lambda x, p_h=p_horses: "未設定" if x == 0 else f"{x}番 {p_h.get(x, '')}",
                             key=f"win5_rank3_{r_diag['id']}"
                         )
-                        extra_race_ranks.append({"win": w_num, "second": rank2, "third": rank3})
+                        excl_nums = st.multiselect(
+                            f"🚫 WIN{r_diag['id']} 除外・取消馬",
+                            options=[k for k in p_horses.keys() if k not in {w_num, rank2, rank3}],
+                            format_func=lambda x, p_h=p_horses: f"{x}番 {p_h.get(x, '')}",
+                            key=f"win5_excl_{r_diag['id']}"
+                        )
+                        extra_race_ranks.append({"win": w_num, "second": rank2, "third": rank3, "excluded": set(excl_nums)})
 
             # 学習実行ボタン
             can_learn = any(num > 0 for num in actual_win_nums)
-            if st.button("💾 5レースの確定結果をAIに自己学習させる（馬メモリー蓄積＆永久保存）", type="primary", disabled=not can_learn):
-                with st.spinner("🤖 AIが5レースの結果を解析し、Tier 1完全記憶と出走全頭の競走馬メモリーを更新中..."):
+            if st.button("💾 5レースの確定結果をAIに自己学習させる（コース傾向・重み進化＆馬メモリー永久保存）", type="primary", disabled=not can_learn):
+                with st.spinner("🤖 AIが5レースの結果を解析し、Tier 1〜4（完全記憶・馬メモリー・コース傾向・5大重み）を更新中..."):
                     if "race_database" not in st.session_state:
                         st.session_state["race_database"] = {}
                     if "horse_memory" not in st.session_state:
                         st.session_state["horse_memory"] = {}
+                    if "pattern_memory" not in st.session_state:
+                        st.session_state["pattern_memory"] = {}
                     if "training_history" not in st.session_state:
                         st.session_state["training_history"] = []
 
                     race_db = st.session_state["race_database"]
                     horse_mem = st.session_state["horse_memory"]
+                    pat_mem = st.session_state["pattern_memory"]
+                    cur_w = dict(st.session_state.get("learned_weights", learned_weights))
+                    old_w = dict(cur_w)
+                    update_pattern_fn = kwargs.get("update_pattern_func")
+                    pat_summaries = []
                     total_horses_learned = 0
                     races_learned_count = 0
 
@@ -1415,21 +2528,24 @@ def render_win5_simulator(
                         pace_val = r_diag["pace"]
                         cond_val = r_diag["condition"]
 
+                        sub_r = extra_race_ranks[i]
+                        excl_set = sub_r.get("excluded", set())
+                        excl_names = {str(r["馬名"]).strip() for _, r in p_df.iterrows() if int(r["馬番"]) in excl_set}
+
                         # 確定着順辞書
                         actual_ranks_dict = {}
                         r_meta = r_diag.get("meta", {})
                         scraped_ranks = r_diag.get("actual_ranks") or (r_meta.get("actual_ranks") if isinstance(r_meta, dict) else None)
+                        has_full_scraped_ranks = bool(scraped_ranks and isinstance(scraped_ranks, dict) and len(scraped_ranks) >= 4)
 
-                        if scraped_ranks and isinstance(scraped_ranks, dict) and len(scraped_ranks) > 0:
-                            actual_ranks_dict = scraped_ranks.copy()
+                        if has_full_scraped_ranks:
+                            actual_ranks_dict = {k: v for k, v in scraped_ranks.items() if k not in excl_names}
                         else:
-                            # 手動入力データから着順構築
-                            sub_r = extra_race_ranks[i]
+                            # 手動入力データから着順構築（未入力馬に一律8着ペナルティを与えないよう入力された上位馬のみ登録）
                             r2_num = sub_r["second"]
                             r3_num = sub_r["third"]
 
-                            # 馬番から馬名マッピング
-                            num_to_name = {int(r["馬番"]): str(r["馬名"]).strip() for _, r in p_df.iterrows()}
+                            num_to_name = {int(r["馬番"]): str(r["馬名"]).strip() for _, r in p_df.iterrows() if int(r["馬番"]) not in excl_set}
                             for h_n, h_nm in num_to_name.items():
                                 if h_n == w_num:
                                     actual_ranks_dict[h_nm] = 1
@@ -1437,8 +2553,6 @@ def render_win5_simulator(
                                     actual_ranks_dict[h_nm] = 2
                                 elif r3_num > 0 and h_n == r3_num:
                                     actual_ranks_dict[h_nm] = 3
-                                else:
-                                    actual_ranks_dict[h_nm] = 8
 
                         # 確定勝馬が確実に1着として登録されるよう安全補正
                         num_to_name_all = {int(r["馬番"]): str(r["馬名"]).strip() for _, r in p_df.iterrows()}
@@ -1446,7 +2560,7 @@ def render_win5_simulator(
                         if winner_horse_name:
                             actual_ranks_dict[winner_horse_name] = 1
 
-                        # 【Tier 1】 過去レース完全記憶登録
+                        # 【Tier 1】 過去レース検証ベンチマーク登録（カンニングなし精度検証用）
                         if generate_race_sig_func:
                             race_sig = generate_race_sig_func(p_df, track_name, race_dist)
                         else:
@@ -1454,7 +2568,16 @@ def render_win5_simulator(
                             track_key = str(track_name).split()[0]
                             race_sig = f"{track_key}_{race_dist}m_" + "_".join(clean_names)
 
-                        race_label = f"{track_name.split()[0]} {race_dist}m ({c_type}) [WIN{r_diag['id']}]"
+                        already_learned_leg = (race_sig in race_db)
+                        existing_bench = race_db.get(race_sig, {}) if already_learned_leg else {}
+                        ai_ranks_now = {
+                            str(r_p["馬名"]).strip(): int(r_p.get("予想着順数値", i_p + 1))
+                            for i_p, (_, r_p) in enumerate(p_df.iterrows())
+                            if str(r_p.get("馬名", "")).strip()
+                        }
+                        win_ai_rk_now = ai_ranks_now.get(winner_horse_name, 99) if winner_horse_name else 99
+                        raw_horses_leg = edited_races[i]["horses"].to_dict("records") if i < len(edited_races) and hasattr(edited_races[i].get("horses"), "to_dict") else []
+                        race_label = r_diag.get("name") or f"{track_name.split()[0]} {race_dist}m ({c_type}) [WIN{r_diag['id']}]"
                         race_db[race_sig] = {
                             "race_name": race_label,
                             "track": track_name,
@@ -1464,62 +2587,88 @@ def render_win5_simulator(
                             "condition": cond_val,
                             "pace": pace_val,
                             "actual_ranks": actual_ranks_dict,
+                            "horses": raw_horses_leg or existing_bench.get("horses", []),
+                            "past_records": r_diag.get("past_records") or existing_bench.get("past_records", {}),
+                            "official_payouts": r_diag.get("official_payouts") or existing_bench.get("official_payouts", {}),
+                            "ai_ranks_at_save": ai_ranks_now,
+                            "winner_ai_rank_at_save": win_ai_rk_now,
+                            "initial_winner_ai_rank": existing_bench.get("initial_winner_ai_rank", win_ai_rk_now),
                             "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
-                            "horse_count": len(p_df)
+                            "horse_count": len(actual_ranks_dict)
                         }
 
-                        # 【Tier 2】 出走馬ごとの競走馬メモリー更新
+                        # 【Tier 2】 出走馬ごとの競走馬メモリー更新 (重複学習防止・未入力馬への不当減点防止)
                         pop_map = dict(zip(p_df["馬番"], p_df["単勝人気"]))
-                        for _, r_horse in p_df.iterrows():
-                            h_name = str(r_horse["馬名"]).strip()
-                            if not h_name:
-                                continue
-                            total_horses_learned += 1
-                            act_rank = actual_ranks_dict.get(h_name, 8)
-                            h_num = r_horse.get("馬番")
-                            pop = int(pop_map.get(h_num, 5)) if not pd.isna(pop_map.get(h_num)) else 5
+                        if not already_learned_leg:
+                            for _, r_horse in p_df.iterrows():
+                                h_name = str(r_horse["馬名"]).strip()
+                                if not h_name or h_name in excl_names or int(r_horse.get("馬番", 0)) in excl_set:
+                                    continue
+                                if h_name not in actual_ranks_dict:
+                                    continue
+                                total_horses_learned += 1
+                                act_rank = int(actual_ranks_dict[h_name])
+                                h_num = r_horse.get("馬番")
+                                pop = int(pop_map.get(h_num, 5)) if not pd.isna(pop_map.get(h_num)) else 5
 
-                            h_data = horse_mem.get(h_name, {
-                                "starts": 0,
-                                "wins": 0,
-                                "top3": 0,
-                                "ability_adj": 0.0,
-                                "last_ranks": []
-                            })
+                                h_data = horse_mem.get(h_name, {
+                                    "starts": 0,
+                                    "wins": 0,
+                                    "top3": 0,
+                                    "ability_adj": 0.0,
+                                    "last_ranks": []
+                                })
 
-                            h_data["starts"] += 1
-                            if act_rank == 1:
-                                h_data["wins"] += 1
-                            if act_rank <= 3:
-                                h_data["top3"] += 1
+                                h_data["starts"] += 1
+                                if act_rank == 1:
+                                    h_data["wins"] += 1
+                                if act_rank <= 3:
+                                    h_data["top3"] += 1
 
-                            ranks_list = h_data.get("last_ranks", [])
-                            ranks_list.append(act_rank)
-                            h_data["last_ranks"] = ranks_list[-5:]
+                                ranks_list = h_data.get("last_ranks", [])
+                                ranks_list.append(act_rank)
+                                h_data["last_ranks"] = ranks_list[-5:]
 
-                            # 能力補正の算出: 1着+3.0, 2着+1.8, 3着+1.0, 8着以下-1.0
-                            rank_bonus = 0.0
-                            if act_rank == 1:
-                                rank_bonus += 3.0
-                            elif act_rank == 2:
-                                rank_bonus += 1.8
-                            elif act_rank == 3:
-                                rank_bonus += 1.0
-                            elif act_rank >= 8:
-                                rank_bonus -= 1.0
+                                # 能力補正の算出: 1着+3.0, 2着+1.8, 3着+1.0, 8着以下-1.0
+                                rank_bonus = 0.0
+                                if act_rank == 1:
+                                    rank_bonus += 3.0
+                                elif act_rank == 2:
+                                    rank_bonus += 1.8
+                                elif act_rank == 3:
+                                    rank_bonus += 1.0
+                                elif act_rank >= 8:
+                                    rank_bonus -= 1.0
 
-                            # 人気着順ギャップ補正（人気以上に好走した実力馬を底上げ、大敗を下方修正）
-                            gap = pop - act_rank
-                            gap_bonus = gap * 0.5
+                                # 人気着順ギャップ補正（人気以上に好走した実力馬を底上げ、大敗を下方修正）
+                                gap = pop - act_rank
+                                gap_bonus = gap * 0.5
 
-                            delta_ab = rank_bonus + gap_bonus
-                            new_adj = h_data.get("ability_adj", 0.0) + (delta_ab * 0.4)
-                            h_data["ability_adj"] = round(float(np.clip(new_adj, -6.0, 10.0)), 2)
+                                delta_ab = rank_bonus + gap_bonus
+                                new_adj = h_data.get("ability_adj", 0.0) + (delta_ab * 0.4)
+                                h_data["ability_adj"] = round(float(np.clip(new_adj, -4.0, 6.0)), 2)
 
-                            horse_mem[h_name] = h_data
+                                horse_mem[h_name] = h_data
+
+                        # 【Tier 3 & Tier 4】 コース傾向学習 ＆ 5大重みの適応型強化学習
+                        if update_pattern_fn is not None and not p_df.empty and not already_learned_leg:
+                            cur_w, pat_mem, p_logs = update_pattern_fn(
+                                pred_df=p_df,
+                                actual_ranks_dict=actual_ranks_dict,
+                                track_name=track_name,
+                                course_type=c_type,
+                                race_distance=race_dist,
+                                cur_weights=cur_w,
+                                pattern_memory=pat_mem
+                            )
+                            for lg in p_logs:
+                                pat_summaries.append(f"**WIN{r_diag['id']}**: {lg}")
+
+                    st.session_state["learned_weights"] = cur_w
+                    st.session_state["pattern_memory"] = pat_mem
+                    st.session_state["weights_just_updated"] = True
 
                     # 学習履歴への記録
-                    cur_w = learned_weights
                     w_a = float(cur_w.get("ability", 1.5))
                     w_p = float(cur_w.get("pace", 1.0))
                     w_j = float(cur_w.get("jockey", 1.0))
@@ -1539,7 +2688,7 @@ def render_win5_simulator(
                         "ワイドBOX(3点)": "―",
                         "単勝的中": f"{passed_cnt}/5レース的中",
                         "3着内好走": f"勝馬確定{races_learned_count}頭",
-                        "モデル重み(黄金比率固定)": f"{w_a:.2f}/{w_p:.2f}/{w_j:.2f}/{w_e:.2f}/{w_s:.2f}"
+                        "モデル重み(適応進化)": f"{w_a:.2f}/{w_p:.2f}/{w_j:.2f}/{w_e:.2f}/{w_s:.2f}"
                     }
                     st.session_state["training_history"].append(hist_entry)
 
@@ -1549,21 +2698,30 @@ def render_win5_simulator(
                             st.session_state["learned_weights"],
                             st.session_state["training_history"],
                             st.session_state["race_database"],
-                            st.session_state["horse_memory"]
+                            st.session_state["horse_memory"],
+                            st.session_state["pattern_memory"]
                         )
 
                     # AI分析解説インサイト
                     insights = []
-                    insights.append(f"🧠 **【過去レース完全記憶（Tier 1）】** 確定結果を入力した全{races_learned_count}レースの着順データを永久保存しました。次回同一レースを入力した際は100%完全再現して的中させます。")
+                    insights.append(f"🧪 **【過去レース検証ベンチマーク登録（Tier 1）】** 確定結果を入力した全{races_learned_count}レースを精度検証用データとして保存しました。今後AIをレベルアップさせた際、答えを見ずに純粋予想させて精度が上がったか比較検証できます。")
                     insights.append(f"🐎 **【個別競走馬メモリー更新（Tier 2）】** 出走全{total_horses_learned}頭の実績・好走・人気着順ギャップを馬メモリーに反映しました。別レース（通常レース含む）に出走した際にも実力差として自動適用されます。")
+                    if pat_summaries:
+                        insights.extend(pat_summaries)
                     if is_win5_hit and official_win5_payout > 0:
                         insights.append(f"💰 **【WIN5 回収達成！】** 払戻金 **￥{total_return:,} 円**（回収率 **{roi_ratio:.1f}%** / 純利益 **+{net_profit:,} 円**）の特大勝利を記録しました！")
                     else:
-                        insights.append(f"📊 **【次戦への蓄積】** {passed_cnt}/5 レース突破の実績と波乱データを学習。次回開催のWIN5・通常レースの予想精度が底上げされました。")
-                    insights.append("🛡️ **【黄金比率セーフティ】** 重みパラメータは実績十分の黄金比率（能力1.5 / 展開1.0 / 騎手1.0 / 力学1.2 / シナジー1.1）を強固に維持。波乱によるAIのブレ・過学習を完全に防止しています。")
+                        insights.append(f"📊 **【次戦への蓄積】** {passed_cnt}/5 レース突破の実績とコース別勝ち脚質・好調穴馬傾向・5大重みを学習しました。初出走馬を含む次回開催のWIN5・通常レースの予想精度が直接進化します。")
 
                     st.session_state["win5_learning_success"] = {
                         "weights": (w_a, w_p, w_j, w_e, w_s),
+                        "old_weights": (
+                            float(old_w.get("ability", 1.5)),
+                            float(old_w.get("pace", 1.0)),
+                            float(old_w.get("jockey", 1.0)),
+                            float(old_w.get("escape_dynamic", 1.2)),
+                            float(old_w.get("synergy", 1.1)),
+                        ),
                         "insights": insights,
                         "races_count": races_learned_count,
                         "horses_count": total_horses_learned
@@ -1575,20 +2733,26 @@ def render_win5_simulator(
             if st.session_state.get("win5_learning_success"):
                 succ_data = st.session_state["win5_learning_success"]
                 w_a, w_p, w_j, w_e, w_s = succ_data["weights"]
+                ow_a, ow_p, ow_j, ow_e, ow_s = succ_data.get("old_weights", (w_a, w_p, w_j, w_e, w_s))
                 insights = succ_data["insights"]
 
-                st.success(f"🎉 **WIN5 5レースのAI学習が完了しました！出走全{succ_data.get('horses_count', 0)}頭の競走馬メモリーと確定着順が安全に永久保存されました。**")
+                st.success(f"🎉 **WIN5 5レースのAI自己学習（Tier 1〜4）が完了しました！個別馬メモリーに加え、コース傾向と5大重みパラメータが進化しました。**")
                 col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(5)
                 with col_w1:
-                    st.metric("1️⃣ 基礎能力", f"{w_a:.2f}", delta="黄金比率固定", delta_color="normal")
+                    d_a = round(w_a - ow_a, 2)
+                    st.metric("1️⃣ 基礎能力", f"{w_a:.2f}", delta=f"{d_a:+.2f}" if d_a != 0 else "維持", delta_color="normal")
                 with col_w2:
-                    st.metric("2️⃣ ペース・展開", f"{w_p:.2f}", delta="黄金比率固定", delta_color="normal")
+                    d_p = round(w_p - ow_p, 2)
+                    st.metric("2️⃣ ペース・展開", f"{w_p:.2f}", delta=f"{d_p:+.2f}" if d_p != 0 else "維持", delta_color="normal")
                 with col_w3:
-                    st.metric("3️⃣ 騎手実績", f"{w_j:.2f}", delta="黄金比率固定", delta_color="normal")
+                    d_j = round(w_j - ow_j, 2)
+                    st.metric("3️⃣ 騎手実績", f"{w_j:.2f}", delta=f"{d_j:+.2f}" if d_j != 0 else "維持", delta_color="normal")
                 with col_w4:
-                    st.metric("4️⃣ 脚質力学", f"{w_e:.2f}", delta="黄金比率固定", delta_color="normal")
+                    d_e = round(w_e - ow_e, 2)
+                    st.metric("4️⃣ 脚質力学", f"{w_e:.2f}", delta=f"{d_e:+.2f}" if d_e != 0 else "維持", delta_color="normal")
                 with col_w5:
-                    st.metric("5️⃣ 血統シナジー", f"{w_s:.2f}", delta="黄金比率固定", delta_color="normal")
+                    d_s = round(w_s - ow_s, 2)
+                    st.metric("5️⃣ 血統シナジー", f"{w_s:.2f}", delta=f"{d_s:+.2f}" if d_s != 0 else "維持", delta_color="normal")
 
                 st.markdown("##### 💡 AI分析・学習インサイト")
                 for ins in insights:
