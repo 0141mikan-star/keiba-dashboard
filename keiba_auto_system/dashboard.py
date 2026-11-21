@@ -35,8 +35,14 @@ if st.button("🔄 最新状態に更新"):
 
 def load_table(table_name: str) -> pd.DataFrame:
     if sb_client is not None:
-        res = sb_client.table(table_name).select("*").execute()
-        return pd.DataFrame(res.data)
+        try:
+            res = sb_client.table(table_name).select("*").execute()
+            if isinstance(res.data, list) and len(res.data) > 0:
+                return pd.DataFrame(res.data)
+            return pd.DataFrame()
+        except Exception as e:
+            st.warning(f"Supabase読み込みエラー ({table_name}): {e}")
+            return pd.DataFrame()
     if not DB_PATH.exists():
         return pd.DataFrame()
     conn = sqlite3.connect(DB_PATH)
@@ -139,4 +145,5 @@ with tab3:
             }),
             use_container_width=True
         )
+
 
