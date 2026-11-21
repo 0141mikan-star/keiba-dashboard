@@ -1,6 +1,6 @@
+﻿.venv/
+venv32/
+*.pkl
+keiba_auto_system/data/
+keiba_auto_system/scheduler_backend.py
 __pycache__/
-*.py[cod]
-*$py.class
-.streamlit/secrets.toml
-.venv/
-env/
