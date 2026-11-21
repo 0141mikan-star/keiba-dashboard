@@ -12,8 +12,12 @@ st.title("🏇 競馬AI 自動予測 ＆ 収支ダッシュボード")
 DB_PATH = Path(__file__).resolve().parent / "data" / "keiba.db"
 
 # Supabase接続チェック（Streamlit CloudのSecretsまたは環境変数）
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+except Exception:
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 sb_client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -135,3 +139,4 @@ with tab3:
             }),
             use_container_width=True
         )
+
